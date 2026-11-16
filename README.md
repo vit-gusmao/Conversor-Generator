@@ -32,8 +32,6 @@ rasterizadas temporariamente para OCR, mas nunca são incorporadas à planilha.
 - [Deploy](#deploy)
 - [Publicando no GitHub](#publicando-no-github)
 - [Documentação](#documentação)
-- [Segurança](#segurança)
-- [Contribuição](#contribuição)
 - [Licença](#licença)
 
 ---
@@ -131,7 +129,7 @@ aplicação (usuários, conversões, eventos) e o motor Python escreve evidênci
 ├── services/
 │   └── converter/            motor Python (FastAPI): inspeção, OCR, layout, campos, tabelas, XLSX, auditoria
 ├── infra/                    docker-compose, nginx, PostgreSQL (init), OpenTelemetry collector
-├── docs/                     arquitetura, conversão, auditoria, banco, segurança, API, testes, deploy
+├── docs/                     arquitetura, conversão, auditoria, banco, API, testes, deploy
 ├── starter-server.cmd        inicializador para Windows (modo standalone)
 ├── .env.example              modelo de variáveis de ambiente
 └── package.json              scripts de raiz (install:all, build, test, test:py)
@@ -295,7 +293,7 @@ Esta tabela resume as mais importantes.
 | `UPLOAD_MAX_PAGES` | `500` | limite de páginas |
 | `GLMOCR_*` | ver `.env.example` | Ollama para GLM-OCR; `GLMOCR_HOST` padrão `127.0.0.1` |
 | `ASSISTANT_*`, `EMBEDDING_MODEL` | `ASSISTANT_ENABLED=false` | assistente local (Ollama, Qwen3.5-4B) |
-| `RETENTION_PDF_DAYS`, `RETENTION_XLSX_DAYS`, `RETENTION_AUDIT_DAYS` | `7` / `30` / `90` | prazos informados em `/settings` (veja [docs/SECURITY.md](docs/SECURITY.md#retenção-e-lgpd)) |
+| `RETENTION_PDF_DAYS`, `RETENTION_XLSX_DAYS`, `RETENTION_AUDIT_DAYS` | `7` / `30` / `90` | prazos informados em `/settings` (veja a seção de retenção em [docs/DEPLOY.md](docs/DEPLOY.md)) |
 | `VITE_API_BASE` | `/api/v1` | base da API compilada na interface (**em tempo de build**) |
 | `VITE_API_PROXY_TARGET` | `http://localhost:3000` | alvo do proxy do Vite em desenvolvimento |
 
@@ -383,39 +381,17 @@ roda nas próximas alterações. Substitua `OWNER/REPO` nos badges acima.
 | [docs/AUDIT.md](docs/AUDIT.md) | eventos, cadeia de hash, proveniência, cobertura |
 | [docs/DATABASE.md](docs/DATABASE.md) | tabelas, fronteira de escrita, migrações |
 | [docs/API.md](docs/API.md) | contrato REST e SSE, códigos de erro |
-| [docs/SECURITY.md](docs/SECURITY.md) | ameaças, isolamento, LGPD e retenção |
 | [docs/TESTING.md](docs/TESTING.md) | estratégia e corpus de testes |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | publicação do frontend na Vercel e da API e do motor em containers |
 | [apps/api/README.md](apps/api/README.md) | API NestJS: configuração, rotas, Docker |
 | [apps/web/README.md](apps/web/README.md) | interface: desenvolvimento, build, Vercel |
 | [services/converter/README.md](services/converter/README.md) | motor Python: execução, CLI, migrações |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | fluxo de contribuição |
 | [CHANGELOG.md](CHANGELOG.md) | histórico de versões |
-
----
-
-## Segurança
-
-Não abra issues públicas para vulnerabilidades. Use o relato privado descrito em
-[SECURITY.md](SECURITY.md). O modelo de ameaças e as defesas implementadas estão
-em [docs/SECURITY.md](docs/SECURITY.md).
-
----
-
-## Contribuição
-
-Veja [CONTRIBUTING.md](CONTRIBUTING.md) para configuração do ambiente, convenções
-de commit, comandos de teste por pacote e o checklist de Pull Request.
 
 ---
 
 ## Licença
 
-**A licença ainda não foi definida.** Até que um arquivo `LICENSE` seja
-adicionado, todos os direitos estão reservados.
+Projeto proprietário. Todos os direitos reservados.
 
-Ponto de atenção: o SDK opcional `glmocr-sdk` (extra em
-`services/converter/pyproject.toml`) depende de PyMuPDF, que é AGPL. O motor não
-usa PyMuPDF por padrão, e o projeto não instala esse extra. Antes de habilitá-lo
-em um produto distribuído, revise a licença. Detalhes em
-[docs/SECURITY.md](docs/SECURITY.md#licenças-de-dependências).
+Ponto de atenção: o extra opcional `glmocr-sdk` (em `services/converter/pyproject.toml`) depende de PyMuPDF, que é AGPL; o motor não o usa por padrão, então revise a licença antes de habilitá-lo em um produto distribuído.

@@ -2,6 +2,7 @@
   "name": "pdf-to-excel-platform",
   "version": "1.0.0",
   "private": true,
+  "license": "UNLICENSED",
   "description": "Conversor Generator — plataforma local de conversão documental com auditoria completa, API REST e frontend React",
   "scripts": {
     "install:all": "npm --prefix packages/contracts install && npm --prefix packages/contracts run build && npm --prefix apps/api install && npm --prefix apps/web install",

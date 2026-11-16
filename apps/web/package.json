@@ -2,6 +2,7 @@
   "name": "@pdf2x/web",
   "version": "1.0.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "description": "Conversor Generator — frontend React com trilha de auditoria da conversão",
   "scripts": {

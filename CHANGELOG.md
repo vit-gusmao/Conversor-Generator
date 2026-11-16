@@ -7,11 +7,19 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Alterado
+
+- Licença: projeto proprietário, com todos os direitos reservados (antes, a licença não estava definida).
+
 ### Corrigido
 
 - CORS da API passa a liberar o cabeçalho `Cache-Control`, enviado pelo stream
   SSE do frontend, para que o progresso funcione quando web e API estão em
   origens diferentes (Vercel + backend).
+
+### Removido
+
+- Arquivos de contribuição, canal de segurança e templates de issue/PR.
 
 ## [1.0.0] - 2026-11-16
 
@@ -47,12 +55,10 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
   OpenAPI.
 - **Infraestrutura**: `infra/docker-compose.yml` (PostgreSQL, Redis, MinIO, motor,
   worker Celery, API e nginx), imagens Docker da API, do motor e da interface.
-- **Documentação** em `docs/`: arquitetura, conversão, auditoria, banco, segurança,
+- **Documentação** em `docs/`: arquitetura, conversão, auditoria, banco,
   API e estratégia de testes.
 - **Publicação**: `vercel.json` para a interface como SPA, workflow de integração
-  contínua (`.github/workflows/ci.yml`), guia de publicação em `docs/DEPLOY.md`,
-  guia de contribuição (`CONTRIBUTING.md`), política de segurança (`SECURITY.md`),
-  e modelos de issue e de Pull Request em `.github/`.
+  contínua (`.github/workflows/ci.yml`) e guia de publicação em `docs/DEPLOY.md`.
 
 ### Conhecido e não implementado
 
@@ -61,4 +67,3 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 - OCR por célula ou linha existe no componente, mas ainda não é acionado pelo
   pipeline.
 - A execução com Docker Compose não foi verificada no ambiente de construção.
-- Não há licença definida ainda.

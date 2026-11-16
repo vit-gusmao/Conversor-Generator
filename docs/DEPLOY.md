@@ -172,7 +172,7 @@ faça commit de valores reais.
 | `UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | aplicado pela API e pelo motor. O proxy ou o provedor pode impor limite menor: confira |
 | `UPLOAD_MAX_PAGES` | `500` | |
 | `AUTH_MODE` | `optional` | sessão por navegador, sem login. `required` aceita apenas JWT emitido por um emissor confiável; não há tela de login |
-| `RETENTION_*_DAYS` | `7` / `30` / `90` | informados em `/settings`. Não encontrei uma rotina agendada de expurgo no código; veja [SECURITY.md](SECURITY.md#retenção-e-lgpd) |
+| `RETENTION_*_DAYS` | `7` / `30` / `90` | informados em `/settings`. Não encontrei uma rotina agendada de expurgo no código; veja o item 10 do checklist pós-deploy |
 | `LOG_LEVEL`, `LOG_JSON` | `INFO`, `1` nas imagens | |
 
 **OCR e assistente**
@@ -189,6 +189,10 @@ faça commit de valores reais.
   repositório.
 - **Assistente** (`ASSISTANT_ENABLED`) vem desativado por padrão. Ative-o apenas
   com um Ollama acessível e o modelo `qwen3.5:4b` instalado.
+- **Privacidade do OCR:** o motor fala com o Ollama diretamente, sem o cliente
+  MaaS do SDK `glmocr`, que envia documentos à nuvem quando há `ZHIPU_API_KEY` no
+  ambiente. Mantenha `GLMOCR_HOST` em loopback ou em rede privada e não defina
+  `ZHIPU_API_KEY` neste deploy.
 
 ### Gerar segredos
 
@@ -199,7 +203,10 @@ openssl rand -hex 32      # CONVERTER_INTERNAL_TOKEN
 
 Os valores padrão do código (`dev-...-change-me`) são apenas para desenvolvimento.
 O motor registra um aviso ao iniciar quando encontra `CONVERTER_INTERNAL_TOKEN` ou
-`JWT_SECRET` com o padrão do código.
+`JWT_SECRET` com o padrão do código. O gateway NestJS usa outro padrão para
+`JWT_SECRET` (`dev-only-insecure-secret-change-me`, em
+`apps/api/src/config/configuration.ts`), que esse aviso não cobre: defina
+`JWT_SECRET` explicitamente na API.
 
 ### Rotação de segredos
 
@@ -325,7 +332,9 @@ Execute na ordem:
    configuradas e testadas.
 10. **Retenção**: confirme como os prazos de `RETENTION_*` serão aplicados. O
     código informa os prazos, mas não encontrei uma rotina agendada de expurgo.
-    Defina a rotina operacional antes de tratar dados reais.
+    Defina a rotina operacional antes de tratar dados reais. A base legal (LGPD) e
+    os prazos cabem ao operador, conforme o tipo de documento; `DELETE
+    /conversions/:id` faz exclusão lógica e remove os artefatos do storage.
 11. **Limites**: confirme que o limite do proxy ou do provedor aceita o
     `UPLOAD_MAX_BYTES` configurado.
 12. **Preview**: se usar previews da Vercel, confirme que a origem de cada um
