@@ -48,7 +48,12 @@ alternativa versionada para ambientes controlados.
 ```bash
 .venv/Scripts/python -m pytest tests -q          # Linux/macOS: .venv/bin/python
 .venv/Scripts/python scripts/smoke_run.py        # inspeção manual por fixture
+.venv/Scripts/python scripts/stress_gabarito.py --root ../../stress/pdfs   # corpus local (não versionado)
 ```
+
+`stress_gabarito.py` pontua a conversão contra o `GABARITO.jsonl` do corpus de
+stress. A pasta `stress/pdfs` não faz parte do repositório; veja
+[`../../docs/TESTING.md`](../../docs/TESTING.md#stress-contra-o-corpus-dourado-3208-pdfs).
 
 A quantidade de testes muda com o código; o resumo do pytest é a referência.
 Testes que dependem de Ollama ou do GLM-OCR são pulados quando o serviço ou o

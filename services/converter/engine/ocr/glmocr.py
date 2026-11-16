@@ -1,6 +1,6 @@
 """GLM-OCR engine — VLM recognition via local Ollama (``glm-ocr:latest``).
 
-GLM-OCR integration: the model
+Integration of the GLM-OCR plan: the model
 runs 100% locally on the GPU through Ollama's native ``/api/generate`` endpoint
 (the endpoint recommended by the official repository for GLM-OCR), with
 ``temperature=0`` and explicit ``num_ctx`` to avoid truncated pages.
@@ -221,7 +221,15 @@ def segment_text_lines(image, *, threshold: int = 128) -> list[tuple[float, floa
         return []
 
     row_ink = ink.sum(axis=1)
-    rows = np.flatnonzero(row_ink > 0)
+    # A noise floor matters on blurry or noisy scans: one stray dark pixel per
+    # row bridges every line into a single band, and the whole page is then
+    # distributed evenly over that band (geometry collapses).
+    minimum_ink = max(1, int(ink.shape[1] * 0.002))
+    rows = np.flatnonzero(row_ink >= minimum_ink)
+    if rows.size == 0:
+        rows = np.flatnonzero(row_ink > 0)
+        if rows.size == 0:
+            return []
     runs: list[list[int]] = []
     start = prev = int(rows[0])
     for r in rows[1:]:
@@ -235,7 +243,10 @@ def segment_text_lines(image, *, threshold: int = 128) -> list[tuple[float, floa
 
     heights = [b - a + 1 for a, b in runs]
     median_h = float(np.median(heights)) if heights else 0.0
-    merge_gap = max(2, int(median_h * 0.45))
+    # Accents and thin strokes sit a few pixels above the glyph; a line gap is
+    # an order of magnitude larger.  Capping the merge distance keeps two real
+    # lines apart even when the median run is tall.
+    merge_gap = max(2, min(int(median_h * 0.45), 10))
 
     merged: list[list[int]] = []
     for run in runs:
@@ -256,16 +267,91 @@ def segment_text_lines(image, *, threshold: int = 128) -> list[tuple[float, floa
     return boxes
 
 
-def words_in_box(text: str, box: tuple[float, float, float, float], confidence: float) -> list[OcrWord]:
-    """Split one line of text into words laid out proportionally in *box*.
+def word_runs_in_line(
+    ink, box: tuple[float, float, float, float], expected: int
+) -> list[tuple[float, float]] | None:
+    """Real x-ranges of the words printed inside one line box.
 
-    x-positions are derived from character counts inside the real ink extent —
-    the audit records this policy, so no fabricated precision is implied.
+    Proportional distribution is the fallback, not the rule: the ink itself has
+    the word boundaries.  Column projection inside the line band yields one run
+    per word cluster; runs are only accepted when their count matches the words
+    the model returned, so a mismatch degrades to the proportional layout
+    instead of inventing positions.
+    """
+    import numpy as np
+
+    if expected <= 0:
+        return None
+    height, width = ink.shape
+    x0, y0, x1, y1 = box
+    top = max(0, int(y0))
+    bottom = min(height, int(max(y1, y0 + 1)))
+    left = max(0, int(x0))
+    right = min(width, int(max(x1, x0 + 1)))
+    if bottom - top < 2 or right - left < 2:
+        return None
+    band = ink[top:bottom, left:right]
+    present = np.flatnonzero(band.sum(axis=0) > 0)
+    if present.size == 0:
+        return None
+
+    line_height = bottom - top
+    gap_threshold = max(4.0, line_height * 0.45)
+    runs: list[list[int]] = []
+    start = prev = int(present[0])
+    for value in present[1:]:
+        value = int(value)
+        if value - prev <= gap_threshold:
+            prev = value
+            continue
+        runs.append([start, prev])
+        start = prev = value
+    runs.append([start, prev])
+    # The ink and the model rarely disagree about the *line*, but they can
+    # disagree about the word count (touching letters, a space the model split).
+    # Merging the closest runs / splitting the widest ones keeps every position
+    # anchored to real ink instead of spreading the line across the page.
+    while len(runs) > expected:
+        gaps = [(runs[i + 1][0] - runs[i][1], i) for i in range(len(runs) - 1)]
+        _, index = min(gaps)
+        runs[index] = [runs[index][0], runs[index + 1][1]]
+        del runs[index + 1]
+    while len(runs) < expected:
+        widths = [(runs[i][1] - runs[i][0], i) for i in range(len(runs))]
+        _, index = max(widths)
+        middle = (runs[index][0] + runs[index][1]) / 2
+        runs[index : index + 1] = [
+            [runs[index][0], int(middle)],
+            [int(middle), runs[index][1]],
+        ]
+    return [(float(left + a), float(left + b + 1)) for a, b in runs]
+
+
+def words_in_box(
+    text: str,
+    box: tuple[float, float, float, float],
+    confidence: float,
+    *,
+    ink=None,
+) -> list[OcrWord]:
+    """Split one line of text into words placed inside *box*.
+
+    With the raster at hand the word positions come from the ink of that line
+    (real x-ranges).  Without it — or when the ink does not segment into exactly
+    as many runs as there are words — they are distributed proportionally to the
+    character count.  The policy is recorded in the audit, so no fabricated
+    precision is implied.
     """
     x0, y0, x1, y1 = box
     words = [w for w in text.split() if w]
     if not words:
         return []
+    runs = word_runs_in_line(ink, box, len(words)) if ink is not None else None
+    if runs is not None:
+        return [
+            OcrWord(text=word, bbox_px=(start, y0, end, y1), confidence=confidence)
+            for word, (start, end) in zip(words, runs)
+        ]
     span = max(x1 - x0, 1.0)
     total_chars = sum(len(w) for w in words) + max(len(words) - 1, 0)
     char_w = span / max(total_chars, 1)
@@ -282,6 +368,53 @@ def words_in_box(text: str, box: tuple[float, float, float, float], confidence: 
         )
         cursor += width + (char_w if i < len(words) - 1 else 0.0)
     return result
+
+
+def _ink_mask(image, threshold: int = 128):
+    """Boolean ink mask of the raster (dark pixels)."""
+    import numpy as np
+
+    gray = np.asarray(image.convert("L"))
+    if gray.size == 0:
+        return None
+    return gray < threshold
+
+
+def assign_lines_to_bands(
+    bands: list[tuple[float, float, float, float]], count: int
+) -> list[tuple[float, float, float, float]]:
+    """Give each recognised line its own box inside the ink bands.
+
+    ``segment_text_lines`` merges two close rows into one band when the gap is
+    small (a table header touching its first row), so the model can return more
+    lines than there are bands.  Each band receives a number of lines
+    proportional to its height, and its vertical span is split; no line is
+    placed outside the band where its ink actually is.
+    """
+    if not bands or count <= 0:
+        return []
+    heights = [max(1.0, band[3] - band[1]) for band in bands]
+    total_height = sum(heights)
+    per_line = total_height / count
+    weights = [max(1, int(round(height / per_line))) for height in heights]
+    while sum(weights) > count:
+        index = max(range(len(weights)), key=lambda position: weights[position])
+        if weights[index] <= 1:
+            break
+        weights[index] -= 1
+    while sum(weights) < count:
+        index = max(range(len(weights)), key=lambda position: weights[position])
+        weights[index] += 1
+
+    boxes: list[tuple[float, float, float, float]] = []
+    for band, pieces in zip(bands, weights):
+        top, bottom = band[1], band[3]
+        step = max((bottom - top) / pieces, 1.0)
+        for piece in range(pieces):
+            boxes.append(
+                (band[0], top + piece * step, band[2], top + (piece + 1) * step)
+            )
+    return boxes[:count]
 
 
 def even_line_boxes(height: int, width: int, count: int) -> list[tuple[float, float, float, float]]:
@@ -362,6 +495,8 @@ class GlmOcrEngine(OcrEngine):
         self._client = client or GlmOcrClient()
         self.version = self._client.model
         self.boxing_method = "projection_v1"
+        #: line boxes actually used for the last recognition (audit/decision)
+        self.bands: list[tuple[float, float, float, float]] = []
 
     @classmethod
     def available(cls) -> bool:
@@ -420,23 +555,24 @@ class GlmOcrEngine(OcrEngine):
         if not lines:
             raise OcrUnavailable("glm-ocr returned no text lines")
 
+        ink = _ink_mask(image)
         boxes = segment_text_lines(image)
         if len(boxes) == len(lines):
             self.boxing_method = "projection_v1"
         else:
-            # Count mismatch: keep every line, anchored to the ink extent (not
-            # the whole page) so text stays where the document actually has it.
-            self.boxing_method = "even_distribution"
-            if boxes:
-                top = min(b[1] for b in boxes)
-                bottom = max(b[3] for b in boxes)
-                boxes = distribute_boxes(width, top, bottom, len(lines))
-            else:
+            # Count mismatch: an ink band can hold two wrapped lines, so the
+            # band is split by its own height instead of redistributing every
+            # line over the page (which moved rows far from where they print).
+            self.boxing_method = "band_split_v1"
+            boxes = assign_lines_to_bands(boxes, len(lines))
+            if not boxes:
+                self.boxing_method = "even_distribution"
                 boxes = even_line_boxes(height, width, len(lines))
 
+        self.bands = list(boxes)
         words = []
         for line, box in zip(lines, boxes):
-            words.extend(words_in_box(line, box, confidence))
+            words.extend(words_in_box(line, box, confidence, ink=ink))
         return words
 
     def describe(self) -> dict[str, object]:

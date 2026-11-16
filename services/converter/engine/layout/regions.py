@@ -105,7 +105,11 @@ def build_regions(
     field_boxes = [f.bbox for f in fields]
 
     for block in blocks:
-        table_hit = next((tb for tb in table_boxes if tb.overlap_ratio(block.bbox) >= 0.55), None)
+        # "Is the block inside the table?" — the block's own area is what must be
+        # covered. Asking the other way round (fraction of the table covered by
+        # one line) never reaches 0.55 for a single row of a table, so table
+        # blocks were classified as paragraphs and their rows became sections.
+        table_hit = next((tb for tb in table_boxes if block.bbox.overlap_ratio(tb) >= 0.55), None)
         if table_hit is not None:
             block.kind = REGION_TABLE
             continue

@@ -66,10 +66,26 @@ LATTICE_SETTINGS = {
 }
 
 
+def _upright_page(page):
+    """Page without rotated characters.
+
+    pdfplumber builds a cell's text from every character inside it, including
+    characters drawn at 90/180 degrees (a vertical stamp, a reversed title).
+    Those belong to the page, not to the grid: keeping them produced cells like
+    ``"ODA\\n994.50"``.  Lines/rects are preserved, so the grid is unchanged.
+    """
+    try:
+        return page.filter(
+            lambda obj: obj.get("object_type") != "char" or bool(obj.get("upright", True))
+        )
+    except Exception:  # noqa: BLE001 - filtering is an optimisation, never a requirement
+        return page
+
+
 def detect_lattice(page, page_number: int) -> list[RawTable]:
     tables: list[RawTable] = []
     try:
-        found = page.find_tables(LATTICE_SETTINGS)
+        found = _upright_page(page).find_tables(LATTICE_SETTINGS)
     except Exception:  # noqa: BLE001
         found = []
 

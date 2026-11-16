@@ -886,7 +886,11 @@ class ConversionRepository:
             if not sheets:
                 return None
             names = [s.name for s in sheets]
-            target = sheet if sheet in names else names[0]
+            # The consolidated tab is a derived view (union of the other tabs),
+            # so it is never the implicit preview: with no explicit choice the
+            # app opens the first tab that carries extracted data.
+            default_sheet = next((s.name for s in sheets if s.kind != "consolidated"), names[0])
+            target = sheet if sheet in names else default_sheet
             meta = next(s for s in sheets if s.name == target)
             rows = session.execute(
                 select(OutputCellRow)

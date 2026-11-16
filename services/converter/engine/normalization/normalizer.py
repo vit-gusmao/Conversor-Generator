@@ -305,6 +305,28 @@ def normalize(text: str | None, *, header: str | None = None, locale: LocaleProf
     # -- numbers -----------------------------------------------------------
     if _only_digits_and_separators(stripped):
         decimal_value = _parse_decimal(stripped, locale)
+        if decimal_value is not None and _exceeds_excel_precision(decimal_value):
+            # Excel stores numbers as IEEE-754 doubles: anything above 15
+            # significant digits is silently rounded, so a 20-digit "amount"
+            # read from a broken cell no longer matches what was written and the
+            # artifact fails its own audit.  The characters are data, so they are
+            # kept verbatim as text.
+            return NormalizedValue(
+                value=stripped,
+                display=stripped,
+                value_type="code",
+                original=original,
+                number_format="@",
+                confidence=0.8,
+                transformations=[
+                    {
+                        "rule": "precision_kept_as_text",
+                        "from": stripped,
+                        "to": stripped,
+                        "reason": "Valor acima da precisão numérica do Excel; mantido como texto.",
+                    }
+                ],
+            )
         if decimal_value is not None:
             if hint_type == "money":
                 # The header ("Salário", "Valor", "Total") says this column is
@@ -404,17 +426,41 @@ def _leading_zero(text: str) -> bool:
     return len(digits) > 1 and digits.startswith("0")
 
 
+def _exceeds_excel_precision(value: Decimal) -> bool:
+    """True when Excel's 15 significant digits cannot hold *value* exactly."""
+    if value != value.to_integral_value():
+        return False
+    digits = len(str(abs(int(value))).lstrip("0"))
+    return digits > 15
+
+
 def _is_identifier(text: str) -> bool:
     return any(pattern.match(text) for pattern in _IDENTIFIERS)
 
 
 def _has_decimal_part(text: str, locale: LocaleProfile) -> bool:
+    """True when the number carries a fractional part.
+
+    Judged per value (a table can use dots while a money field uses commas in
+    the same document), falling back to the locale only for the ambiguous
+    three-digit tail.
+    """
     raw = text.replace(" ", "")
-    separator = locale.decimal_sep
-    if separator not in raw:
-        return False
-    tail = raw.rsplit(separator, 1)[1]
-    return tail.isdigit() and 1 <= len(tail) <= 6 and not tail.endswith("000")
+    for separator in (",", "."):
+        if separator not in raw:
+            continue
+        groups = raw.split(separator)
+        tail = groups[-1]
+        if not tail.isdigit():
+            continue
+        if len(groups) > 2:
+            # "1.234.567" is an integer; "6,706,36" carries a decimal tail.
+            return 1 <= len(tail) <= 2
+        if 1 <= len(tail) <= 2:
+            return True
+        if len(tail) == 3:
+            return separator == locale.decimal_sep
+    return False
 
 
 def _parse_decimal(text: str, locale: LocaleProfile) -> Decimal | None:
@@ -445,33 +491,34 @@ def _parse_decimal(text: str, locale: LocaleProfile) -> Decimal | None:
 
     dec = locale.decimal_sep
     thou = locale.thousand_sep
-    if dec in raw and thou in raw:
-        if raw.rfind(dec) > raw.rfind(thou):
-            normalized = raw.replace(thou, "").replace(dec, ".")
+    if "," in raw and "." in raw:
+        if raw.rfind(",") > raw.rfind("."):
+            normalized = raw.replace(".", "").replace(",", ".")
         else:
-            normalized = raw.replace(dec, "").replace(thou, ".")
-    elif dec in raw:
-        occurrences = raw.count(dec)
-        tail = raw.rsplit(dec, 1)[1]
-        if occurrences > 1:
-            groups = raw.split(dec)
-            if len(groups[-1]) == 2 and all(len(g) == 3 for g in groups[1:-1]):
-                normalized = "".join(groups[:-1]) + "." + groups[-1]
+            normalized = raw.replace(",", "")
+    elif "," in raw or "." in raw:
+        # The separator that appears is judged by how it is used, not by the
+        # document locale: one PDF can print table prices as "308.36" and a
+        # money field as "R$ 153,18".  Trusting the locale turned 153,18 into
+        # 15318.
+        sep = "," if "," in raw else "."
+        groups = raw.split(sep)
+        tail = groups[-1]
+        if len(groups) == 2 and tail.isdigit() and 1 <= len(tail) <= 2:
+            normalized = f"{groups[0]}.{tail}"
+        elif len(groups) > 2:
+            # "1.234.567" is a thousand-separated integer, but "6,706,36" is a
+            # number whose thousand separator was read as a comma (very common
+            # on scans): a two-digit tail is always the decimal part.
+            if tail.isdigit() and 1 <= len(tail) <= 2:
+                normalized = "".join(groups[:-1]) + "." + tail
             else:
-                normalized = raw.replace(dec, "")
+                normalized = raw.replace(sep, "")
+        elif len(groups) == 2 and tail.isdigit() and len(tail) == 3:
+            # "1,234" vs "1.234" is genuinely ambiguous: the locale decides.
+            normalized = raw.replace(sep, ".") if sep == dec else raw.replace(sep, "")
         else:
-            decimals = len(tail)
-            if decimals == 0:
-                normalized = raw.replace(dec, "")
-            elif decimals <= 2:
-                normalized = raw.replace(dec, ".")
-            elif decimals == 3 and len(raw.split(dec)[0]) <= 3:
-                # "1.250" is 1250 in pt-BR, 1.25 in en-US
-                normalized = raw.replace(dec, "") if dec == thou else raw.replace(dec, ".")
-            else:
-                normalized = raw.replace(dec, ".")
-    elif thou in raw:
-        normalized = raw.replace(thou, "")
+            normalized = raw.replace(sep, "")
     else:
         normalized = raw
 

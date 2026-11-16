@@ -48,6 +48,7 @@ export const VALUE_TYPE_LABELS: Record<ValueType, string> = {
 };
 
 export const SHEET_KIND_LABELS: Record<string, string> = {
+  consolidated: 'Todos os dados',
   records: 'Registros',
   table: 'Tabela',
   text: 'Texto',

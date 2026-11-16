@@ -224,7 +224,7 @@ export interface Paginated<T> {
 
 export interface SheetSummary {
   name: string;
-  kind: 'records' | 'table' | 'text' | 'unclassified' | 'metadata';
+  kind: 'records' | 'table' | 'text' | 'unclassified' | 'metadata' | 'consolidated';
   rows: number;
   columns: number;
   source_pages: number[];

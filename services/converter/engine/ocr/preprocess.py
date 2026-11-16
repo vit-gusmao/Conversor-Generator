@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from PIL import Image
+
 from engine.ocr.rasterize import image_stats
 
 
@@ -93,7 +95,12 @@ def preprocess(image, *, aggressive: bool = False) -> PreprocessResult:
             operations.append("adaptive_threshold")
 
     out = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    return PreprocessResult(image=out, operations=operations, parameters=params)
+    # The OCR engines take a PIL image; returning the raw OpenCV array made
+    # every engine call fail with "'numpy.ndarray' object has no attribute
+    # 'convert'" once opencv was installed.
+    return PreprocessResult(
+        image=Image.fromarray(out), operations=operations, parameters=params
+    )
 
 
 def _estimate_skew(gray, cv2, np) -> float | None:

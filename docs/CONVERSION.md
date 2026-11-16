@@ -43,15 +43,56 @@ visuais. Isso elimina uma classe inteira de bugs de ordenação.
 `engine/ocr/*`
 
 1. rasterização por `pypdfium2` (DPI configurável, com limite de pixels);
-2. pré-processamento adaptativo com OpenCV — deskew, CLAHE, denoise,
-   limiarização adaptativa — sempre preservando a imagem original;
-3. motor, na ordem de preferência: **GLM-OCR** (VLM local via Ollama, GPU) →
+2. orientação: a projeção de tinta indica página deitada; as duas direções
+   (90°/270°) são lidas e vence a que produz **geometria medida** (faixas de tinta
+   1:1 com as linhas reconhecidas). A rotação corrige as coordenadas de volta ao
+   espaço da página original — girar a imagem sem remapear colocava cada palavra
+   fora da página. Sem geometria medida, a página é lida na orientação original;
+3. pré-processamento adaptativo com OpenCV — deskew, CLAHE, denoise,
+   limiarização adaptativa — sempre preservando a imagem original. O raster
+   **original** é o que vai ao motor (a geometria depende dele); a versão
+   melhorada é apenas fallback de reconhecimento;
+4. motor, na ordem de preferência: **GLM-OCR** (VLM local via Ollama, GPU) →
    RapidOCR → Tesseract (`--psm 6` página, `--psm 7` linha/célula);
-4. coordenadas convertidas de pixels para pontos;
-5. reconciliação: palavra de OCR que duplica texto nativo no mesmo lugar é
-   descartada; texto nativo válido nunca é substituído por OCR;
-6. **sem motor instalado**, a região é registrada como não reconhecida e a
-   página falha de forma explícita. Nenhum caractere é inventado.
+5. geometria: as faixas de linha saem da projeção de tinta; a posição x de cada
+   palavra sai da **tinta da própria linha** (merge/split de trechos quando a
+   contagem divergir). Sem isso a linha era distribuída por proporção e as
+   colunas nunca alinhavam;
+6. coordenadas convertidas de pixels para pontos;
+7. reconciliação: palavra de OCR que duplica texto nativo no mesmo lugar é
+   descartada; texto nativo válido nunca é substituído por OCR — exceto quando a
+   camada nativa é **invisível** (`3 Tr`/`7 Tr`) e há imagem: aí o OCR visual
+   prevalece, porque é o que o leitor vê;
+8. **sem motor instalado**, a região é registrada como não reconhecida e a
+   página falha de forma explícita. Nenhum caractere é inventado;
+9. legibilidade: glifos com menos de ~6 px de altura geram a issue
+   `OCR_LOW_LEGIBILITY` — o texto é exportado, mas a auditoria diz que a fonte
+   não era legível o suficiente para confiar palavra por palavra.
+
+### Grid que é formulário, não tabela
+
+Um bloco de texto em colunas com vários `Rótulo:` dentro das células não vira
+tabela: a extração de campos nunca veria essas linhas (elas estariam "dentro de
+uma tabela") e o formulário inteiro viraria uma célula falsa. O teste é direto —
+duas células com dois ou mais marcadores de rótulo reprovam o candidato — e o
+texto segue para campos/aba `Texto`.
+
+### Linhas idênticas repetidas
+
+O mesmo documento digitalizado em duas páginas (uma nativa, uma raster) gerava
+a mesma entidade três vezes. Linhas **idênticas em todas as colunas** nas abas
+de registro são colapsadas e o fato é registrado (`DUPLICATE_ROWS_REMOVED`);
+tabelas nunca passam por essa regra, porque itens repetidos são legítimos.
+
+### Tabelas quando a geometria não serve
+
+`engine/tables/text_pattern.py` reconstrói a tabela **pelo texto**, sem
+coordenadas: uma linha de cabeçalho com ≥3 rótulos conhecidos (`Item`,
+`Descrição`, `Qtd`, `Preço`, `Total`) seguida de ≥2 linhas que terminam em
+números. Só entra quando nenhum detector geométrico produz candidato (scan
+desfocado, banda de tinta única) e cada linha mantém sua própria caixa como
+proveniência. Valores não são reescritos: só as fronteiras de célula são
+inferidas.
 
 ### Motor GLM-OCR
 
@@ -118,7 +159,7 @@ Quatro passagens, nesta ordem de confiança:
 
 | Passagem | Entrada | Resultado |
 | --- | --- | --- |
-| 1 | `Nome: João da Silva` (um ou vários pares por linha) | coluna `Nome` |
+| 1 | `Nome: Fulano Exemplo` (um ou vários pares por linha) | coluna `Nome` |
 | 2 | `Nome:` e o valor na linha seguinte (inclusive multilinha) | coluna `Nome` |
 | 3 | duas colunas geométricas, sem separador | par rótulo/valor |
 | 4 | campos AcroForm | valor direto + rótulo visual |
@@ -180,6 +221,12 @@ identificador, código, booleano, vazio.
 
 - moeda com `Decimal`; o **símbolo do documento é preservado** (`R$`, `US$`,
   `€`, `£`) tanto na exibição quanto no formato da célula;
+- separador decidido **por valor**, não pelo locale do documento: um mesmo PDF
+  pode imprimir preços com ponto (`308.36`) e um campo de valor com vírgula
+  (`R$ 153,18`). Confiar só no locale transformava `153,18` em `15318`;
+- números com mais de **15 dígitos significativos** ficam como texto (`@`):
+  o Excel arredonda acima disso, e a célula deixaria de corresponder ao plano
+  (o artefato era reprovado na própria auditoria);
 - quando o cabeçalho indica valor (`Salário`, `Total`, `Valor`) e a célula traz
   apenas o número, o valor é tratado como moeda mesmo sem símbolo;
 - identificadores (CPF, CNPJ, CEP, matrícula, telefone) sempre texto;
@@ -248,6 +295,11 @@ quanto a duplicação do que já foi estruturado.
   registro;
 - texto livre → aba `Texto` (`Texto`, `Seção`, `Página`);
 - conteúdo sem estrutura → aba `Não classificado`;
+- **aba consolidada** `Todos os dados`: quando existem duas ou mais abas
+  estruturais (registros/tabelas), uma aba extra repete cada linha com a
+  **união de todas as colunas** e duas colunas de origem (`Aba`, `Página`).
+  É uma cópia do plano — nunca uma nova extração —, então não pode divergir
+  das abas originais; o download continua sendo **um único `.xlsx`**;
 - limites do Excel respeitados por divisão, nunca por truncamento.
 
 ## Fase 12 — Gerar o XLSX

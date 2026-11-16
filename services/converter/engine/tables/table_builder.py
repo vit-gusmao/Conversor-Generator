@@ -11,6 +11,7 @@ rows, summary rows and transposed-table detection.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from audit.events import (
@@ -21,6 +22,11 @@ from audit.events import (
 )
 from engine.tables import docling_adapter
 from engine.tables.hybrid import detect_hybrid
+from engine.tables.text_pattern import (
+    _QUANTITY_LABELS,
+    _close_to_label,
+    detect_text_tables,
+)
 from engine.tables.lattice import RawTable, detect_lattice, detect_lattice_manual
 from engine.tables.stream import detect_stream
 from models.document import (
@@ -31,6 +37,7 @@ from models.document import (
     TableStructure,
     TextBlock,
     Token,
+    median,
 )
 
 _TOTAL = re.compile(
@@ -97,7 +104,8 @@ def detect_tables(
     if not candidates:
         return []
 
-    scored = [_score(raw, tokens) for raw in candidates]
+    page_height = float(getattr(page, 'height', 0.0) or 0.0)
+    scored = [_score(raw, tokens, page_height=page_height) for raw in candidates]
     scored = [
         s
         for s in scored
@@ -167,6 +175,11 @@ def detect_tables(
                 },
             )
 
+    ocr_page = bool(tokens) and all(
+        getattr(token, "origin", "") == "ocr" for token in tokens
+    )
+    tables = _prefer_named_reading(tables, prefer_text_pattern=ocr_page)
+
     if recorder:
         for candidate in scored:
             if candidate.accepted:
@@ -228,6 +241,20 @@ def _collect_candidates(
         except Exception:  # noqa: BLE001
             pass
 
+    # Always offered, independent of pixels: a header line naming the columns
+    # followed by lines that end in numbers.  Only grids with no hole are kept —
+    # a hole means the split was wrong and values would land in the wrong
+    # columns — and the post-selection decides which reading represents the
+    # region.
+    try:
+        candidates.extend(
+            candidate
+            for candidate in detect_text_tables(tokens, page_number)
+            if _raw_is_clean(candidate)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     # Remove duplicates produced by different engines on the same block.
     unique: list[RawTable] = []
     for candidate in candidates:
@@ -247,7 +274,121 @@ def _collect_candidates(
     return unique
 
 
-def _score(raw: RawTable, tokens: list[Token]) -> ScoredCandidate:
+def _mostly_generic(headers: list[str]) -> bool:
+    if not headers:
+        return True
+    generic = sum(1 for header in headers if re.fullmatch(r"Coluna \d+", header or ""))
+    return generic >= max(1, len(headers) // 2)
+
+
+def _raw_is_clean(raw: RawTable) -> bool:
+    """A text-pattern grid must have every cell filled."""
+    rows = raw.rows[1:] if len(raw.rows) > 1 else []
+    if len(rows) < 2:
+        return False
+    width = max(len(row) for row in rows)
+    if width < 3:
+        return False
+    for row in rows:
+        if len(row) != width:
+            return False
+        if any(not str(cell).strip() for cell in row):
+            return False
+    return True
+
+
+def _pattern_is_clean(table: TableStructure) -> bool:
+    """The text-pattern grid is usable only when no cell is missing.
+
+    It infers boundaries from the text, so a hole in the middle of a row means
+    the split was wrong (values would land in the wrong columns).  Only clean
+    grids are allowed to replace a geometrical one.
+    """
+    if len(table.rows) < 3 or not table.headers:
+        return False
+    for row in table.rows:
+        if len(row) != len(table.headers):
+            return False
+        if any(not str(cell).strip() for cell in row):
+            return False
+    numeric_tails = sum(
+        1 for row in table.rows if str(row[-1]).strip() and any(ch.isdigit() for ch in str(row[-1]))
+    )
+    return numeric_tails >= 2
+
+
+def _same_region(a: BBox, b: BBox) -> bool:
+    """Two candidates describe the same table when one contains the other.
+
+    A geometric grid often covers only the rows (the header band was not ruled),
+    while the text-pattern reading spans header + rows: IoU alone would call them
+    different regions.
+    """
+    return _iou(a, b) >= 0.4 or _containment(a, b) >= 0.6
+
+
+def _consistent_grid(table: TableStructure) -> bool:
+    """True when the grid width matches its own header labels.
+
+    A degraded scan can produce a six-column grid under five labels; the cells
+    are then shifted and no column can be trusted.  The text-pattern reading
+    (built from the text alone) is the better answer in that case.
+    """
+    if not table.headers:
+        return False
+    if len(table.headers) != table.n_cols:
+        return False
+    return not any(re.fullmatch(r"Coluna \d+", header or "") for header in table.headers)
+
+
+def _prefer_named_reading(
+    tables: list[TableStructure], *, prefer_text_pattern: bool = False
+) -> list[TableStructure]:
+    """Keep the reading whose columns are actually named.
+
+    A degraded scan can produce a geometric grid whose columns are all
+    "Coluna N" while the text-pattern reading of the same region names them
+    (Item, Descrição, Qtd, Preço, Total).  Only one table represents a region;
+    the one that tells the reader what each column is wins, and the geometric
+    table is kept when *it* is the one with real headers.
+    """
+    named = [
+        table
+        for table in tables
+        if table.strategy == "text_pattern"
+        and not _mostly_generic(table.headers)
+        and _pattern_is_clean(table)
+    ]
+    if not named:
+        return tables
+    kept: list[TableStructure] = []
+    for table in tables:
+        if table.strategy == "text_pattern":
+            explained = any(
+                other is not table and _same_region(other.bbox, table.bbox)
+                and not _mostly_generic(other.headers)
+                and (not prefer_text_pattern or _consistent_grid(other))
+                for other in tables
+            )
+            if explained:
+                continue
+            kept.append(table)
+            continue
+        needs_better_reading = _mostly_generic(table.headers) or (
+            prefer_text_pattern and not _consistent_grid(table)
+        )
+        if needs_better_reading:
+            replacement = next(
+                (candidate for candidate in named if _same_region(candidate.bbox, table.bbox)),
+                None,
+            )
+            if replacement is not None:
+                continue
+        kept.append(table)
+    return kept
+
+
+def _score(raw: RawTable, tokens: list[Token], *, page_height: float = 0.0) -> ScoredCandidate:
     total = max(1, len(raw.rows) * max(1, raw.n_cols))
     filled = sum(1 for row in raw.rows for cell in row if cell and cell.strip())
     density = filled / total
@@ -268,10 +409,17 @@ def _score(raw: RawTable, tokens: list[Token]) -> ScoredCandidate:
     coverage = assigned / max(1, len(inside)) if inside else 0.0
 
     size_bonus = min(1.0, (len(raw.rows) * raw.n_cols) / 24.0)
-    strategy_bonus = {"lattice": 0.08, "hybrid": 0.05, "docling": 0.04}.get(raw.strategy, 0.0)
+    strategy_bonus = {"lattice": 0.12, "hybrid": 0.05, "docling": 0.04}.get(raw.strategy, 0.0)
     score = 0.5 * coverage + 0.28 * density + 0.22 * size_bonus + strategy_bonus
     if raw.strategy == "stream":
         score -= 0.05  # prefer a drawn grid when both explain the region
+    # A "table" that covers the whole page without a drawn grid is the page
+    # itself: the alignment engines happily turn a form plus its items list into
+    # one big grid, which then swallows the fields.  Real grids may be tall; an
+    # inferred one that tall is a false positive.
+    if raw.strategy in {"stream", "hybrid"} and page_height and page_height > 0:
+        if raw.bbox.height / page_height >= 0.8:
+            score -= 0.3
 
     raw.text_coverage = round(coverage, 4)
     return ScoredCandidate(raw=raw, score=round(score, 4), coverage=coverage, density=density)
@@ -341,12 +489,31 @@ def _build_structure(
     if not rows:
         return None
 
+    # The grid may not contain the header row at all (the OCR saw the header as
+    # one line above the ruled area).  The document still names its columns, so
+    # that line is used instead of exporting "Coluna N".
+    header_from_text = _header_line_above(raw, tokens, max(len(r) for r in rows))
+
+    # A header drawn without inner vertical rules arrives as a single cell
+    # ("Item Descricao Qtd Preco Total").  Without splitting it the table has
+    # no header at all and every column is named "Coluna N".
+    _unglue_header_row(rows, raw, tokens)
+    # The header may reveal more columns than the rows carried (a lost column
+    # boundary): re-pad the body to the final width before repairing cells.
+    final_width = max(len(row) for row in rows)
+    for row in rows:
+        while len(row) < final_width:
+            row.append("")
+    _split_shifted_cells(rows)
+
     # Spans are detected on the final grid: computing them before the trims
     # made every index drift by the number of removed rows/columns.
     merged = _detect_spans(raw, rows)
 
     header_index, header_confidence = _header_index(rows, raw, tokens)
     headers: list[str] = []
+    if header_index is None and header_from_text:
+        headers = list(header_from_text)
     data_rows = rows
     if header_index is not None:
         headers = [_clean_header(cell, i) for i, cell in enumerate(rows[header_index])]
@@ -355,6 +522,12 @@ def _build_structure(
         data_rows = [r for r in data_rows if not _same_row(r, rows[header_index])]
     else:
         data_rows = [r for r in rows if not _generic_transposed_header(r)]
+
+    if _looks_like_prose(data_rows):
+        # A running text column (or an address block) is not a table: exporting
+        # it as one turns paragraphs into cells and hides the text sheet.  The
+        # body is what matters — a short header above prose proves nothing.
+        return None
 
     transposed = _looks_transposed(data_rows)
     if transposed:
@@ -410,6 +583,254 @@ def _build_structure(
     )
 
 
+def _looks_like_prose(rows: list[list[str]]) -> bool:
+    """True when the grid is running text laid out in columns, not a table.
+
+    Prose has no numeric column and its cells are sentences; a real table always
+    has short cells somewhere (or a number).  The test is intentionally narrow:
+    it only rejects grids where the majority of cells are long sentences.
+    """
+    cells = [cell.strip() for row in rows for cell in row if cell.strip()]
+    if not cells:
+        return True
+    # A grid whose cells carry several "Label:" markers is a form laid out in
+    # columns, not a table: exporting it hides every field behind a fake cell
+    # (and the field engine never sees those lines, because they are "inside a
+    # table").
+    label_cells = sum(1 for cell in cells if len(re.findall(r"\S+[:=]", cell)) >= 2)
+    if label_cells >= 2:
+        return True
+    if any(_NUMERIC.match(cell) for cell in cells):
+        return False
+    wordy = sum(1 for cell in cells if len(cell.split()) >= 8)
+    return wordy / len(cells) >= 0.6
+
+
+def _column_gap(box: BBox, x: float) -> float:
+    """Distance from *x* to a column box (0 when inside it)."""
+    if box.x0 <= x <= box.x1:
+        return 0.0
+    return box.x0 - x if x < box.x0 else x - box.x1
+
+
+def _glued_cell_bbox(raw: RawTable, text: str) -> BBox | None:
+    target = " ".join(text.split())
+    for cell in raw.cells:
+        if cell.missing or not cell.text:
+            continue
+        if " ".join(cell.text.split()) == target:
+            return cell.bbox
+    return None
+
+
+_NUMERIC_TAIL = re.compile(
+    r"^(?P<head>.+?\S)\s+(?P<tail>[-+]?(?:[R$€£]\s*)?\d[\d.,]*)$"
+)
+
+
+def _is_numeric_header(cell: str) -> bool:
+    label = _header_key_free(cell)
+    return label in {
+        "qtd", "qtde", "qnt", "quantidade", "qt",
+        "preco", "preço", "valor", "vlr", "vl", "unitario", "unitário",
+        "total", "subtotal", "desconto", "peso", "km",
+    }
+
+
+def _header_key_free(cell: str) -> str:
+    text = unicodedata.normalize("NFKD", (cell or "").lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _shift_rows_right_by_one(
+    rows: list[list[str]], numeric_column: list[bool], header: list[str]
+) -> None:
+    """Repair a grid whose data rows lost one column boundary.
+
+    In a receipt the quantity sits so close to the description that the two
+    arrive as one cell, and every row then holds one value fewer than the header
+    (the last column stays empty).  The whole row is shifted, so the repair is an
+    *insertion*: the trailing number of the first cell that is followed by a
+    number becomes its own column and everything to its right moves one column.
+
+    Only fires with strong evidence: at least two data rows, the same number of
+    filled cells in every one of them, and the header clearly having one more
+    column than the rows.
+    """
+    data = rows[1:] if len(rows) > 1 else []
+    if len(data) < 2 or not numeric_column:
+        return
+    width = max(len(row) for row in rows)
+    filled = [sum(1 for cell in row if cell.strip()) for row in data]
+    if len(set(filled)) != 1 or filled[0] >= width:
+        return
+    header_filled = sum(1 for cell in header if str(cell).strip())
+    if header_filled <= filled[0]:
+        return
+    for row in data:
+        for column in range(len(row) - 1):
+            cell = row[column]
+            if not cell.strip() or not str(row[column + 1]).strip():
+                continue
+            match = _NUMERIC_TAIL.match(cell.strip())
+            if not match:
+                continue
+            head, tail = match.group("head").strip(), match.group("tail").strip()
+            if not head or _NUMERIC.match(head):
+                continue
+            row[column] = head
+            row.insert(column + 1, tail)
+            while len(row) > width:
+                row.pop()
+            break
+
+
+def _split_shifted_cells(rows: list[list[str]]) -> None:
+    """Move a number that stuck to the previous cell into its own column.
+
+    A receipt prints ``01 Treinamento 2 376.92 753.84``; the gap between the
+    description and the quantity is smaller than the column gap, so the grid
+    arrives as ``["01", "Treinamento 2", "", "376,92", "753,84"]``.  The
+    numeric column on the right is empty (or its header says "Qtd") and the
+    cell on the left ends with a number: moving the trailing number is the only
+    reading consistent with the header.
+    """
+    if len(rows) < 2:
+        return
+    width = max(len(row) for row in rows)
+    numeric_column: list[bool] = []
+    for column in range(width):
+        values = [row[column].strip() for row in rows if column < len(row) and row[column].strip()]
+        numeric_column.append(
+            bool(values) and sum(1 for value in values if _NUMERIC.match(value)) / len(values) >= 0.6
+        )
+    header = rows[0] if rows else []
+    _shift_rows_right_by_one(rows, numeric_column, header)
+    for row in rows:
+        for column in range(width - 1):
+            target = column + 1
+            header_hint = target < len(header) and _is_numeric_header(header[target])
+            if not (numeric_column[target] or header_hint):
+                continue
+            if target < len(row) and row[target].strip():
+                continue
+            cell = row[column] if column < len(row) else ""
+            match = _NUMERIC_TAIL.match(cell.strip())
+            if not match:
+                continue
+            head, tail = match.group("head").strip(), match.group("tail").strip()
+            if not head or _NUMERIC.match(head):
+                continue
+            row[column] = head
+            row[target] = tail
+
+
+def _unglue_header_row(rows: list[list[str]], raw: RawTable, tokens: list[Token]) -> None:
+    """Split a header row that a merged cell glued into one column.
+
+    Layouts drawn with horizontal rules only (or with a header band that has no
+    inner vertical rules) arrive as ``["Item Descricao Qtd Preco Total", "", ...]``.
+    Redistribution is deterministic and conservative:
+
+    1. one word per column when the word count equals the column count;
+    2. otherwise the words keep their geometry and are placed in the column
+       that contains their centre.
+
+    Anything ambiguous leaves the row untouched: inventing a header is worse
+    than exporting "Coluna N".
+    """
+    if not rows:
+        return
+    first = rows[0]
+    width = len(first)
+    filled = [index for index, cell in enumerate(first) if cell.strip()]
+    if width < 3 or len(filled) != 1:
+        return
+    text = first[filled[0]]
+    words = text.split()
+    if len(words) < 2:
+        return
+    if len(words) == width:
+        rows[0] = words
+        return
+
+    columns = list(getattr(raw, "col_boxes", []) or [])
+    if len(columns) != width:
+        # The grid has fewer columns than the header labels.  A receipt prints
+        # "Item Descricao Qtd Preco Total" as one cell while the data rows lost
+        # the Qtd boundary: the labels are the only evidence of the real width,
+        # so the row is split one word per column and the caller pads the body.
+        if (
+            len(words) > width
+            and len(words) <= width + 2
+            and all(word.isalpha() and len(word) <= 14 for word in words)
+        ):
+            rows[0] = words
+        return
+    box = _glued_cell_bbox(raw, text)
+    if box is None:
+        return
+    inside = [
+        token
+        for token in tokens
+        if box.contains_point(token.bbox.x_center, token.bbox.y_center, tol=2.0)
+    ]
+    if len(inside) < 2:
+        return
+    buckets: list[list[str]] = [[] for _ in range(width)]
+    for token in sorted(inside, key=lambda item: item.bbox.x0):
+        target = min(range(width), key=lambda index: _column_gap(columns[index], token.bbox.x_center))
+        buckets[target].append(token.text)
+    placed = sum(1 for bucket in buckets if bucket)
+    if placed < max(2, width // 2):
+        return
+    rows[0] = [" ".join(bucket).strip() for bucket in buckets]
+
+
+def _header_line_above(raw: RawTable, tokens: list[Token], width: int) -> list[str] | None:
+    """Column labels from the text line sitting immediately above the grid."""
+    if width < 2 or not tokens:
+        return None
+    from engine.tables.text_pattern import _QUANTITY_LABELS, _close_to_label
+
+    heights = [token.bbox.height for token in tokens if token.bbox.height > 0]
+    tolerance = max(2.0, (median(heights) or 8.0) * 0.6)
+    groups: list[list[Token]] = []
+    for token in sorted(tokens, key=lambda item: (item.bbox.y_center, item.bbox.x0)):
+        for group in groups:
+            if abs(group[0].bbox.y_center - token.bbox.y_center) <= tolerance:
+                group.append(token)
+                break
+        else:
+            groups.append([token])
+
+    best: tuple[float, list[Token]] | None = None
+    for group in groups:
+        group.sort(key=lambda item: item.bbox.x0)
+        bottom = max(token.bbox.y1 for token in group)
+        gap = raw.bbox.y0 - bottom
+        if gap < -2.0 or gap > 140.0:
+            continue
+        # The recogniser may return the whole header as one token
+        # ("Item Descrição Qtd Preco Total"); the labels are still there.
+        words = [word for token in group for word in token.text.split()]
+        known = sum(1 for word in words if _close_to_label(word, _QUANTITY_LABELS))
+        if known < 3 or len(words) < 3:
+            continue
+        if any(word.endswith((":", "=")) for word in words):
+            # A form line, not a column header.
+            continue
+        if best is None or gap < best[0]:
+            best = (gap, words)
+    if best is None:
+        return None
+    words = best[1]
+    if len(words) > width:
+        return None
+    return words + [f"Coluna {index + 1}" for index in range(len(words), width)]
+
+
 def _clean_header(cell: str, index: int) -> str:
     text = " ".join((cell or "").split())
     if not text:
@@ -454,6 +875,16 @@ def _header_index(
     non_empty = [c for c in first if c.strip()]
     if len(non_empty) < max(2, len(first) // 2):
         return None, 0.0
+    # A first row made only of column labels is a header, whatever the numeric
+    # signals say: OCR pages often lose the ruled header band and the labels end
+    # up as the first data row ("Coluna 1..5" otherwise).
+    known_labels = sum(
+        1
+        for cell in non_empty
+        if _close_to_label(cell, _QUANTITY_LABELS) and not any(ch.isdigit() for ch in cell)
+    )
+    if known_labels >= 3:
+        return 0, 0.8
     if any(_NUMERIC.match(c) for c in non_empty):
         return None, 0.0
 

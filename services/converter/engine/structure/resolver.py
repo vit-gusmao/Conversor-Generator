@@ -17,7 +17,7 @@ Rules applied here:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from audit.events import EVT_SHEET_CREATED, AuditRecorder
 from audit.evidence import column_letter
@@ -35,6 +35,7 @@ from models.document import (
     DEST_TABLE,
     DEST_TEXT,
     DEST_UNCLASSIFIED,
+    SHEET_CONSOLIDATED,
     SHEET_RECORDS,
     SHEET_TABLE,
     SHEET_TEXT,
@@ -82,6 +83,7 @@ def build_workbook(
         ir.tables, locale, used_names, recorder, block_for, _field_boxes(records)
     )
 
+    _dedupe_record_rows(record_sheets, recorder)
     result.plan.sheets.extend(record_sheets)
     result.plan.sheets.extend(table_sheets)
 
@@ -100,6 +102,13 @@ def build_workbook(
         result.plan.sheets.append(unclassified)
 
     _mark_remaining_destinations(ir, text_sheet, unclassified, result.plan)
+
+    # The consolidated view is built *after* every destination is known: it
+    # repeats rows that already exist, so it must never own a block.
+    consolidated = _build_consolidated_sheet(result.plan, used_names, recorder)
+    if consolidated is not None:
+        result.plan.sheets.insert(0, consolidated)
+
     _reindex(result.plan)
     _apply_excel_limits(result.plan, recorder)
     return result
@@ -211,6 +220,39 @@ class _RecordGroup:
     labels: set[str] = field(default_factory=set)
 
 
+def _dedupe_record_rows(sheets: list[SheetPlan], recorder: AuditRecorder | None) -> None:
+    """Collapse rows that are identical in every column.
+
+    A document scanned twice (one native page, one raster page) produces the
+    same entity on two pages; the workbook showed the record three times.  Only
+    *whole rows* that match exactly are collapsed, and the removal is registered,
+    so a legitimate repetition is never silent.
+    """
+    for sheet in sheets:
+        if not sheet.rows:
+            continue
+        seen: set[tuple[str, ...]] = set()
+        kept: list[list[CellPlan | None]] = []
+        removed = 0
+        for row in sheet.rows:
+            key = tuple((cell.display if cell is not None else "") for cell in row)
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            kept.append(row)
+        if removed:
+            sheet.rows = kept
+            if recorder:
+                recorder.issue(
+                    "DUPLICATE_ROWS_REMOVED",
+                    f"{removed} linha(s) idêntica(s) removida(s) da aba '{sheet.name}' "
+                    "(mesma informação repetida em outra página).",
+                    severity="warning",
+                    context={"sheet": sheet.name, "removed": removed},
+                )
+
+
 def _group_records(records: list[Record]) -> list[_RecordGroup]:
     groups: list[_RecordGroup] = []
     for record in records:
@@ -236,7 +278,80 @@ def _group_records(records: list[Record]) -> list[_RecordGroup]:
         target.labels |= signature
         if not target.section and record.section:
             target.section = record.section
-    return groups
+    return _absorb_lone_records(groups)
+
+
+def _absorb_lone_records(groups: list[_RecordGroup]) -> list[_RecordGroup]:
+    """Fold a one-field record into the single main record on its page.
+
+    A footer line (`ID: ...`) or a stray label creates a record whose labels
+    have nothing in common with the rest of the page, so it would become its own
+    sheet with one column.  When the page carries exactly one substantial record
+    and the stray record has a single field, the stray data belongs to that
+    entity: it becomes one more column of the same row.
+
+    The rule is deliberately narrow: two records with the same shape (several
+    employees, several invoices) are never folded together.
+    """
+
+    def fold(lone: Record, host: Record) -> bool:
+        existing = {_canon(field.label) for field in host.fields}
+        extra = [field for field in lone.fields if _canon(field.label) not in existing]
+        if not extra:
+            return False
+        host.fields.extend(extra)
+        host.finalize()
+        return True
+
+    # 1. Same group: a footer line (`ID: ...`) that the vertical rhythm cut from
+    # the main record becomes one more column of that row.
+    for group in groups:
+        if len(group.records) < 2:
+            continue
+        kept: list[Record] = []
+        for record in group.records:
+            if len(record.fields) == 1:
+                host = next(
+                    (
+                        candidate
+                        for candidate in group.records
+                        if candidate is not record
+                        and candidate.page_number == record.page_number
+                        and len(candidate.fields) >= 2
+                    ),
+                    None,
+                )
+                if host is not None and fold(record, host):
+                    continue
+            kept.append(record)
+        group.records = kept
+
+    # 2. Across groups: a lone record whose labels overlap nothing else.
+    for group in groups:
+        if len(group.records) != 1:
+            continue
+        lone = group.records[0]
+        if len(lone.fields) != 1:
+            continue
+        host = next(
+            (
+                candidate
+                for candidate in groups
+                if candidate is not group
+                and len(candidate.records) == 1
+                and candidate.records[0].page_number == lone.page_number
+                and len(candidate.records[0].fields) >= 2
+            ),
+            None,
+        )
+        if host is None:
+            continue
+        host_record = host.records[0]
+        if not fold(lone, host_record):
+            continue
+        host.labels |= {_canon(field.label) for field in lone.fields}
+        group.records = []
+    return [group for group in groups if group.records]
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -539,6 +654,129 @@ def _cell_bbox(table: TableStructure, row_index: int, column_index: int) -> BBox
         if column.width > 0:
             return BBox(column.x0, table.bbox.y0, column.x1, table.bbox.y1)
     return table.bbox
+
+
+# --------------------------------------------------------------------------- #
+# Consolidated view
+# --------------------------------------------------------------------------- #
+
+CONSOLIDATED_SHEET_NAME = "Todos os dados"
+#: Provenance columns that open the consolidated sheet.  They are the only
+#: columns the resolver adds; every other header comes from the document.
+_CONSOLIDATED_LEAD: tuple[str, ...] = ("Aba", "Página")
+
+
+def _header_key(header: str) -> str:
+    return " ".join((header or "").lower().replace(":", "").split())
+
+
+def _build_consolidated_sheet(
+    plan: WorkbookPlan,
+    used_names: set[str],
+    recorder: AuditRecorder | None = None,
+) -> SheetPlan | None:
+    """One sheet holding every record/table row with the union of all columns.
+
+    The download stays a single workbook: independent tables keep their own
+    tabs (nothing is merged blindly), and this extra tab gives the reader the
+    whole document in one flat, sortable table.  Rows are copied, never
+    re-extracted, so the consolidated view can never disagree with the origin
+    tabs; the `Aba` column says which tab each row came from.
+
+    A single structural sheet already *is* the whole document, so the extra tab
+    is only created when there are at least two.
+    """
+    sources = [sheet for sheet in plan.sheets if sheet.kind in {SHEET_RECORDS, SHEET_TABLE} and sheet.rows]
+    if len(sources) < 2:
+        return None
+
+    lead = list(_CONSOLIDATED_LEAD)
+    columns: list[str] = []
+    index_of: dict[str, int] = {}
+    maps: dict[str, dict[int, int]] = {}
+    for source in sources:
+        mapping: dict[int, int] = {}
+        for column_index, header in enumerate(source.headers):
+            key = _header_key(header)
+            if key not in index_of:
+                # First appearance wins: the document decides column order, the
+                # same way it does inside a record sheet.
+                index_of[key] = len(columns)
+                columns.append(header or f"Coluna {column_index + 1}")
+            mapping[column_index] = index_of[key]
+        maps[source.name] = mapping
+
+    headers = _unique_headers(lead + columns)
+    offset = len(lead)
+    sheet = SheetPlan(
+        name=_sanitize_sheet_name(CONSOLIDATED_SHEET_NAME, used_names),
+        kind=SHEET_CONSOLIDATED,
+        headers=headers,
+        notes=(
+            "Visão consolidada: uma linha por registro/tabela, com a união das "
+            "colunas de todas as abas. A coluna 'Aba' indica a origem."
+        ),
+    )
+    pages: set[int] = set()
+    for source in sources:
+        mapping = maps[source.name]
+        for row in source.rows:
+            page = next((cell.page_number for cell in row if cell is not None and cell.page_number), None)
+            out: list[CellPlan | None] = [None] * len(headers)
+            out[0] = CellPlan(
+                value=source.name,
+                display=source.name,
+                value_type="text",
+                header=headers[0],
+                original=source.name,
+                number_format="@",
+                element_id=None,
+                page_number=page,
+            )
+            if page is not None:
+                out[1] = CellPlan(
+                    value=page,
+                    display=str(page),
+                    value_type="integer",
+                    header=headers[1],
+                    original=str(page),
+                    number_format="#,##0",
+                    page_number=page,
+                )
+                pages.add(page)
+            has_data = False
+            for column_index, cell in enumerate(row):
+                target = mapping.get(column_index)
+                if cell is None or target is None:
+                    continue
+                slot = offset + target
+                if out[slot] is not None:
+                    # The same header was already filled by another column of
+                    # this same row: keep the first value, never invent a merge.
+                    continue
+                out[slot] = replace(cell, header=headers[slot])
+                has_data = True
+            if has_data:
+                sheet.rows.append(out)
+
+    if not sheet.rows:
+        return None
+    sheet.source_pages = sorted(pages)
+    if recorder:
+        recorder.emit(
+            EVT_SHEET_CREATED,
+            "normalize",
+            f"Aba '{sheet.name}' criada com {sheet.n_rows} linha(s) e {sheet.n_cols} coluna(s) "
+            f"(união de {len(sources)} abas)",
+            payload={
+                "sheet": sheet.name,
+                "kind": sheet.kind,
+                "rows": sheet.n_rows,
+                "columns": headers,
+                "sources": [source.name for source in sources],
+            },
+        )
+    return sheet
 
 
 # --------------------------------------------------------------------------- #

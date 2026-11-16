@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from audit.coverage import aggregate_coverage
 from models.document import (
+    SHEET_CONSOLIDATED,
     SHEET_RECORDS,
     DocumentIR,
     WorkbookPlan,
@@ -143,14 +144,18 @@ def validate_plan(plan: WorkbookPlan, ir: DocumentIR) -> list[ValidationCheck]:
         )
     )
 
+    # Provenance is measured on the sheets that carry extraction results: the
+    # consolidated tab is a derived copy (its "Aba"/"Página" columns are added
+    # by the resolver), so counting it would dilute a real provenance failure.
+    source_sheets = [sheet for sheet in sheets if sheet.kind != SHEET_CONSOLIDATED]
     cells_without_source = [
         cell
-        for sheet in sheets
+        for sheet in source_sheets
         for row in sheet.rows
         for cell in row
         if cell is not None and cell.element_id is None
     ]
-    total_cells = sum(1 for s in sheets for r in s.rows for c in r if c is not None)
+    total_cells = sum(1 for s in source_sheets for r in s.rows for c in r if c is not None)
     ratio = (len(cells_without_source) / total_cells) if total_cells else 0.0
     checks.append(
         ValidationCheck(

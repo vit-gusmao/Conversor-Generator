@@ -276,13 +276,17 @@ class TestGlmOcrEngine:
         assert [w.text for w in words if w.text.startswith("Nome")] == ["Nome:"]
         assert all(w.confidence == settings.glmocr_confidence for w in words)
 
-    def test_recognize_falls_back_to_even_distribution(self):
+    def test_recognize_splits_one_band_into_the_recognised_lines(self):
+        # One ink band, three recognised lines: the band is split by its own
+        # height, so every line stays where its ink is instead of being spread
+        # over the whole page.
         poster, _ = _fake_poster("um\ndois\ntres")
         engine = GlmOcrEngine(client=_client(poster))
         words = engine.recognize(_bars_image([(60, 80)]), mode="page")
-        assert engine.boxing_method == "even_distribution"
+        assert engine.boxing_method == "band_split_v1"
         bands = sorted({round(w.bbox_px[1]) for w in words})
         assert len(bands) == 3
+        assert all(60 <= top <= 80 for top in bands)
 
     def test_recognize_table_prompt_for_table_mode(self):
         poster, calls = _fake_poster("<table><tr><td>a</td></tr></table>")

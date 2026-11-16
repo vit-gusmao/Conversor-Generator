@@ -25,15 +25,78 @@ class RasterPage:
     scale: float
     image: object  # PIL.Image.Image
     dpi: int
+    #: clockwise rotation already applied to `image` (0/90/180/270)
+    rotation: int = 0
 
     def to_points(self, pixel_bbox: tuple[float, float, float, float]) -> BBox:
         x0, y0, x1, y1 = pixel_bbox
+        if self.rotation:
+            x0, y0, x1, y1 = _unrotate_bbox(
+                (x0, y0, x1, y1), self.rotation, self.width_px, self.height_px
+            )
         return BBox(
             x0=x0 / self.scale,
             y0=y0 / self.scale,
             x1=x1 / self.scale,
             y1=y1 / self.scale,
         )
+
+    @property
+    def width_px(self) -> int:
+        return int(getattr(self.image, "width", 0))
+
+    @property
+    def height_px(self) -> int:
+        return int(getattr(self.image, "height", 0))
+
+    def rotated(self, angle: int) -> "RasterPage":
+        """Return a copy whose image was rotated clockwise by *angle* degrees.
+
+        Coordinates produced on the rotated image are mapped back to the page by
+        `to_points`, so token geometry stays in the original visual space — the
+        reason a plain ``image.rotate()`` used to place every word outside the
+        page.
+        """
+        angle = angle % 360
+        if angle == 0:
+            return self
+        rotated_image = self.image.rotate(-angle, expand=True)
+        width_pt, height_pt = self.width_pt, self.height_pt
+        if angle in (90, 270):
+            width_pt, height_pt = height_pt, width_pt
+        return RasterPage(
+            page_number=self.page_number,
+            width_pt=width_pt,
+            height_pt=height_pt,
+            scale=self.scale,
+            image=rotated_image,
+            dpi=self.dpi,
+            rotation=angle,
+        )
+
+
+def _unrotate_bbox(
+    box: tuple[float, float, float, float], angle: int, width: int, height: int
+) -> tuple[float, float, float, float]:
+    """Map a box from the rotated image back to the original pixel space.
+
+    ``width``/``height`` are the dimensions of the *rotated* image.
+    """
+    x0, y0, x1, y1 = box
+    corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+    mapped: list[tuple[float, float]] = []
+    for x, y in corners:
+        if angle == 90:  # clockwise: new_x = H-1-y, new_y = x
+            mapped.append((y, width - 1 - x))
+        elif angle == 180:
+            mapped.append((width - 1 - x, height - 1 - y))
+        elif angle == 270:  # counter-clockwise 90
+            mapped.append((height - 1 - y, x))
+        else:
+            mapped.append((x, y))
+    xs = [point[0] for point in mapped]
+    ys = [point[1] for point in mapped]
+    return min(xs), min(ys), max(xs), max(ys)
 
 
 def _open_document(source: bytes | str | Path):

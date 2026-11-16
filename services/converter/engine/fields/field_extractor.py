@@ -14,6 +14,7 @@ resolver can still send it to the free-text sheet.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from audit.events import AuditRecorder
@@ -25,7 +26,7 @@ from engine.fields.label_detector import (
     split_label_value,
     split_two_columns,
 )
-from models.document import BBox, Field, Line, TextBlock, median
+from models.document import BBox, Field, Line, TextBlock, Token, median
 
 
 @dataclass(slots=True)
@@ -61,8 +62,86 @@ def extract_fields(
             ):
                 result.consumed_block_ids.add(block.element_id)
 
+    _cross_block_label_rows(blocks, result, page_number, sections, recorder)
     _merge_multiline_values(result.fields)
     return result
+
+
+def _cross_block_label_rows(
+    blocks: list[TextBlock],
+    result: FieldExtraction,
+    page_number: int,
+    sections: dict[str, str | None],
+    recorder: AuditRecorder | None,
+) -> None:
+    """`Nome: Data:` in one block, the values in the block right below.
+
+    The layout engine splits a label line and its value line into separate
+    blocks when the vertical gap is large enough, so the in-block pass never
+    sees them together.  The pairing is geometric and strict: single-line label
+    block, single-line value block directly below, and at least two value
+    segments so that one label is never invented from a stray line.
+    """
+    ordered = sorted(blocks, key=lambda block: (block.reading_order, block.bbox.y0))
+    for position, block in enumerate(ordered):
+        if block.element_id in result.consumed_block_ids:
+            continue
+        lines = [line for line in block.lines if line.text.strip()]
+        if len(lines) != 1:
+            continue
+        segments = _label_row(lines[0])
+        if segments is None:
+            continue
+        for candidate in ordered[position + 1 : position + 3]:
+            if candidate.element_id in result.consumed_block_ids:
+                continue
+            value_lines = [line for line in candidate.lines if line.text.strip()]
+            if len(value_lines) != 1:
+                continue
+            gap = candidate.bbox.y0 - block.bbox.y1
+            if gap < -2 or gap > max(26.0, block.bbox.height * 2.6):
+                continue
+            value_line = value_lines[0]
+            if split_label_value(value_line) or label_only(value_line) is not None:
+                continue
+            pairs = _pair_label_row_with_values(segments, value_line)
+            if not pairs:
+                continue
+            section = sections.get(block.element_id)
+            created = 0
+            for segment, value_words in pairs:
+                value_text = " ".join(word.text for word in value_words).strip()
+                if not value_text:
+                    continue
+                result.fields.append(
+                    Field(
+                        label=segment.label,
+                        value=value_text,
+                        page_number=page_number,
+                        label_bbox=segment.label_bbox,
+                        value_bbox=BBox.union_all(word.bbox for word in value_words),
+                        element_ids=[word.element_id for word in segment.label_words + value_words],
+                        separator="below",
+                        confidence=0.74,
+                        reason_codes=["label_row", "values_below", "cross_block"],
+                        section=section,
+                    )
+                )
+                created += 1
+            if created:
+                result.consumed_block_ids.add(block.element_id)
+                result.consumed_block_ids.add(candidate.element_id)
+                if recorder:
+                    recorder.decide(
+                        stage="field_resolution",
+                        subject=f"{block.text.strip()[:60]!r} / linha de valores",
+                        accepted=True,
+                        algorithm="field-resolver-v1",
+                        reason_codes=["label_row", "values_below", "cross_block"],
+                        page=page_number,
+                        payload={"fields": created, "gap": round(gap, 2)},
+                    )
+            break
 
 
 def _sections(blocks: list[TextBlock]) -> dict[str, str | None]:
@@ -77,8 +156,43 @@ def _sections(blocks: list[TextBlock]) -> dict[str, str | None]:
     for block in sorted(blocks, key=lambda b: (b.page_number, b.reading_order)):
         mapping[block.element_id] = current
         if block.kind == "title" or _looks_like_section_title(block):
+            if _looks_like_table_header(block.text):
+                # "Item Descrição Qtd Preco Total" names columns, not a section:
+                # accepting it renamed the fields below the table.
+                continue
+            if ":" in block.text or "=" in block.text:
+                # A label/value line is data.  The layout can call it a title
+                # (it is short and starts with a capital), and then it renamed
+                # the section of the following fields — splitting one form into
+                # two sheets.
+                continue
+            if _digit_tokens(block.text) >= 2:
+                # The layout can call a value row a title ("Maria Carolina Demo
+                # 29 01 2025").  Data must never rename the section: it split a
+                # single record into several sheets.
+                continue
             current = block.text.strip().split("\n")[0][:120]
     return mapping
+
+
+def _looks_like_table_header(text: str) -> bool:
+    from engine.tables.text_pattern import _QUANTITY_LABELS, _close_to_label
+
+    words = (text or "").split()
+    if len(words) < 3:
+        return False
+    return sum(1 for word in words if _close_to_label(word, _QUANTITY_LABELS)) >= 3
+
+
+def _digit_tokens(text: str) -> int:
+    return sum(1 for word in (text or "").split() if any(ch.isdigit() for ch in word))
+
+
+_DATA_IN_TITLE = re.compile(
+    r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"  # dates
+    r"|\d{1,3}(?:\.\d{3})*,\d{2}"  # pt-BR money / decimals
+    r"|R\$\s*\d"  # currency
+)
 
 
 def _looks_like_section_title(block: TextBlock) -> bool:
@@ -93,6 +207,14 @@ def _looks_like_section_title(block: TextBlock) -> bool:
     if len(lines) != 1:
         return False
     words = text.split()
+    # Data is not a heading: a date, an amount or two or more numeric tokens
+    # means this is a value row ("Maria Carolina Demo 29/01/2025",
+    # "03 Deslocamento 12 266.85").  Making it a section split one record into
+    # several sheets.
+    if _DATA_IN_TITLE.search(text):
+        return False
+    if sum(1 for word in words if any(ch.isdigit() for ch in word)) >= 2:
+        return False
     return len(words) <= 6 and (text.isupper() or text.istitle())
 
 
@@ -197,6 +319,47 @@ def _process_block(
                 payload={"label": field.label, "value": field.value, "separator": "below"},
             )
 
+    # -- pass 2b: a row of labels, the values on the row below --------------
+    # Two-column forms print "Nome: Data:" on one line and the two values on
+    # the next.  Pass 2 only understands a single label, so those forms produced
+    # no field at all.
+    for index, line in enumerate(lines):
+        if (block.element_id, line.index) in result.consumed_lines:
+            continue
+        pending_row = _label_row(line)
+        if pending_row is None or index + 1 >= len(lines):
+            continue
+        value_line = lines[index + 1]
+        if (block.element_id, value_line.index) in result.consumed_lines:
+            continue
+        if split_label_value(value_line) or label_only(value_line) is not None:
+            continue
+        pairs = _pair_label_row_with_values(pending_row, value_line)
+        if not pairs:
+            continue
+        for segment, value_words in pairs:
+            value_text = " ".join(w.text for w in value_words).strip()
+            if not value_text:
+                continue
+            result.fields.append(
+                Field(
+                    label=segment.label,
+                    value=value_text,
+                    page_number=page_number,
+                    label_bbox=segment.label_bbox,
+                    value_bbox=BBox.union_all(w.bbox for w in value_words),
+                    element_ids=[w.element_id for w in segment.label_words + value_words],
+                    separator="below",
+                    confidence=0.78,
+                    reason_codes=["label_row", "values_below", "column_alignment"],
+                    line_index=line.index,
+                    section=section,
+                )
+            )
+            produced = True
+        result.consumed_lines.add((block.element_id, line.index))
+        result.consumed_lines.add((block.element_id, value_line.index))
+
     # -- pass 3: two geometric columns, no separator -----------------------
     # Runs even when pass 1/2 produced fields: a block can mix "Cargo: X" with
     # plain two-column rows, and those rows used to be dropped.
@@ -234,6 +397,93 @@ def _process_block(
                     )
 
     return produced
+
+
+def _label_row(line: Line) -> list[Segment] | None:
+    """``Nome: Data:`` — two or more labels sharing one line, no values.
+
+    Every word after the last label must end with a separator; a line that mixes
+    labels and free text is not a label row.
+    """
+    words = [word for word in line.words if word.text.strip()]
+    if len(words) < 2:
+        return None
+    groups: list[list[Token]] = []
+    current: list[Token] = []
+    for word in words:
+        current.append(word)
+        if word.text.strip().endswith((":", "=")):
+            groups.append(current)
+            current = []
+    if current or len(groups) < 2:
+        return None
+    segments: list[Segment] = []
+    for group in groups:
+        label_words = [word for word in group if word.text.strip() not in {":", "="}]
+        if label_words:
+            last = label_words[-1]
+            text = last.text.rstrip(":=").strip()
+            if text and text != last.text:
+                label_words = label_words[:-1] + [
+                    Token(
+                        element_id=last.element_id,
+                        text=text,
+                        bbox=last.bbox,
+                        page_number=last.page_number,
+                        origin=last.origin,
+                        font=last.font,
+                        size=last.size,
+                        direction=last.direction,
+                        confidence=last.confidence,
+                        index=last.index,
+                        engine=last.engine,
+                    )
+                ]
+        label = " ".join(word.text for word in label_words).strip()
+        if not label or not is_label_like(label):
+            return None
+        segments.append(
+            Segment(
+                label=label,
+                value="",
+                label_words=label_words,
+                value_words=[],
+                separator="colon",
+                reason_codes=["label_row", "values_below"],
+                confidence=0.68,
+            )
+        )
+    return segments
+
+
+def _pair_label_row_with_values(
+    segments: list[Segment], value_line: Line
+) -> list[tuple[Segment, list[Token]]]:
+    """Match each label of the row with the value segment under it.
+
+    Values are split at wide gaps and assigned to the label whose left edge is
+    closest: forms align the value with its label horizontally.
+    """
+    words = [word for word in value_line.words if word.text.strip()]
+    if not words:
+        return []
+    sizes = [word.size for word in words if word.size]
+    height = median(sizes) or 10.0
+    gap_threshold = max(12.0, height * 1.8)
+    chunks: list[list[Token]] = [[words[0]]]
+    for previous, word in zip(words, words[1:]):
+        if word.bbox.x0 - previous.bbox.x1 >= gap_threshold:
+            chunks.append([word])
+        else:
+            chunks[-1].append(word)
+    if len(chunks) < 2:
+        return []
+    pairs: list[tuple[Segment, list[Token]]] = []
+    for chunk in chunks:
+        left = BBox.union_all(word.bbox for word in chunk).x0
+        segment = min(segments, key=lambda item: abs(item.label_bbox.x0 - left))
+        pairs.append((segment, chunk))
+    return pairs
 
 
 def _extend_multiline(

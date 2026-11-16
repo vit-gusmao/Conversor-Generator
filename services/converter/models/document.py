@@ -40,6 +40,10 @@ SHEET_TABLE = "table"
 SHEET_TEXT = "text"
 SHEET_UNCLASSIFIED = "unclassified"
 SHEET_METADATA = "metadata"
+#: Derived sheet that repeats every record/table row with the union of all
+#: columns, so the whole document can be filtered/sorted in one place.  It is
+#: built from the other sheets, never from new extraction.
+SHEET_CONSOLIDATED = "consolidated"
 
 DEST_FIELD = "field"
 DEST_TABLE = "table"

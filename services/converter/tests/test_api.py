@@ -61,7 +61,8 @@ def test_full_conversion_flow(api_client, pdf_paths):
 
     result = api_client.get(f"/api/v1/conversions/{conversion_id}/result", headers={"x-device-id": device}).json()
     assert result["pages"] == 1
-    assert result["sheets_count"] == 3
+    # records + table + text + consolidated ("Todos os dados")
+    assert result["sheets_count"] == 4
 
     preview = api_client.get(
         f"/api/v1/conversions/{conversion_id}/preview", headers={"x-device-id": device}

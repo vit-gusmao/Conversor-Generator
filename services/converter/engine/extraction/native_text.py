@@ -30,6 +30,12 @@ class NativePage:
     rotated_tokens: list[Token] = field(default_factory=list)
     char_count: int = 0
     visible_char_count: int = 0
+    #: fraction of the shown characters drawn with an invisible render mode
+    #: (``3 Tr``/``7 Tr``).  ``0.0`` when the page has no such text.
+    invisible_render_ratio: float = 0.0
+    #: the text layer is not what a human sees: it may only be trusted when
+    #: there is nothing visible to read instead
+    text_is_invisible: bool = False
     quality: dict[str, float] = field(default_factory=dict)
     has_text_layer: bool = False
     is_blank: bool = True
@@ -205,7 +211,7 @@ def _join_char_run(run: list[dict]) -> dict:
     }
 
 
-def extract_native(pdf_page, page_number: int) -> NativePage:
+def extract_native(pdf_page, page_number: int, *, invisible_ratio: float | None = None) -> NativePage:
     rotation = int(getattr(pdf_page, "rotation", 0) or 0) % 360
     raw_w = float(getattr(pdf_page, "width", 0.0) or 0.0)
     raw_h = float(getattr(pdf_page, "height", 0.0) or 0.0)
@@ -327,6 +333,14 @@ def extract_native(pdf_page, page_number: int) -> NativePage:
 
     page.char_count = char_count
     page.visible_char_count = visible_chars
+    # `Tr 3`/`Tr 7` text contributes nothing to the page a human sees.  It is
+    # not "no text": it is text that cannot be verified visually, and the OCR
+    # decision must know that.
+    if invisible_ratio is not None:
+        page.invisible_render_ratio = max(0.0, min(1.0, float(invisible_ratio)))
+    page.text_is_invisible = (
+        char_count >= 10 and page.invisible_render_ratio >= 0.9 and visible_chars > 0
+    )
     page.quality = _assess_quality(
         page,
         replacement=replacement,
@@ -363,6 +377,9 @@ def _assess_quality(
     score -= min(0.6, replacement_ratio * 4.0)
     score -= min(0.4, control_ratio * 4.0)
     score -= min(0.5, invisible_ratio * 2.0)
+    # Invisible render mode is independent from colour: the glyphs are simply
+    # not painted, so the layer can never be confirmed against the page.
+    score -= min(0.5, page.invisible_render_ratio * 0.5)
     score -= min(0.3, tiny_ratio * 2.0)
 
     long_words = sum(1 for t in page.tokens if len(t.text) > 45)
@@ -396,6 +413,7 @@ def _assess_quality(
         "tiny_ratio": round(tiny_ratio, 4),
         "duplicate_ratio": round(duplicate_ratio, 4),
         "glued_ratio": round(glued_ratio, 4),
+        "invisible_render_ratio": round(page.invisible_render_ratio, 4),
         "fonts": float(unique_fonts),
         "median_font_size": round(median_size, 2),
     }
@@ -409,6 +427,10 @@ def classify_page(native: NativePage) -> str:
     """
     if native.is_blank:
         return "empty"
+    if native.text_is_invisible and native.image_coverage >= 0.35:
+        # What the reader sees is an image; the text layer is an invisible
+        # (often OCR-generated) overlay that cannot be trusted over it.
+        return "hybrid"
     if native.has_text_layer and native.image_coverage >= 0.55 and native.char_count < 80:
         return "hybrid"
     if native.has_text_layer:
@@ -430,6 +452,11 @@ def needs_ocr(native: NativePage) -> bool:
     """
     if native.is_blank:
         return False
+    if native.text_is_invisible:
+        # Invisible text cannot be validated against the page.  OCR is only
+        # attempted when there is something visible to read; with no image the
+        # hidden layer is the single source and stays (flagged in the audit).
+        return native.image_count > 0 or native.vector_count > 40
     if not native.has_text_layer:
         return native.image_count > 0 or native.vector_count > 10
     return native.quality.get("score", 1.0) < 0.55

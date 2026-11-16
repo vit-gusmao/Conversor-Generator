@@ -17,6 +17,7 @@ Two invariants hold at every step:
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -47,8 +48,9 @@ from config import settings
 from engine.excel.auditor import XlsxAudit, audit_xlsx
 from engine.excel.writer import ExcelResult, write_workbook
 from engine.extraction.native_text import NativePage, classify_page, extract_native, needs_ocr
+from engine.extraction.visibility import page_invisible_ratios
 from engine.fields.field_extractor import extract_fields
-from engine.fields.record_grouper import group_records
+from engine.fields.record_grouper import GroupingConfig, group_records
 from engine.inspector.pdf_inspector import PDFInspection, inspect_pdf
 from engine.layout.blocks import build_layout
 from engine.layout.reading_order import assign_reading_order
@@ -76,10 +78,14 @@ from models.document import (
     ORIGIN_OCR,
     REGION_FOOTER,
     REGION_HEADER,
+    BBox,
     DocumentIR,
     EngineUsage,
+    Field,
     PageResult,
+    Record,
     TextBlock,
+    median,
     WorkbookPlan,
 )
 
@@ -464,12 +470,26 @@ class ConversionPipeline:
             self.recorder.stage_end("inspect", pages=total)
             self.recorder.stage_start("extract", f"Extraindo texto de {total} página(s)")
 
+            invisible_ratios = page_invisible_ratios(self._data)
+            if invisible_ratios and any((ratio or 0) >= 0.9 for ratio in invisible_ratios[:total]):
+                hidden = sum(1 for ratio in invisible_ratios[:total] if (ratio or 0) >= 0.9)
+                self.recorder.emit(
+                    "INVISIBLE_TEXT_LAYER_DETECTED",
+                    "inspect",
+                    f"{hidden} página(s) possuem texto com modo de renderização invisível "
+                    "(não aparece na página); a camada será tratada como não confiável.",
+                    payload={"pages": hidden},
+                )
+
             for index in range(total):
                 if self.cancel_check and self.cancel_check():
                     raise ConversionError("CANCELLED", "Conversão cancelada pelo usuário.")
                 page_number = index + 1
                 try:
-                    context = self._process_page(index, page_number, pages[index], ocr, ir)
+                    ratio = invisible_ratios[index] if index < len(invisible_ratios) else None
+                    context = self._process_page(
+                        index, page_number, pages[index], ocr, ir, invisible_ratio=ratio
+                    )
                 except Exception as exc:  # noqa: BLE001
                     page = PageResult(
                         page_number=page_number,
@@ -576,9 +596,16 @@ class ConversionPipeline:
             )
 
     def _process_page(
-        self, index: int, page_number: int, page, ocr: OcrRunner, ir: DocumentIR
+        self,
+        index: int,
+        page_number: int,
+        page,
+        ocr: OcrRunner,
+        ir: DocumentIR,
+        *,
+        invisible_ratio: float | None = None,
     ) -> _PageContext:
-        native = extract_native(page, page_number)
+        native = extract_native(page, page_number, invisible_ratio=invisible_ratio)
         classification = classify_page(native)
         page_result = PageResult(
             page_number=page_number,
@@ -601,10 +628,21 @@ class ConversionPipeline:
                 if not native.has_text_layer
                 else f"qualidade da camada textual baixa ({native.quality.get('score', 0):.2f})"
             )
+            if native.text_is_invisible:
+                reason = (
+                    "texto da camada invisível (não aparece na página); "
+                    "o conteúdo visual precisa ser lido"
+                )
             outcome = ocr.run_page(index, page_number, reason=reason)
             if outcome.tokens:
                 ocr_recovered = True
-                if native.has_text_layer and native.quality.get("score", 0) >= 0.3:
+                if native.text_is_invisible:
+                    # The hidden layer cannot be verified against the page: the
+                    # characters OCR reads from the image are what a human sees,
+                    # so they replace the overlay instead of merging with it.
+                    tokens = outcome.tokens
+                    text_source = "ocr"
+                elif native.has_text_layer and native.quality.get("score", 0) >= 0.3:
                     kept_native = [t for t in tokens if not _is_suspicious(t)]
                     tokens = kept_native + deduplicate_ocr(kept_native, outcome.tokens)
                     text_source = "mixed"
@@ -619,6 +657,28 @@ class ConversionPipeline:
                 ocr.skip(page_number, "camada textual nativa utilizável")
             elif native.is_blank:
                 ocr.skip(page_number, "página sem conteúdo")
+
+        if native.text_is_invisible:
+            self.recorder.issue(
+                "INVISIBLE_TEXT_LAYER",
+                (
+                    f"O texto da página {page_number} está em modo de renderização invisível "
+                    f"({int(native.invisible_render_ratio * 100)}% dos caracteres). "
+                    + (
+                        "O conteúdo visual foi lido por OCR e prevaleceu sobre a camada oculta."
+                        if ocr_recovered
+                        else "Sem conteúdo visual para conferir: a camada oculta foi preservada "
+                        "e marcada como não verificável."
+                    )
+                ),
+                severity="warning",
+                page=page_number,
+                context={
+                    "invisible_render_ratio": round(native.invisible_render_ratio, 4),
+                    "ocr_used": ocr_recovered,
+                    "image_coverage": round(native.image_coverage, 3),
+                },
+            )
 
         if native.image_count and native.image_coverage >= 0.12 and not ocr_recovered:
             context = {
@@ -689,7 +749,11 @@ class ConversionPipeline:
         tables = detect_tables(
             page,
             page_number,
-            tokens,
+            # Rotated words are a separate text layer on the page (a vertical
+            # stamp, a rotated title).  Feeding them to the table detector made
+            # them land inside cell boxes ("ODA\n994.50"): they belong to the
+            # text column, not to the grid.
+            [token for token in tokens if token.direction in {"ltr", "rtl"}],
             blocks,
             rotation=native.rotation,
             page_width=native.width,
@@ -754,7 +818,9 @@ class ConversionPipeline:
                 block
                 for block in page.blocks
                 if block.kind not in {REGION_HEADER, REGION_FOOTER}
-                and not any(box.overlap_ratio(block.bbox) >= 0.55 for box in table_boxes)
+                # A block inside a table is table content: it must not be read
+                # as a label/value pair nor become the section of the next field.
+                and not any(block.bbox.overlap_ratio(box) >= 0.55 for box in table_boxes)
             ]
             extraction = extract_fields(candidates, page_number=page.page_number, recorder=self.recorder)
             page.fields = extraction.fields
@@ -762,6 +828,7 @@ class ConversionPipeline:
                 extraction.fields,
                 page_number=page.page_number,
                 blocks=page.blocks,
+                config=_grouping_config(extraction.fields),
             )
             ir.records.extend(page.records)
             build_regions(page, page.blocks, page.tables, page.fields, repeated)
@@ -796,6 +863,93 @@ class ConversionPipeline:
                     ]
                 },
             )
+            merged = self._merge_form_fields(pages, ir, inspection)
+            if merged:
+                ir.engines = _engine_usage(ir)
+                self.recorder.emit(
+                    "FORM_FIELDS_MERGED",
+                    "structure",
+                    f"{merged} valor(es) de formulário interativo incorporados ao workbook",
+                    payload={"merged": merged},
+                )
+
+    def _merge_form_fields(self, pages, ir: DocumentIR, inspection: PDFInspection) -> int:
+        """Turn AcroForm widget values into workbook fields.
+
+        A fillable PDF stores its data in the widget, not in the text layer:
+        the page shows only the labels and the drawn values are invisible to
+        text extraction.  Without this step a perfectly filled form converted
+        to an empty workbook.
+
+        The label is recovered from the page (the text immediately left of, or
+        above, the widget); when geometry is unavailable the internal field name
+        is cleaned (`Nome_001230` -> `Nome`).  Values already extracted from the
+        text layer are never duplicated.
+        """
+        if not inspection.form_fields:
+            return 0
+        by_page: dict[int, list[Field]] = {}
+        for item in inspection.form_fields:
+            value = str(item.value).strip() if item.value is not None else ""
+            if not value:
+                continue
+            page_number = item.page_number or 1
+            page = next((p for p in pages if p.page_number == page_number), None)
+            label = _form_field_label(page, item)
+            if not label:
+                continue
+            box = BBox(*item.bbox) if item.bbox else (page.bbox if page is not None else BBox.empty())
+            if box.is_empty:
+                continue
+            existing = [
+                field
+                for record in ir.records
+                if record.page_number == page_number
+                for field in record.fields
+            ]
+            if any(
+                field.label.strip().lower() == label.lower()
+                and field.value.strip().lower() == value.lower()
+                for field in existing
+            ):
+                continue
+            by_page.setdefault(page_number, []).append(
+                Field(
+                    label=label,
+                    value=value,
+                    page_number=page_number,
+                    label_bbox=box,
+                    value_bbox=box,
+                    separator="form",
+                    confidence=0.99,
+                    reason_codes=["acroform_widget"],
+                    section=None,
+                )
+            )
+        merged = 0
+        for page_number, fields in sorted(by_page.items()):
+            if not fields:
+                continue
+            # One entity per page: widget values belong to the record already
+            # read from the text layer, not to a second row/sheet.
+            page_records = [r for r in ir.records if r.page_number == page_number]
+            if len(page_records) == 1:
+                target = page_records[0]
+                target.fields.extend(fields)
+                target.finalize()
+                merged += len(fields)
+                continue
+            record = Record(
+                record_id=f"rec_form_{page_number:03d}",
+                page_number=page_number,
+                fields=fields,
+                section=fields[0].section,
+                origin="acroform",
+                order=len(ir.records),
+            )
+            ir.records.append(record.finalize())
+            merged += len(fields)
+        return merged
 
     def _normalize(self, ir: DocumentIR, contexts: list[_PageContext]) -> LocaleProfile:
         self.recorder.stage_start("normalize", "Detectando locale, deduplicando e unificando tabelas")
@@ -1062,6 +1216,73 @@ class ConversionPipeline:
             "duration_ms": duration_ms,
             "coverage_percent": coverage["coverage_percent"],
         }
+
+
+def _grouping_config(fields: list[Field]) -> GroupingConfig:
+    """Record-break threshold tuned to the page's own line pitch.
+
+    A record break must be clearly larger than the rhythm of the page.  On
+    native text the default ratio already expresses that; on OCR pages the word
+    boxes are tight inside a wide line pitch, and the same ratio cuts a form
+    into one record per line.  The rule only ever relaxes the default.
+    """
+    config = GroupingConfig()
+    if len(fields) < 3:
+        return config
+    tops = sorted(field.label_bbox.y0 for field in fields)
+    deltas = [end - start for start, end in zip(tops, tops[1:]) if end - start > 1.0]
+    if not deltas:
+        return config
+    # The *larger* half of the gaps is the line pitch: OCR geometry often packs
+    # the first lines tightly, and a median over all gaps would then be the
+    # intra-line distance, which is not the rhythm of the page.
+    deltas.sort()
+    pitch = deltas[int(len(deltas) * 0.75)]
+    heights = [f.label_bbox.height for f in fields if f.label_bbox.height > 0]
+    line_height = median(heights) if heights else 0.0
+    if pitch <= 0 or line_height <= 0:
+        return config
+    config.max_vertical_gap_ratio = max(config.max_vertical_gap_ratio, (pitch * 1.6) / line_height)
+    return config
+
+
+def _form_field_label(page, item) -> str | None:
+    """Visual label of an AcroForm widget, or a cleaned internal name.
+
+    Priority: text ending just left of the widget (same line), then text right
+    above it, then the declared `/TU` tooltip, then the internal name without
+    its numeric suffix.  `TextField12` is never shown to the user as a header.
+    """
+    box = BBox(*item.bbox) if item.bbox else None
+    if page is not None and box is not None and not box.is_empty:
+        left: tuple[float, str] | None = None
+        above: tuple[float, str] | None = None
+        for block in page.blocks:
+            for line in block.lines:
+                text = line.text.strip().rstrip(":").strip()
+                if not text or len(text.split()) > 5:
+                    continue
+                vertical_overlap = min(line.bbox.y1, box.y1) - max(line.bbox.y0, box.y0)
+                if vertical_overlap > 0 and line.bbox.x1 <= box.x0 + 6:
+                    distance = box.x0 - line.bbox.x1
+                    if distance <= 160 and (left is None or distance < left[0]):
+                        left = (distance, text)
+                    continue
+                horizontal_overlap = min(line.bbox.x1, box.x1) - max(line.bbox.x0, box.x0)
+                gap = box.y0 - line.bbox.y1
+                if horizontal_overlap > 0 and 0 <= gap <= 24:
+                    if above is None or gap < above[0]:
+                        above = (gap, text)
+        if left is not None:
+            return left[1]
+        if above is not None:
+            return above[1]
+    tooltip = getattr(item, "label_guess", None)
+    if tooltip and str(tooltip).strip():
+        return " ".join(str(tooltip).split())[:60]
+    name = re.sub(r"[_\-\s]*\d{4,}$", "", str(item.name or "")).replace("_", " ").strip()
+    name = " ".join(part.capitalize() if part.islower() else part for part in name.split())
+    return name or None
 
 
 def _engine_usage(ir: DocumentIR) -> dict[str, EngineUsage]:

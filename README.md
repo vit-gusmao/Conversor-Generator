@@ -47,6 +47,13 @@ onde foi.
 - **Normalização:** datas, moedas com `Decimal` (o símbolo do documento é
   preservado), percentuais, identificadores (CPF, CNPJ, CEP etc.) como texto e
   zeros à esquerda preservados. Texto iniciado por `=` nunca vira fórmula.
+- **Aba consolidada `Todos os dados`:** quando há duas ou mais abas estruturais,
+  uma aba extra reúne todas as linhas com a união das colunas e as colunas
+  `Aba` e `Página` de origem. O download continua sendo um único `.xlsx`.
+- **Robustez:** texto invisível (`3 Tr`/`7 Tr`) é detectado, valores de AcroForm
+  viram dados, tabelas sem bordas são reconstruídas pelo padrão do texto, o
+  separador decimal é decidido por valor e o OCR testa a orientação da página
+  nas duas direções.
 - **Auditoria:** eventos encadeados por hash, manifesto com SHA-256, cobertura
   por página e proveniência célula a célula. A interface exibe a auditoria em
   12 abas.
@@ -324,6 +331,11 @@ npm --prefix apps/web run typecheck
   `services/converter/tests/fixtures/generate_pdfs.py`.
 - Testes que dependem de Ollama ou do GLM-OCR são pulados automaticamente quando
   o serviço ou o modelo não existem.
+- Stress contra o gabarito: `services/converter/scripts/stress_gabarito.py`
+  pontua a conversão de cada PDF contra o `GABARITO.jsonl`. O corpus
+  (`stress/pdfs`) é **local** e não faz parte do repositório (está no
+  `.gitignore`); sem ele, o script não roda. Veja
+  [docs/TESTING.md](docs/TESTING.md#stress-contra-o-corpus-dourado-3208-pdfs).
 
 Estratégia e corpus em [docs/TESTING.md](docs/TESTING.md).
 

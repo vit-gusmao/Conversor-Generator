@@ -144,8 +144,17 @@ def detect_stream(
     median_height = median(heights)
     gap_threshold = max(9.0, page_width * 0.014)
 
+    # A band breaks where the vertical rhythm breaks, so the yardstick is the
+    # line pitch, not the glyph height: OCR words are tight boxes inside a
+    # 24 pt line pitch, and measuring their height alone split every table row
+    # into its own band (no grid could ever form).
+    centers = [row.y for row in rows]
+    deltas = [end - start for start, end in zip(centers, centers[1:]) if end > start]
+    pitch = median(deltas) if deltas else 0.0
+    max_gap = max(median_height * 2.2, pitch * 1.6)
+
     tables: list[RawTable] = []
-    for band in _vertical_bands(rows, median_height * 2.2, h_rules or []):
+    for band in _vertical_bands(rows, max_gap, h_rules or []):
         table = _table_from_band(band, page_number, gap_threshold)
         if table is not None:
             tables.append(table)
@@ -212,7 +221,11 @@ def _table_from_band(
         return None
 
     columns = _cluster_segments(seg_rows)
-    required = max(2, int(len(seg_rows) * 0.4))
+    # A column has to appear in at least half the rows.  A gap inside a long
+    # description ("Equipamento | de teste") would otherwise become a sixth
+    # column that exists in two rows and shifts the real columns after it; the
+    # text is not lost, it is merged into the nearest surviving column.
+    required = max(2, int(round(len(seg_rows) * 0.5)))
     columns = [c for c in columns if c.count >= required]
     if len(columns) < MIN_COLS:
         return None

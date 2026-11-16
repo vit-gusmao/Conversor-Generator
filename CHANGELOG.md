@@ -7,15 +7,43 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Adicionado
+
+- Aba consolidada `Todos os dados` quando há duas ou mais abas estruturais: união
+  de todas as colunas, com as colunas de origem `Aba` e `Página`. O download
+  continua sendo um único `.xlsx`.
+- Detecção de camada de texto invisível (modos de renderização `3 Tr`/`7 Tr`),
+  com a issue `INVISIBLE_TEXT_LAYER`. Quando há imagem, o OCR visual prevalece.
+- Reconstrução de tabelas sem geometria, pelo padrão do texto
+  (`engine/tables/text_pattern.py`), quando nenhum detector geométrico produz candidato.
+- Issue `OCR_LOW_LEGIBILITY` para glifos com menos de ~6 px de altura.
+- Remoção de linhas idênticas repetidas em abas de registro, registrada em
+  `DUPLICATE_ROWS_REMOVED`.
+- Harness `services/converter/scripts/stress_gabarito.py`, que pontua a conversão
+  contra `GABARITO.jsonl`. O corpus de stress é local e não é versionado.
+- Testes `test_consolidated_sheet.py` e `test_stress_rules.py`.
+
 ### Alterado
 
 - Licença: projeto proprietário, com todos os direitos reservados (antes, a licença não estava definida).
+- Valores de AcroForm passam a ser dados do workbook, com o rótulo visual recuperado pela posição do widget.
+- Separador decimal decidido por valor, e não pelo locale do documento.
+- Números com mais de 15 dígitos significativos são mantidos como texto, para não serem arredondados pelo Excel.
+- OCR: o raster original é a variante principal. A orientação é lida nas duas
+  direções e as coordenadas são devolvidas ao espaço da página original.
+- GLM-OCR: linhas e palavras recebem geometria a partir da tinta da própria linha.
+- Stream: faixas de colunas por pitch e regra de 50% de coluna. Lattice: filtragem de texto rotacionado.
+- Pares rótulo/valor são casados entre blocos; registros isolados são absorvidos pelo registro vizinho.
 
 ### Corrigido
 
 - CORS da API passa a liberar o cabeçalho `Cache-Control`, enviado pelo stream
   SSE do frontend, para que o progresso funcione quando web e API estão em
   origens diferentes (Vercel + backend).
+- Correção de bug na sobreposição de regiões de layout.
+- Tabelas: cabeçalho desgrudado do grid, células deslocadas, prosa rejeitada
+  como tabela e cabeçalho acima do grid passam a ser tratados.
+- Pré-processamento com OpenCV: a conversão de `ndarray` para PIL foi corrigida.
 
 ### Removido
 
