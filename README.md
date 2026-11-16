@@ -13,9 +13,6 @@ viram colunas, registros viram linhas, tabelas viram abas e o restante vira
 arquivos TXT/CSV. Para cada valor, a auditoria guarda de onde ele veio e para
 onde foi.
 
-Regra de saída: o `.xlsx` contém somente texto e dados. Imagens podem ser
-rasterizadas temporariamente para OCR, mas nunca são incorporadas à planilha.
-
 ---
 
 ## Sumário
