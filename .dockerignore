@@ -1,0 +1,32 @@
+# Root build context for the Docker images. Keeps personal documents,
+# databases, virtualenvs, generated bundles and secrets out of every image.
+**/.git
+**/.gitignore
+**/node_modules
+**/dist
+**/build
+**/__pycache__
+**/*.pyc
+**/.venv
+**/.venv-probe
+**/data
+/storage
+**/uploads
+**/work
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.log
+**/coverage
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+.env
+.env.*
+!.env.example
+Upgrades
+study
+docs
+services/converter/data
+apps/api/data
+apps/web/dist

@@ -1,0 +1,53 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# builds
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.vite/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+htmlcov/
+.coverage
+
+# local data
+data/
+/storage/
+/artifacts/
+/uploads/
+*.db
+*.sqlite
+*.sqlite3
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# editor / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+npm-debug.log*
+
+# deploy / local scratch
+.vercel/
+/work/
+/study/

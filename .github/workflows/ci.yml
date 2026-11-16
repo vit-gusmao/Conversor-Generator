@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: web (contracts + SPA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            packages/contracts/package-lock.json
+            apps/web/package-lock.json
+
+      - name: Install contracts
+        run: npm --prefix packages/contracts ci
+
+      - name: Build contracts
+        run: npm --prefix packages/contracts run build
+
+      - name: Install web
+        run: npm --prefix apps/web ci
+
+      - name: Build web
+        run: npm --prefix apps/web run build
+
+      - name: Test web
+        run: npm --prefix apps/web test
+
+  api:
+    name: api (NestJS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            packages/contracts/package-lock.json
+            apps/api/package-lock.json
+
+      - name: Install contracts
+        run: npm --prefix packages/contracts ci
+
+      - name: Build contracts
+        run: npm --prefix packages/contracts run build
+
+      - name: Install api
+        run: npm --prefix apps/api ci
+
+      - name: Generate Prisma client
+        run: npm --prefix apps/api run db:generate
+
+      - name: Typecheck api
+        run: npm --prefix apps/api run typecheck
+
+      - name: Test api
+        run: npm --prefix apps/api test
+
+  converter:
+    name: converter (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/converter/pyproject.toml
+
+      - name: Install Tesseract (OCR)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-por
+
+      - name: Install converter
+        working-directory: services/converter
+        run: pip install -e ".[test]"
+
+      - name: Test converter
+        working-directory: services/converter
+        run: pytest tests -q

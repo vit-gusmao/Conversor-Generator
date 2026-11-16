@@ -1,0 +1,220 @@
+# ============================================================================
+# Production-shaped stack: PostgreSQL + Redis + MinIO + NestJS + FastAPI +
+# Celery worker + Nginx (SPA + API proxy).
+#
+#   cd infra && docker compose up --build
+#   open http://localhost:8080
+#
+# The services keep the same ownership boundary as the standalone mode:
+#   Node owns application data, Python owns conversion evidence.
+# ============================================================================
+name: pdf2x
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pdf2x}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pdf2x}
+      POSTGRES_DB: ${POSTGRES_DB:-pdf2x}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pdf2x} -d ${POSTGRES_DB:-pdf2x}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+    <<: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+    <<: *logging
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+    <<: *logging
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin} &&
+      mc mb --ignore-existing local/${S3_BUCKET:-pdf2x} &&
+      mc anonymous set none local/${S3_BUCKET:-pdf2x} &&
+      echo 'bucket ready'"
+    networks: [backend]
+
+  converter:
+    build:
+      context: ..
+      dockerfile: services/converter/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      RUNTIME_MODE: full
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_JSON: "1"
+      CONVERTER_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pdf2x}:${POSTGRES_PASSWORD:-pdf2x}@postgres:5432/pdf2x_conv
+      CONVERTER_QUEUE: celery
+      REDIS_URL: redis://redis:6379/0
+      CONVERTER_INTERNAL_TOKEN: ${CONVERTER_INTERNAL_TOKEN:?set CONVERTER_INTERNAL_TOKEN}
+      CONVERTER_CALLBACK_URL: http://api:3000/api/v1/internal/hooks/converter
+      CONVERTER_MAX_PAGES: ${CONVERTER_MAX_PAGES:-500}
+      CONVERTER_RENDER_DPI: ${CONVERTER_RENDER_DPI:-300}
+      CONVERTER_OCR_ENABLED: ${CONVERTER_OCR_ENABLED:-true}
+      CONVERTER_OCR_MIN_CONFIDENCE: ${CONVERTER_OCR_MIN_CONFIDENCE:-0.45}
+      CONVERTER_WORKERS: "1"
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-pdf2x}
+      S3_SECURE: "false"
+    networks: [backend]
+    <<: *logging
+
+  worker:
+    build:
+      context: ..
+      dockerfile: services/converter/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command:
+      - celery
+      - -A
+      - worker.celery_app
+      - worker
+      - -Q
+      - pdf-native
+      - -c
+      - "2"
+      - --loglevel=INFO
+      - --max-tasks-per-child=20
+    environment:
+      RUNTIME_MODE: full
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CONVERTER_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pdf2x}:${POSTGRES_PASSWORD:-pdf2x}@postgres:5432/pdf2x_conv
+      CONVERTER_QUEUE: celery
+      REDIS_URL: redis://redis:6379/0
+      CONVERTER_INTERNAL_TOKEN: ${CONVERTER_INTERNAL_TOKEN:?set CONVERTER_INTERNAL_TOKEN}
+      CONVERTER_CALLBACK_URL: http://api:3000/api/v1/internal/hooks/converter
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-pdf2x}
+    networks: [backend]
+    <<: *logging
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+      args:
+        DATABASE_PROVIDER: postgres
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      converter:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      API_PORT: "3000"
+      DATABASE_PROVIDER: postgres
+      API_POSTGRES_URL: postgresql://${POSTGRES_USER:-pdf2x}:${POSTGRES_PASSWORD:-pdf2x}@postgres:5432/pdf2x_api?schema=public
+      API_DATABASE_URL: postgresql://${POSTGRES_USER:-pdf2x}:${POSTGRES_PASSWORD:-pdf2x}@postgres:5432/pdf2x_api?schema=public
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      AUTH_MODE: ${AUTH_MODE:-optional}
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-52428800}
+      UPLOAD_MAX_PAGES: ${UPLOAD_MAX_PAGES:-500}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+      CONVERTER_INTERNAL_URL: http://converter:8000
+      CONVERTER_INTERNAL_TOKEN: ${CONVERTER_INTERNAL_TOKEN:?set CONVERTER_INTERNAL_TOKEN}
+      CONVERTER_TIMEOUT_MS: "30000"
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-pdf2x}
+      S3_FORCE_PATH_STYLE: "true"
+      RETENTION_PDF_DAYS: ${RETENTION_PDF_DAYS:-7}
+      RETENTION_XLSX_DAYS: ${RETENTION_XLSX_DAYS:-30}
+      RETENTION_AUDIT_DAYS: ${RETENTION_AUDIT_DAYS:-90}
+    networks: [backend]
+    <<: *logging
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_BASE: /api/v1
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      API_UPSTREAM: http://api:3000
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    networks: [backend]
+    <<: *logging
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+
+networks:
+  backend:
+    driver: bridge

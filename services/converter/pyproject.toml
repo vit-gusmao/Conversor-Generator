@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf2x-converter"
+version = "1.0.0"
+description = "Universal PDF -> Excel conversion engine with full provenance audit"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "sqlalchemy>=2.0",
+  "python-multipart>=0.0.9",
+  "httpx>=0.27",
+  "pypdf>=4.2",
+  "pdfplumber>=0.11",
+  "pypdfium2>=4.30",
+  "openpyxl>=3.1",
+  "Pillow>=10.3",
+  "numpy>=1.26",
+  "PyJWT>=2.8",
+  "email-validator>=2.1",
+]
+
+[project.optional-dependencies]
+ocr = [
+  "opencv-python-headless>=4.10",
+  "pytesseract>=0.3.10",
+  "rapidocr-onnxruntime>=1.3 ; python_version < '3.15'",
+]
+# Optional: the official GLM-OCR SDK pipeline (PP-DocLayout-V3 layout detection,
+# region cropping, HTML/Markdown formatting).  NOT required by this converter,
+# which talks to Ollama directly and builds its own deterministic geometry.
+# NOTE: `glmocr` depends on PyMuPDF (AGPL) — review the licence before enabling.
+glmocr-sdk = ["glmocr>=0.1.5"]
+queue = ["celery>=5.4", "redis>=5.0"]
+s3 = ["boto3>=1.34"]
+postgres = ["psycopg[binary]>=3.1"]
+docling = ["docling>=2.0 ; python_version < '3.13'"]
+camelot = ["camelot-py>=0.11 ; python_version < '3.13'"]
+test = ["pytest>=8.2", "pytest-asyncio>=0.23", "httpx>=0.27", "reportlab>=4.1"]
+migrate = ["alembic>=1.13"]
+full = [
+  "opencv-python-headless>=4.10",
+  "pytesseract>=0.3.10",
+  "celery>=5.4",
+  "redis>=5.0",
+  "boto3>=1.34",
+]
+
+[project.scripts]
+pdf2x = "worker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "api*",
+  "engine*",
+  "audit*",
+  "models*",
+  "repositories*",
+  "storage*",
+  "jobqueue*",
+  "worker*",
+  "exports*",
+  "ingestion*",
+  "knowledge*",
+  "assistant*",
+]
+
+[tool.setuptools]
+py-modules = ["config", "logging_setup", "version"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "B008"]

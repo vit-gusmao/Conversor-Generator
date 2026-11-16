@@ -1,0 +1,554 @@
+openapi: 3.1.0
+info:
+  title: PDF to Excel Platform API
+  version: 1.0.0
+  description: |
+    API pública da plataforma. Este documento é um resumo executável do
+    contrato; a implementação de referência está em `apps/api` (NestJS) e o
+    espelho standalone em `services/converter/api`.
+servers:
+  - url: /api/v1
+security:
+  - bearer: []
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Cria usuário
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201': { $ref: '#/components/responses/AuthSession' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Autentica
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200': { $ref: '#/components/responses/AuthSession' }
+  /auth/anonymous:
+    post:
+      tags: [Auth]
+      summary: Sessão anônima de dispositivo
+      security: []
+      responses:
+        '201': { $ref: '#/components/responses/AuthSession' }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Usuário atual
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+  /conversions:
+    post:
+      tags: [Conversions]
+      summary: Envia PDF e cria tarefa
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '202':
+          description: Aceito
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateConversionResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Conversions]
+      summary: Histórico
+      parameters:
+        - { in: query, name: status, schema: { type: string } }
+        - { in: query, name: q, schema: { type: string } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConversionListItem' }
+                  total: { type: integer }
+                  page: { type: integer }
+                  page_size: { type: integer }
+  /conversions/{id}:
+    get:
+      tags: [Conversions]
+      summary: Status
+      parameters: [{ $ref: '#/components/parameters/ConversionId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversion' }
+    delete:
+      tags: [Conversions]
+      summary: Exclui conversão
+      parameters: [{ $ref: '#/components/parameters/ConversionId' }]
+      responses:
+        '204': { description: Removida }
+  /conversions/{id}/events:
+    get:
+      tags: [Realtime]
+      summary: SSE de progresso
+      parameters:
+        - { $ref: '#/components/parameters/ConversionId' }
+        - in: header
+          name: Last-Event-ID
+          schema: { type: integer }
+      responses:
+        '200':
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /conversions/{id}/result:
+    get:
+      tags: [Conversions]
+      summary: Metadados do resultado
+      parameters: [{ $ref: '#/components/parameters/ConversionId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResultSummary' }
+  /conversions/{id}/preview:
+    get:
+      tags: [Conversions]
+      summary: Prévia paginada
+      parameters:
+        - { $ref: '#/components/parameters/ConversionId' }
+        - { in: query, name: sheet, schema: { type: string } }
+        - { in: query, name: offset, schema: { type: integer, minimum: 0, default: 0 } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Preview' }
+  /conversions/{id}/download:
+    get:
+      tags: [Conversions]
+      summary: Baixa o XLSX
+      parameters: [{ $ref: '#/components/parameters/ConversionId' }]
+      responses:
+        '200':
+          description: Arquivo XLSX
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema: { type: string, format: binary }
+        '409': { $ref: '#/components/responses/Error' }
+  /conversions/{id}/retry:
+    post:
+      tags: [Conversions]
+      summary: Cria nova execução
+      parameters: [{ $ref: '#/components/parameters/ConversionId' }]
+      responses:
+        '202': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /conversions/{id}/cancel:
+    post:
+      tags: [Conversions]
+      summary: Solicita cancelamento
+      parameters: [{ $ref: '#/components/parameters/ConversionId' }]
+      responses:
+        '202': { $ref: '#/components/responses/Error' }
+  /conversions/{id}/audit:
+    get:
+      tags: [Audit]
+      summary: Resumo da auditoria
+      parameters: [{ $ref: '#/components/parameters/ConversionId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditSummary' }
+  /conversions/{id}/audit/events:
+    get:
+      tags: [Audit]
+      summary: Eventos detalhados
+      parameters:
+        - { $ref: '#/components/parameters/ConversionId' }
+        - { in: query, name: stage, schema: { type: string } }
+        - { in: query, name: event_type, schema: { type: string } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: page, schema: { type: integer } }
+        - { in: query, name: since_sequence, schema: { type: integer } }
+        - { in: query, name: limit, schema: { type: integer, maximum: 500, default: 200 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AuditEvent' } }
+                  total: { type: integer }
+  /conversions/{id}/audit/pages/{page}:
+    get:
+      tags: [Audit]
+      summary: Evidências de uma página
+      parameters:
+        - { $ref: '#/components/parameters/ConversionId' }
+        - { in: path, name: page, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PageAudit' }
+  /conversions/{id}/audit/cells:
+    get:
+      tags: [Audit]
+      summary: Proveniência de células
+      parameters:
+        - { $ref: '#/components/parameters/ConversionId' }
+        - { in: query, name: sheet, schema: { type: string } }
+        - { in: query, name: cell, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, maximum: 500, default: 200 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/CellEvidence' } }
+                  total: { type: integer }
+  /conversions/{id}/audit/issues:
+    get:
+      tags: [Audit]
+      summary: Erros e avisos
+      parameters:
+        - { $ref: '#/components/parameters/ConversionId' }
+        - { in: query, name: severity, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AuditIssue' } }
+                  total: { type: integer }
+  /conversions/{id}/audit/export:
+    get:
+      tags: [Audit]
+      summary: Exporta relatório
+      parameters:
+        - { $ref: '#/components/parameters/ConversionId' }
+        - { in: query, name: format, schema: { type: string, enum: [json, txt], default: json } }
+      responses:
+        '200':
+          description: Arquivo
+          content:
+            application/json:
+              schema: { type: object }
+  /settings:
+    get:
+      tags: [System]
+      summary: Configurações e capacidades
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformSettings' }
+  /health:
+    get:
+      tags: [System]
+      summary: Saúde dos serviços
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  services:
+                    type: object
+                    additionalProperties: { type: string }
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ConversionId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Error:
+      description: Erro
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+                  details: { type: object }
+    AuthSession:
+      description: Sessão criada
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AuthSession' }
+  schemas:
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+        name: { type: string }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, nullable: true }
+        name: { type: string, nullable: true }
+        role: { type: string, enum: [owner, admin, viewer] }
+        is_anonymous: { type: boolean }
+        created_at: { type: string, format: date-time }
+    AuthSession:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer }
+        user: { $ref: '#/components/schemas/User' }
+    CreateConversionResponse:
+      type: object
+      properties:
+        conversion_id: { type: string, format: uuid }
+        status: { type: string }
+        message: { type: string }
+        links:
+          type: object
+          additionalProperties: { type: string }
+    ConversionListItem:
+      type: object
+      properties:
+        conversion_id: { type: string, format: uuid }
+        status: { type: string }
+        progress: { type: number }
+        quality: { type: string }
+        filename: { type: string }
+        page_count: { type: integer, nullable: true }
+        size_bytes: { type: integer }
+        tables: { type: integer, nullable: true }
+        cells: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Conversion:
+      type: object
+      properties:
+        conversion_id: { type: string, format: uuid }
+        status: { type: string }
+        stage: { type: string }
+        progress: { type: number }
+        progress_indeterminate: { type: boolean }
+        quality: { type: string }
+        document: { type: object }
+        run: { type: object }
+        stats: { type: object, nullable: true }
+        validation: { type: object, nullable: true }
+        error: { type: object, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        links:
+          type: object
+          additionalProperties: { type: string }
+    ResultSummary:
+      type: object
+      properties:
+        conversion_id: { type: string }
+        status: { type: string }
+        quality: { type: string }
+        pages: { type: integer }
+        tables: { type: integer }
+        sheets: { type: integer }
+        cells: { type: integer }
+        records: { type: integer }
+        fields: { type: integer }
+        download_url: { type: string }
+        audit_url: { type: string }
+        sheets:
+          type: array
+          items: { type: object }
+        warnings:
+          type: array
+          items: { type: object }
+    Preview:
+      type: object
+      properties:
+        sheet: { type: string }
+        headers:
+          type: array
+          items: { type: string }
+        rows:
+          type: array
+          items:
+            type: array
+            items: { type: object }
+        total_rows: { type: integer }
+        offset: { type: integer }
+        limit: { type: integer }
+    AuditSummary:
+      type: object
+      properties:
+        conversion_id: { type: string }
+        run_id: { type: string }
+        quality: { type: string }
+        status: { type: string }
+        metrics: { type: object }
+        coverage:
+          type: array
+          items: { type: object }
+        engines:
+          type: array
+          items: { type: object }
+        decisions:
+          type: array
+          items: { type: object }
+        validations:
+          type: array
+          items: { type: object }
+        timings:
+          type: array
+          items: { type: object }
+        hash_chain_valid: { type: boolean }
+        generated_at: { type: string, format: date-time }
+    AuditEvent:
+      type: object
+      properties:
+        event_id: { type: string }
+        run_id: { type: string }
+        sequence: { type: integer }
+        event_type: { type: string }
+        stage: { type: string }
+        severity: { type: string }
+        page_number: { type: integer, nullable: true }
+        region_id: { type: string, nullable: true }
+        extraction_method: { type: string, nullable: true }
+        message: { type: string }
+        payload: { type: object }
+        previous_hash: { type: string, nullable: true }
+        event_hash: { type: string }
+        created_at: { type: string, format: date-time }
+    AuditIssue:
+      type: object
+      properties:
+        issue_id: { type: string }
+        run_id: { type: string }
+        severity: { type: string, enum: [info, warning, error, critical] }
+        code: { type: string }
+        message: { type: string }
+        page_number: { type: integer, nullable: true }
+        region_id: { type: string, nullable: true }
+        context: { type: object }
+        created_at: { type: string, format: date-time }
+    PageAudit:
+      type: object
+      properties:
+        page_number: { type: integer }
+        classification: { type: string }
+        status: { type: string }
+        regions:
+          type: array
+          items: { type: object }
+        blocks:
+          type: array
+          items: { type: object }
+        tables_detail:
+          type: array
+          items: { type: object }
+        issues:
+          type: array
+          items: { $ref: '#/components/schemas/AuditIssue' }
+    CellEvidence:
+      type: object
+      properties:
+        sheet: { type: string }
+        cell: { type: string }
+        row: { type: integer }
+        column: { type: integer }
+        header: { type: string }
+        value: { type: string, nullable: true }
+        original_value: { type: string, nullable: true }
+        value_type: { type: string }
+        source: { type: object, nullable: true }
+        transformations:
+          type: array
+          items: { type: object }
+        record_id: { type: string, nullable: true }
+        field_label: { type: string, nullable: true }
+        table_id: { type: string, nullable: true }
+        validation: { type: object }
+    PlatformSettings:
+      type: object
+      properties:
+        auth_mode: { type: string, enum: [optional, required] }
+        max_upload_bytes: { type: integer }
+        max_pages: { type: integer }
+        runtime_mode: { type: string, enum: [standalone, full] }
+        ocr_enabled: { type: boolean }
+        ocr_engine: { type: string, nullable: true }
+        storage_backend: { type: string, enum: [local, s3] }
+        retention: { type: object }
+        engine_version: { type: string }
+        capabilities:
+          type: object
+          additionalProperties: { type: boolean }

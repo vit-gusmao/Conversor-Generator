@@ -1,0 +1,19 @@
+{
+  "name": "pdf-to-excel-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Conversor Generator — plataforma local de conversão documental com auditoria completa, API REST e frontend React",
+  "scripts": {
+    "install:all": "npm --prefix packages/contracts install && npm --prefix packages/contracts run build && npm --prefix apps/api install && npm --prefix apps/web install",
+    "build": "npm --prefix packages/contracts run build && npm --prefix apps/api run build && npm --prefix apps/web run build",
+    "dev:web": "npm --prefix apps/web run dev",
+    "dev:api": "npm --prefix apps/api run start:dev",
+    "test": "npm --prefix apps/api test && npm --prefix apps/web test",
+    "test:py": "python -m pytest services/converter/tests -q",
+    "db:generate": "npm --prefix apps/api run db:generate",
+    "db:push": "npm --prefix apps/api run db:push"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
