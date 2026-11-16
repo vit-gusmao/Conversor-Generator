@@ -7,8 +7,6 @@
 > Converta PDFs e imagens em planilhas e textos, com a origem de cada célula
 > registrada até a página, a região e o motor que a produziu.
 
-> **Substitua `OWNER/REPO`** nos badges pelo caminho real do repositório no GitHub.
-
 **Conversor Generator** é uma plataforma de conversão documental auditável. Ela
 transforma o texto recuperável de um documento em artefatos organizados: campos
 viram colunas, registros viram linhas, tabelas viram abas e o restante vira
