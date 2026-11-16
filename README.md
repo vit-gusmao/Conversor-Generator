@@ -1,6 +1,6 @@
 # Conversor Generator
 
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/vit-gusmao/Conversor-Generator/actions/workflows/ci.yml/badge.svg)](https://github.com/vit-gusmao/Conversor-Generator/actions/workflows/ci.yml)
 ![Node 22](https://img.shields.io/badge/Node-22-339933?logo=node.js&logoColor=white)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 
@@ -367,7 +367,7 @@ git status                        # confira o que será enviado
 git add .
 git commit -m "Versão inicial 1.0.0"
 git branch -M main
-git remote add origin https://github.com/OWNER/REPO.git
+git remote add origin https://github.com/vit-gusmao/Conversor-Generator.git
 git push -u origin main
 ```
 
@@ -375,7 +375,7 @@ Antes do primeiro commit, confirme que **não** estão sendo enviados `.env`,
 `data/`, bancos SQLite nem `node_modules/`. O `.gitignore` cobre esses itens.
 
 Depois do push, o workflow de integração contínua (`.github/workflows/ci.yml`)
-roda nas próximas alterações. Substitua `OWNER/REPO` nos badges acima.
+roda nas próximas alterações.
 
 ---
 
