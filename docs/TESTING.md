@@ -1,5 +1,20 @@
 # Estratégia de testes
 
+## Pré-requisitos
+
+- Python 3.11 ou superior (`requires-python` em `services/converter/pyproject.toml`).
+  A CI usa 3.12.
+- Node.js 22 para `apps/mcp` (`engines` do pacote) e Node.js 20 ou superior para
+  os demais pacotes (`engines` do `package.json` da raiz). O `.nvmrc` da raiz fixa a
+  versão usada pela CI.
+- **Tesseract com o idioma `por`** (pacotes `tesseract-ocr` e `tesseract-ocr-por`
+  no Debian/Ubuntu). A CI instala os dois antes de rodar o pytest. Localmente, instale-os
+  para reproduzir o ambiente da CI. No Windows, se o executável não estiver no
+  `PATH`, aponte-o com `TESSERACT_CMD`.
+- Dependências Python de teste: `pip install -e ".[test]"` em `services/converter`.
+- Ollama com o modelo `glm-ocr:latest` é **opcional**. Sem ele, os testes de GLM-OCR
+  reais são pulados (veja [Testando o GLM-OCR](#testando-o-glm-ocr)).
+
 ## Corpus de referência
 
 Os PDFs são **gerados** a cada execução por
@@ -28,6 +43,35 @@ geometria exatos conhecidos, sem binários opacos no repositório.
 | `encrypted_pdf` | senha | `ENCRYPTED_PDF` |
 | `not_a_pdf` | assinatura inválida | `INVALID_FILE` |
 
+## Comandos
+
+| Comando | Pacote | Observação |
+| --- | --- | --- |
+| `python -m pytest services/converter/tests -q` (ou `npm run test:py` na raiz) | motor Python | a CI roda `pytest tests -q` dentro de `services/converter` |
+| `npm --prefix apps/api test` (ou `npm test` na raiz, que também roda a interface) | API NestJS, testes unitários (Jest) | inclui `options.spec.ts` |
+| `npm --prefix apps/api run test:e2e` | API NestJS, testes e2e (Jest) | inclui `test/e2e/batches.e2e-spec.ts`. **Não roda na CI.** |
+| `npm --prefix apps/web test` | interface (Vitest) | `vitest run` |
+| `npm run test:mcp` (ou `npm --prefix apps/mcp test`) | adaptador MCP | compila antes (`pretest`) e roda `dist-test/tests/*.test.js`. **Não roda na CI.** |
+
+No Windows, use `services/converter/.venv\Scripts\python -m pytest tests -q` a
+partir de `services/converter`.
+
+### Integração contínua
+
+O workflow `.github/workflows/ci.yml` tem três jobs, em `push` e `pull_request`
+para `main`:
+
+| Job | O que roda |
+| --- | --- |
+| `web` | build dos contratos, build da interface e `npm --prefix apps/web test` |
+| `api` | build dos contratos, `db:generate`, typecheck e `npm --prefix apps/api test` |
+| `converter` | instala Tesseract e `pip install -e ".[test]"`, depois `pytest tests -q` |
+
+A CI **não tem job para `apps/mcp`**: `npm run test:mcp` não é executado
+automaticamente. A CI também não roda os testes e2e da API nem o teste de documentos
+grandes (opt-in, veja abaixo). Rode esses comandos localmente antes de mudar
+essas áreas.
+
 ## Suítes
 
 | Arquivo | Escopo |
@@ -42,18 +86,54 @@ geometria exatos conhecidos, sem binários opacos no repositório.
 | `test_audit_fixes.py` | regressões da auditoria: fórmula, cobertura, campos, tabelas, moeda, conciliação, caracteres ilegais, locale |
 | `test_consolidated_sheet.py` | aba consolidada `Todos os dados`: união de colunas, proveniência `Aba`/`Página`, ausência de aba duplicada em documento com uma tabela, arquivo único com todas as abas |
 | `test_stress_rules.py` | regras reveladas pelo stress: camada de texto invisível, separador decimal por valor, números acima de 15 dígitos como texto, prosa que não é tabela, linha deslocada, tabela sem geometria, precisão do Excel |
+| `test_local_app.py` | aplicação local: rotas `/internal` e docs expostas, cookie de sessão `HttpOnly; SameSite=Lax`, `/api/v1/health/ready` sem vazar hosts ou caminhos |
+
+No frontend, `src/lib/api-base.test.ts` cobre a precedência `VITE_API_BASE` > `/api/v1`.
 
 A quantidade de testes muda com o código. Não há contagem fixa neste documento:
-a saída dos comandos abaixo é a referência.
+a saída dos comandos acima é a referência.
 
-| Comando | Pacote |
-| --- | --- |
-| `python -m pytest services/converter/tests -q` | motor Python |
-| `npm --prefix apps/api test` | API NestJS |
-| `npm --prefix apps/web test` | interface |
+## Suítes de lotes, fila e documentos grandes
 
-No Windows, use `services/converter/.venv\Scripts\python -m pytest tests -q` a
-partir de `services/converter`.
+Estas suítes cobrem o processamento em lote, a fila durável, os checkpoints, a
+exportação TXT/CSV, a imagem como entrada, o conhecimento e o assistente. A coluna
+"Comando" é a forma de rodar cada uma.
+
+| Suíte | Comando | Cobre |
+| --- | --- | --- |
+| Contratos/opções (TS) | `npm --prefix apps/api test` (`options.spec.ts`) | Paridade de opções, rejeição de `max_pages` |
+| Paridade (Python) | `pytest tests/test_options_parity.py` | Mesma fixture do lado TS |
+| Lotes/upload (Python) | `pytest tests/test_batches_api.py` | 1.001 itens, replay, partes, hash, abort, cancelamento |
+| Lotes/upload (NestJS, e2e) | `npm --prefix apps/api run test:e2e` (`batches.e2e-spec.ts`) | Mesmo contrato no modo `full` |
+| Fila durável | `pytest tests/test_durable_queue.py` | Fence, lease expirado, cancelamento antes da publicação |
+| Checkpoints | `pytest tests/test_page_checkpoints.py` | Retomada sem refazer OCR, invalidação, corrupção |
+| Resultado compacto | `pytest tests/test_result_overview.py` | Overview independente do nº de células, paginação de abas |
+| UI do resultado | `npm --prefix apps/web test` (`ResultPage.test.tsx`) | Um seletor, uma prévia, parcial/quarentena visíveis |
+| Fila no navegador | `npm --prefix apps/web test` (`upload-queue.test.ts`, `BatchPage.test.tsx`) | 1.001 itens sem perda, imagem→TXT, selagem |
+| Exportação TXT | `pytest tests/test_text_export.py` | Unicode/emoji, form feed, marcador, CRLF, offsets em code points, tabela sem duplicação, página falha/branca |
+| Exportação CSV | `pytest tests/test_csv_export.py` | perfis interoperable/excel_br, aspas, fórmula segura, número negativo, ZIP + manifesto, `NO_TABLES_FOUND` |
+| Entrada de imagem | `pytest tests/test_image_input.py` | PNG/JPEG/BMP/GIF/TIFF/WebP, multipágina, EXIF, transparência, limites de quadro/pixel, assinatura |
+| Imagem → TXT | `pytest tests/test_image_pipeline.py` | Imagem → TXT com motor simulado; falha explícita sem OCR e sem texto reconhecido |
+| Conhecimento | `pytest tests/test_knowledge.py` | Chunks determinísticos, orçamento de tokens, ACL por proprietário e coleção |
+| Assistente | `pytest tests/test_assistant.py` | Streaming, citação válida, abstenção sem fonte, modo desativado, falha recuperável |
+| Publicação | `pytest tests/test_publication.py` | Aviso publicável, falha fatal em quarentena, qualidade `failed` nunca publica |
+| API de exportação | `pytest tests/test_api_upgrade.py` | `/capabilities`, exports TXT/CSV + download, texto paginado, reexport CRLF/marcador, alvo inválido |
+
+### Documentos grandes (opt-in)
+
+```powershell
+$env:PDF2X_RUN_LARGE="1"; $env:PDF2X_LARGE_PAGES="10000"
+.venv\Scripts\python -m pytest tests/test_large_documents.py -q -s
+```
+
+Gera um PDF nativo com marcador único por página e exige: todas as páginas
+1..N presentes, zero páginas falhas, ausência de `PAGES_NOT_PROCESSED`, marcador
+da última página presente no plano de texto. Sem `PDF2X_RUN_LARGE=1` os testes
+são *skipped* — e um skip **não** é aprovação de escala.
+
+O teste com OCR real em 10.000 páginas exige GPU e modelo local. Ele não faz parte
+da CI. É uma homologação manual: não há registro versionado dos resultados neste
+repositório. Ao executá-la, anote data, máquina, versão do motor e resultado.
 
 ## Testando o GLM-OCR
 
@@ -71,7 +151,8 @@ O adapter (`engine/ocr/glmocr.py`) é testado em três níveis:
    não estão presentes, para a suíte não depender de GPU.
 3. **Ponta a ponta** — `test_scanned_page_is_recovered_by_glm_ocr` exige que a
    página sem camada de texto volte como `text_source="ocr"` e que o evento
-   `OCR_COMPLETED` registre `engine`, `model` e `boxing_method`.
+   `OCR_COMPLETED` registre `engine`, `model` e `boxing_method`. Este teste precisa
+   de um Ollama acessível com `glm-ocr:latest`.
 
 Os testes de degradação (`no_engine=True` em `run_fixture`) **simulam a
 ausência de motor** em vez de depender do que está instalado na máquina — assim
@@ -134,18 +215,17 @@ cd services/converter
   Cobertura textual não é prova de precisão.
 - **desempenho**: `duration_ms` por execução e por fase são persistidos.
 
-## Suítes do upgrade
+## Não coberto por automação aqui
 
-| Arquivo | Cobertura |
-| --- | --- |
-| `tests/test_text_export.py` | Unicode/emoji, form feed, marcador, CRLF, offsets em code points, tabela sem duplicação, página falha/branca |
-| `tests/test_csv_export.py` | perfis interoperable/excel_br, aspas, fórmula segura, número negativo, ZIP + manifesto, `NO_TABLES_FOUND` |
-| `tests/test_image_input.py` | PNG/JPEG/BMP/GIF/TIFF/WebP, multipágina, EXIF, transparência, limites de quadro/pixel, assinatura |
-| `tests/test_image_pipeline.py` | imagem → TXT com motor simulado; falha explícita sem OCR e sem texto reconhecido |
-| `tests/test_knowledge.py` | chunks determinísticos, orçamento de tokens, ACL por proprietário e coleção |
-| `tests/test_assistant.py` | streaming, citação válida, abstenção sem fonte, modo desativado, falha recuperável |
-| `tests/test_publication.py` | aviso publicável, falha fatal em quarentena, qualidade `failed` nunca publica |
-| `tests/test_api_upgrade.py` | `/capabilities`, exports TXT/CSV + download, texto paginado, reexport CRLF/marcador, alvo inválido |
+- Testes de navegador automatizados: há smoke manual (upload → resultado →
+  auditoria → assistente) contra o backend real. A compilação TypeScript/Vite e
+  a suíte Testing Library cobrem os componentes e a regressão de tipos.
+- `docker compose up`: não há execução registrada da composição neste
+  repositório. Ela foi escrita e revisada; os modos sem container foram executados.
+- OCR real: o GLM-OCR depende de um Ollama local com `glm-ocr:latest` e, para a
+  velocidade medida em [CONVERSION.md](CONVERSION.md), de GPU. Sem isso, o adapter
+  é coberto pelos testes unitários; a qualidade do OCR só é medida pelo stress, que
+  depende do corpus local.
 
 ## Stress contra o corpus dourado (3208 PDFs)
 
@@ -198,24 +278,31 @@ Execute a partir de `services/converter` (no Windows, `.venv\Scripts\python`):
 
 # triagem rápida: 2 documentos por categoria
 .venv/Scripts/python scripts/stress_gabarito.py --root ../../stress/pdfs --per-category 2
+
+# amostra: os 10 primeiros documentos, com os três formatos de saída
+.venv/Scripts/python scripts/stress_gabarito.py --root ../../stress/pdfs --limit 10 --formats xlsx,txt,csv
 ```
 
 | Flag | Função | Padrão |
 | --- | --- | --- |
+| `--root CAMINHO` | pasta com os packs de PDF e os `GABARITO.jsonl` | `stress/pdfs` na raiz do repositório |
 | `--order asc\|desc\|name` | ordem de execução; `asc` exercita os documentos leves antes dos pesados | `asc` |
 | `--ocr` | inclui documentos digitalizados e híbridos (OCR) | desligado |
 | `--only-ocr` | processa apenas os documentos que o gabarito marca como OCR obrigatório | desligado |
 | `--per-category N` | limita a N documentos por categoria (triagem) | sem limite |
-| `--max-pages N` | limite de páginas processadas por documento; as excedentes não são processadas e o pipeline registra o aviso | `500` |
+| `--limit N` | processa apenas os N primeiros documentos depois dos filtros | `0` (sem limite) |
+| `--categories A,B` | filtra por trecho do nome do arquivo ou da pasta da categoria (lista separada por vírgula) | todas |
+| `--formats A,B` | formatos de saída gerados em cada conversão (`xlsx`, `txt`, `csv`) | `xlsx,txt` |
+| `--max-pages N` | valor repassado ao pipeline. **Sem efeito na prática:** o pipeline de documento inteiro ignora o teto (veja [CONVERSION.md](CONVERSION.md#documentos-grandes-sem-teto-de-páginas)) | `500` |
 | `--budget SEGUNDOS` | orçamento de tempo da execução; `0` = sem orçamento | `0` |
 | `--live` / `--no-live` | imprime cada marco de página durante a conversão | `--live` |
-| `--categories A,B` | filtra categorias | todas |
+| `--state CAMINHO` | arquivo de estado retomável | `services/converter/data/stress_gabarito.json` |
+| `--report CAMINHO` | relatório agregado, reescrito a cada documento | `services/converter/data/stress_gabarito_report.json` |
 | `--rerun` | ignora resultados já gravados no estado | desligado |
 
-O estado é retomável (`data/stress_gabarito.json`) e o relatório
-(`data/stress_gabarito_report.json`) é reescrito a cada documento, com agregados
-por categoria, falhas nomeadas e códigos de issue. Uma execução interrompida
-continua de onde parou.
+O estado é retomável (`--state`) e o relatório (`--report`) é reescrito a cada
+documento, com agregados por categoria, falhas nomeadas e códigos de issue. Uma
+execução interrompida continua de onde parou. Use `--rerun` para refazer tudo.
 
 ### Resultados medidos
 
@@ -260,13 +347,3 @@ os números com OCR vêm apenas da amostra estratificada acima.
 - O resultado com OCR vem de **amostra**, não do corpus inteiro.
 - Os números dependem do corpus local, que não é versionado: reproduzir a
   medição exige o mesmo corpus.
-
-## Não coberto por automação aqui
-
-- Testes de navegador automatizados: há smoke manual (upload → resultado →
-  auditoria → assistente) contra o backend real. A compilação TypeScript/Vite e
-  a suíte Testing Library cobrem os componentes e a regressão de tipos.
-- `docker compose up`: o ambiente de construção não possui Docker. A composição
-  foi escrita e revisada; os modos sem container foram executados.
-- OCR real: **GLM-OCR está instalado** (Ollama, RTX 2070) e é medido pelo stress
-  contra o corpus dourado (acima), não apenas por cobertura de texto.

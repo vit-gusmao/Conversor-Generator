@@ -9,6 +9,23 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
 ### Adicionado
 
+- **Lotes persistentes** (`/batches`): número ilimitado de documentos por lote,
+  com itens idempotentes por `client_item_id` e selagem explícita.
+- **Upload por partes** (`/uploads`): transporte retomável de 8 MiB, hash por
+  parte, verificação do documento inteiro em `complete` e uma única conversão por
+  item.
+- **Fila durável** (`engine_jobs`): backlog no banco, lease com fence, retomada
+  após queda e cancelamento durável arbitrado na publicação.
+- **Checkpoints por página**: retomada de uma execução interrompida sem repetir
+  OCR; checkpoints são escopados ao run, à versão do motor e às opções.
+- **Resultado compacto**: `/conversions/:id/result-summary` e `/sheets`
+  paginados; tela de resultado com um único seletor e uma única prévia.
+- **Contratos canônicos** (`ConversionOptionsV2`) compartilhados por web, API e
+  motor, com rejeição explícita de qualquer teto de páginas.
+- **Adaptador MCP** em `apps/mcp` (envio multi-arquivo, acompanhamento e
+  download por ferramentas).
+- **`GET /api/v1/health/ready`** com `accepting_uploads`, `ocr_available` e
+  `queue_pending`, sem hosts ou caminhos.
 - Aba consolidada `Todos os dados` quando há duas ou mais abas estruturais: união
   de todas as colunas, com as colunas de origem `Aba` e `Página`. O download
   continua sendo um único `.xlsx`.
@@ -22,10 +39,20 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 - Harness `services/converter/scripts/stress_gabarito.py`, que pontua a conversão
   contra `GABARITO.jsonl`. O corpus de stress é local e não é versionado.
 - Testes `test_consolidated_sheet.py` e `test_stress_rules.py`.
+- **Documentação completa da versão local**: `docs/FLOW.md` (fluxo completo),
+  `docs/STORAGE.md` (onde ficam os dados), `docs/OPERATIONS.md` (backup, limpeza,
+  logs e diagnóstico) e `docs/CONFIGURATION.md` (referência de configuração).
 
 ### Alterado
 
-- Licença: projeto proprietário, com todos os direitos reservados (antes, a licença não estava definida).
+- O fluxo padrão **não tem teto de páginas**: `PAGES_NOT_PROCESSED` deixou de
+  existir e `max_pages` virou configuração obsoleta nos dois modos.
+- O prazo global de 600 s por documento foi removido por padrão
+  (`CONVERTER_TASK_TIMEOUT_SECONDS=0`); o timeout passou a ser por unidade.
+- O pipeline de PDF não carrega mais o arquivo inteiro em memória.
+- O preview de planilha pagina em SQL em vez de carregar todas as células.
+- A outbox do modo `full` usa claim com lease, não mais `pending → dispatched`
+  sem exclusão mútua.
 - Valores de AcroForm passam a ser dados do workbook, com o rótulo visual recuperado pela posição do widget.
 - Separador decimal decidido por valor, e não pelo locale do documento.
 - Números com mais de 15 dígitos significativos são mantidos como texto, para não serem arredondados pelo Excel.
@@ -34,12 +61,22 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 - GLM-OCR: linhas e palavras recebem geometria a partir da tinta da própria linha.
 - Stream: faixas de colunas por pitch e regra de 50% de coluna. Lattice: filtragem de texto rotacionado.
 - Pares rótulo/valor são casados entre blocos; registros isolados são absorvidos pelo registro vizinho.
+- Licença: projeto proprietário, com todos os direitos reservados (antes, a licença não estava definida).
+- API NestJS e transporte HTTP do MCP escutam em `127.0.0.1` por padrão (`API_HOST`, `PDF2X_MCP_HOST`).
+- Docker Compose publica a interface só em `127.0.0.1` e não define mais teto de 500 páginas.
+- O projeto passa a ser exclusivamente local, sem hospedagem externa.
 
 ### Corrigido
 
+- Modo `full` descartava `text`/`csv`/`target_formats` enviados pelo cliente.
+- Uma parte de upload divergente podia apagar a parte já confirmada.
+- Retransmissão idêntica de parte agora é no-op em vez de conflito.
+- `seal` era bloqueado por itens `upload_failed` (estado definitivo).
+- Migrações Alembic estavam atrasadas em relação aos modelos (tabelas de
+  conhecimento, exportações e `options_json`).
 - CORS da API passa a liberar o cabeçalho `Cache-Control`, enviado pelo stream
   SSE do frontend, para que o progresso funcione quando web e API estão em
-  origens diferentes (Vercel + backend).
+  origens diferentes (front-end separado + backend).
 - Correção de bug na sobreposição de regiões de layout.
 - Tabelas: cabeçalho desgrudado do grid, células deslocadas, prosa rejeitada
   como tabela e cabeçalho acima do grid passam a ser tratados.
@@ -48,6 +85,14 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 ### Removido
 
 - Arquivos de contribuição, canal de segurança e templates de issue/PR.
+- Suporte a hospedagem na Vercel e no GitHub Pages: `vercel.json`,
+  `apps/web/vercel.json`, `.vercelignore`, `.github/workflows/pages.yml`,
+  `apps/web/scripts/prepare-pages.mjs`, o script `build:pages`, a etapa de CI
+  correspondente e a variável `VITE_BASE_PATH` (a SPA é sempre servida a partir de `/`).
+- `infra/nginx/nginx.conf` (proxy de borda não utilizado) e
+  `infra/observability/otel-collector.yaml` (não referenciado).
+- Variáveis mortas do `.env.example`: `OTEL_*`, `POSTGRES_HOST`/`POSTGRES_PORT` e
+  `UPLOAD_PART_SIZE_BYTES`.
 
 ## [1.0.0] - 2026-11-16
 
@@ -91,7 +136,7 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 ### Conhecido e não implementado
 
 - Estado `REVIEW_REQUIRED` e endpoint de revisão humana: ausentes. Veja
-  [docs/API.md](docs/API.md#fora-do-escopo-atual-lacunas-declaradas).
+  [docs/API.md](docs/FLOW.md#limitações-e-divergências-conhecidas).
 - OCR por célula ou linha existe no componente, mas ainda não é acionado pelo
   pipeline.
 - A execução com Docker Compose não foi verificada no ambiente de construção.

@@ -1,4 +1,5 @@
 import {
+  Body,
   Controller,
   Delete,
   Get,
@@ -16,11 +17,21 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
-import type { Conversion, Paginated, ConversionListItem, Preview, ResultSummary } from '@pdf2x/contracts';
+import type {
+  Conversion,
+  ConversionListItem,
+  Paginated,
+  Preview,
+  ResultOverview,
+  ResultSummary,
+  SheetPage,
+  SheetSourcePages,
+} from '@pdf2x/contracts';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ListConversionsQueryDto } from '../../common/dto/pagination.dto';
 import { ApiError } from '../../common/errors/api-error';
+import { ERROR_CODES } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/request-context';
 import { OptionalJwtGuard } from '../../auth/guards/optional-jwt.guard';
 
@@ -32,6 +43,25 @@ import type {
   UploadedPdfFile,
 } from './dto/conversion-response.dto';
 import { PreviewQueryDto } from './dto/preview-query.dto';
+import { SheetListQueryDto, SheetPagesQueryDto } from './dto/sheet-query.dto';
+
+interface CreateConversionBody {
+  /** JSON string with `ConversionOptionsV2` (multipart form field). */
+  options?: string | Record<string, unknown> | null;
+}
+
+/** Multipart fields arrive as strings; a JSON body may already be an object. */
+function parseOptionsField(body: CreateConversionBody | undefined): unknown {
+  const raw = body?.options;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'object') return raw;
+  if (typeof raw !== 'string' || raw.trim().length === 0) return undefined;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw ApiError.badRequest(ERROR_CODES.INVALID_OPTION, { reason: 'malformed_json' });
+  }
+}
 
 function contentDisposition(filename: string): string {
   const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
@@ -50,10 +80,11 @@ export class ConversionsController {
   async create(
     @UploadedFile() file: UploadedPdfFile | undefined,
     @CurrentUser() user: AuthenticatedUser | undefined,
+    @Body() body: CreateConversionBody | undefined,
     @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<CreateConversionResponse> {
     if (!user) throw ApiError.unauthenticated();
-    return this.conversions.create(user, file, idempotencyKey);
+    return this.conversions.create(user, file, idempotencyKey, parseOptionsField(body));
   }
 
   @Get()
@@ -81,6 +112,37 @@ export class ConversionsController {
   ): Promise<ResultSummary> {
     if (!user) throw ApiError.unauthenticated();
     return this.conversions.getResult(user, id);
+  }
+
+  /** Compact overview: same payload size for 10 cells or 10 million. */
+  @Get(':id/result-summary')
+  resultOverview(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+  ): Promise<ResultOverview> {
+    if (!user) throw ApiError.unauthenticated();
+    return this.conversions.getResultOverview(user, id);
+  }
+
+  @Get(':id/sheets')
+  sheets(
+    @Param('id') id: string,
+    @Query() query: SheetListQueryDto,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+  ): Promise<SheetPage> {
+    if (!user) throw ApiError.unauthenticated();
+    return this.conversions.getSheets(user, id, query);
+  }
+
+  @Get(':id/sheets/:sheetId/pages')
+  sheetPages(
+    @Param('id') id: string,
+    @Param('sheetId') sheetId: string,
+    @Query() query: SheetPagesQueryDto,
+    @CurrentUser() user: AuthenticatedUser | undefined,
+  ): Promise<SheetSourcePages> {
+    if (!user) throw ApiError.unauthenticated();
+    return this.conversions.getSheetPages(user, id, sheetId, query);
   }
 
   @Get(':id/preview')

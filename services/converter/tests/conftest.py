@@ -21,10 +21,24 @@ os.environ.setdefault("CONVERTER_QUEUE", "inline")
 os.environ.setdefault("CONVERTER_INTERNAL_TOKEN", "test-internal-token")
 os.environ.setdefault("CONVERTER_WORKERS", "2")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
+# Small parts so a two-kilobyte fixture still exercises multi-part assembly.
+os.environ.setdefault("UPLOAD_PART_BYTES", "512")
 
 from audit.events import AuditRecorder  # noqa: E402
 from engine.pipeline import ConversionPipeline, PipelineOptions, PipelineResult  # noqa: E402
 from tests.fixtures.generate_pdfs import generate_all  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _database_schema() -> None:
+    """Creates the isolated test schema once.
+
+    The FastAPI lifespan does this for HTTP tests; direct repository/queue
+    tests need the tables too, so the schema is created up front (idempotent).
+    """
+    from models.db import init_db
+
+    init_db()
 
 
 @pytest.fixture(scope="session")

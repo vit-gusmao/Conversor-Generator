@@ -68,7 +68,10 @@ export function validateDocumentFile(
   file: Pick<File, 'name' | 'size' | 'type'>,
   options: FileValidationOptions = {},
 ): FileValidationResult {
-  const maxBytes = options.maxBytes ?? DEFAULT_MAX_UPLOAD_BYTES;
+  // `undefined` keeps the legacy default; `null` means the resumable upload
+  // path has no client-side size ceiling.
+  const maxBytes =
+    options.maxBytes === undefined ? DEFAULT_MAX_UPLOAD_BYTES : options.maxBytes;
 
   if (file.size <= 0) {
     return {
@@ -105,7 +108,7 @@ export function validateDocumentFile(
     };
   }
 
-  if (file.size > maxBytes) {
+  if (maxBytes !== null && file.size > maxBytes) {
     return {
       ok: false,
       code: 'SIZE',

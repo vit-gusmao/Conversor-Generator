@@ -3,13 +3,18 @@
  * ============================================================================
  * Single source of truth for the public contract between:
  *   - apps/web  (React + Vite frontend)
+ *   - apps/mcp  (MCP adapter)
  *   - apps/api  (NestJS public REST API)
  *   - services/converter (FastAPI internal API, mirrors these shapes)
  *
  * Any change here must be reflected in
- * services/converter/models/api_contract.py
+ * services/converter/models/api_contract.py and api/schemas.py
  * ============================================================================
  */
+
+export * from './options';
+export * from './batches';
+export * from './uploads';
 
 /* ------------------------------------------------------------------------- */
 /* Status and pipeline                                                        */
@@ -245,6 +250,78 @@ export interface ResultSummary {
   audit_url: string;
   sheets: SheetSummary[];
   warnings: AuditIssue[];
+}
+
+/* ------------------------------------------------------------------------- */
+/* Compact result overview (U1)                                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * One row of the sheet selector. Deliberately small: `source_pages` is not
+ * inlined here, because a 10,000-page document would otherwise put ten
+ * thousand numbers in the overview payload. Use the paginated sheet endpoint
+ * for the full page list.
+ */
+export interface SheetDescriptor {
+  id: string;
+  name: string;
+  kind: SheetSummary['kind'];
+  rows: number;
+  columns: number;
+  source_page_count: number;
+  table_id: string | null;
+}
+
+export const PUBLICATION_STATUSES = ['approved', 'quarantined', 'expired', 'pending'] as const;
+export type PublicationStatus = (typeof PUBLICATION_STATUSES)[number];
+
+/**
+ * Payload size of this object is independent of the total cell count, so a
+ * million-cell workbook returns the same shape as a tiny one.
+ */
+export interface ResultOverview {
+  conversion_id: string;
+  run_id: string;
+  status: ConversionStatus;
+  quality: QualityState;
+  publication_status: PublicationStatus;
+  counts: {
+    pages: number;
+    tables: number;
+    sheets: number;
+    cells: number;
+    records: number;
+    fields: number;
+  };
+  available_formats: string[];
+  /** Sheet the UI should open first; `null` when the workbook has no sheets. */
+  default_sheet: string | null;
+  warning_counts: {
+    total: number;
+    error: number;
+    critical: number;
+    warning: number;
+  };
+  /** Present when processing finished with failed pages. */
+  partial: boolean;
+  pages_failed: number;
+  pages_total: number;
+  download_url: string | null;
+  audit_url: string;
+}
+
+export interface SheetPage {
+  items: SheetDescriptor[];
+  next_cursor: string | null;
+  total: number;
+}
+
+/** Per-page provenance of one sheet, paginated. */
+export interface SheetSourcePages {
+  sheet_id: string;
+  pages: number[];
+  next_cursor: string | null;
+  total: number;
 }
 
 export interface PreviewCell {
@@ -501,10 +578,30 @@ export interface ConversionEvent {
 /* Settings                                                                   */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * Upload capabilities. The UI must use these instead of assuming a 50 MiB
+ * fallback: `max_file_bytes` is `null` when the resumable path has no product
+ * ceiling, while `max_upload_bytes` remains the explicit limit of the legacy
+ * single-shot `POST /conversions`.
+ */
+export interface UploadCapabilities {
+  resumable: boolean;
+  accepts_multiple: boolean;
+  part_size_bytes: number;
+  max_part_bytes: number;
+  max_file_bytes: number | null;
+  max_upload_bytes: number | null;
+  max_files_per_batch: number | null;
+}
+
 export interface PlatformSettings {
   auth_mode: 'optional' | 'required';
   max_upload_bytes: number;
-  max_pages: number;
+  /**
+   * @deprecated No page ceiling exists in the default flow. Always `null` on
+   * servers that support full-document processing; kept for older clients.
+   */
+  max_pages: number | null;
   runtime_mode: 'standalone' | 'full';
   ocr_enabled: boolean;
   ocr_engine: string | null;
@@ -512,4 +609,6 @@ export interface PlatformSettings {
   retention: { pdf_days: number; xlsx_days: number; audit_days: number };
   engine_version: string;
   capabilities: Record<string, boolean>;
+  upload?: UploadCapabilities;
 }
+

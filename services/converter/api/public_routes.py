@@ -23,6 +23,7 @@ from api.deps import (
     current_user,
     get_db,
     resolve_user,
+    session_cookie_kwargs,
     user_dict,
 )
 from api.schemas import ExportRequest
@@ -76,10 +77,7 @@ def anonymous(
         response.set_cookie(
             DEVICE_COOKIE,
             device_id,
-            max_age=31_536_000,
-            httponly=True,
-            samesite="lax",
-            path="/",
+            **session_cookie_kwargs(),
         )
     return response
 
@@ -162,6 +160,42 @@ def conversion_result(conversion_id: str, user: dict[str, Any] = Depends(current
     return service.result(owner_id=user["id"], conversion_id=conversion_id)
 
 
+@router.get("/conversions/{conversion_id}/result-summary")
+def conversion_result_overview(conversion_id: str, user: dict[str, Any] = Depends(current_user)):
+    """Compact result payload (size independent of the cell count)."""
+    return service.result_overview(owner_id=user["id"], conversion_id=conversion_id)
+
+
+@router.get("/conversions/{conversion_id}/sheets")
+def conversion_sheets(
+    conversion_id: str,
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    q: str | None = Query(default=None, max_length=120),
+    user: dict[str, Any] = Depends(current_user),
+):
+    return service.sheets(
+        owner_id=user["id"], conversion_id=conversion_id, cursor=cursor, limit=limit, q=q
+    )
+
+
+@router.get("/conversions/{conversion_id}/sheets/{sheet_id}/pages")
+def conversion_sheet_pages(
+    conversion_id: str,
+    sheet_id: str,
+    cursor: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+    user: dict[str, Any] = Depends(current_user),
+):
+    return service.sheet_pages(
+        owner_id=user["id"],
+        conversion_id=conversion_id,
+        sheet_id=sheet_id,
+        cursor=cursor,
+        limit=limit,
+    )
+
+
 @router.get("/conversions/{conversion_id}/preview")
 def conversion_preview(
     conversion_id: str,
@@ -195,11 +229,17 @@ def conversion_cell(conversion_id: str, cell_id: str, user: dict[str, Any] = Dep
 
 @router.get("/conversions/{conversion_id}/download")
 def conversion_download(conversion_id: str, user: dict[str, Any] = Depends(current_user)):
-    data, filename, media = service.download(owner_id=user["id"], conversion_id=conversion_id)
-    return Response(
-        content=data,
+    """Streams the workbook from storage instead of loading it into memory."""
+    stream, filename, media = service.download_stream(
+        owner_id=user["id"], conversion_id=conversion_id
+    )
+    return StreamingResponse(
+        iter(lambda: stream.read(1024 * 1024), b""),
         media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -446,6 +486,19 @@ def platform_settings() -> dict[str, Any]:
             "forms": True,
             "sse": True,
             "push_events": True,
+            "batch": settings.batch_upload_enabled,
+            "resumable_upload": settings.batch_upload_enabled,
+            "full_document": settings.large_document_pipeline_enabled,
+            "result_compact": True,
+        },
+        "upload": {
+            "resumable": settings.batch_upload_enabled,
+            "accepts_multiple": settings.batch_upload_enabled,
+            "part_size_bytes": settings.upload_part_bytes,
+            "max_part_bytes": settings.upload_part_bytes,
+            "max_file_bytes": None,
+            "max_upload_bytes": settings.max_bytes(),
+            "max_files_per_batch": settings.max_files_per_batch,
         },
     }
 
@@ -476,6 +529,54 @@ def health() -> dict[str, Any]:
     services["converter"] = "up"
     overall = "ok" if all(v == "up" for v in services.values()) else "degraded"
     return {"status": overall, "services": services, "version": ENGINE_VERSION}
+
+
+@router.get("/health/ready")
+def readiness() -> dict[str, Any]:
+    """Whether the host can accept new conversions right now.
+
+    Deliberately free of hosts, paths and versions: the SPA uses it to explain
+    "server offline" instead of guessing from a failed upload, and the operator
+    keeps the detailed diagnostics in the local logs.
+    """
+    accepting = True
+    try:
+        from sqlalchemy import text
+
+        from models.db import get_engine
+
+        with get_engine().connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001
+        accepting = False
+    try:
+        if get_queue().health() != "up":
+            accepting = False
+    except Exception:  # noqa: BLE001
+        accepting = False
+    try:
+        get_storage().exists("__healthcheck__")
+    except Exception:  # noqa: BLE001
+        accepting = False
+
+    pending = 0
+    try:
+        backlog = getattr(get_queue(), "backlog", None)
+        if callable(backlog):
+            pending = int(backlog().get("queued", 0))
+    except Exception:  # noqa: BLE001
+        pending = 0
+    try:
+        ocr_available = bool(ocr_capability().get("available"))
+    except Exception:  # noqa: BLE001
+        ocr_available = False
+
+    return {
+        "status": "ok" if accepting else "degraded",
+        "accepting_uploads": accepting,
+        "ocr_available": ocr_available,
+        "queue_pending": pending,
+    }
 
 
 # --------------------------------------------------------------------------- #

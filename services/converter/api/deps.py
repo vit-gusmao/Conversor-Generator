@@ -23,10 +23,12 @@ class ApiError(HTTPException):
         code: str,
         message: str,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(
             status_code=status_code,
             detail={"error": {"code": code, "message": message, "details": details or {}}},
+            headers=headers,
         )
 
 
@@ -116,6 +118,15 @@ def resolve_user(
 DEVICE_COOKIE = "pdf2x_device_id"
 
 
+def session_cookie_kwargs() -> dict[str, Any]:
+    """Cookie attributes for the anonymous browser session.
+
+    The SPA and the API share one origin, so a first-party HttpOnly cookie
+    with `SameSite=Lax` is sufficient.
+    """
+    return {"max_age": 31_536_000, "httponly": True, "samesite": "lax", "path": "/"}
+
+
 def current_user(
     request: Request,
     response: Response,
@@ -132,10 +143,7 @@ def current_user(
         response.set_cookie(
             DEVICE_COOKIE,
             generated,
-            max_age=31_536_000,
-            httponly=True,
-            samesite="lax",
-            path="/",
+            **session_cookie_kwargs(),
         )
     return user
 
@@ -155,4 +163,5 @@ __all__ = [
     "create_token",
     "user_dict",
     "resolve_user",
+    "session_cookie_kwargs",
 ]

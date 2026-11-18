@@ -68,6 +68,9 @@ class Run(Base):
     finished_at = Column(DateTime(timezone=True), nullable=True)
     error_code = Column(String(64), nullable=True)
     error_message = Column(Text, nullable=True)
+    #: Durable cancellation request. The publication transaction refuses to
+    #: commit once this is set; the engine is the authority on who wins.
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
@@ -605,6 +608,233 @@ class IdempotencyKeyRow(Base):
 
 
 # --------------------------------------------------------------------------- #
+# Durable job backlog (engine tables, no `public_` prefix)
+# --------------------------------------------------------------------------- #
+
+class PageCheckpointRow(Base):
+    """One extracted page, reproducible without re-running OCR.
+
+    The unique key includes stage, so later phases (structure, export) can add
+    their own checkpoints without colliding with extraction.
+    """
+
+    __tablename__ = "page_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("run_id", "page_number", "stage", name="uq_page_checkpoint"),
+        Index("ix_page_checkpoints_run_stage", "run_id", "stage", "page_number"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False)
+    page_number = Column(Integer, nullable=False)
+    stage = Column(String(32), nullable=False, default="extract")
+    schema_version = Column(Integer, nullable=False, default=1)
+    source_sha256 = Column(String(64), nullable=False, default="")
+    engine_version = Column(String(32), nullable=False, default="")
+    options_hash = Column(String(64), nullable=False, default="")
+    artifact_key = Column(String(512), nullable=False)
+    artifact_sha256 = Column(String(64), nullable=False)
+    status = Column(String(16), nullable=False, default="ok")
+    error_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class RunCheckpointRow(Base):
+    """Cursor for a run-wide phase so it can resume instead of restarting."""
+
+    __tablename__ = "run_checkpoints"
+    __table_args__ = (UniqueConstraint("run_id", "phase", name="uq_run_checkpoint"),)
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False)
+    phase = Column(String(32), nullable=False)
+    cursor = Column(String(64), nullable=True)
+    last_event_sequence = Column(Integer, nullable=False, default=0)
+    plan_version = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class EngineJobRow(Base):
+    """A unit of engine work with a lease and a fencing token.
+
+    The backlog lives in the database, not in an unbounded list of futures: a
+    crashed API, a restarted worker or a second instance all converge on the
+    same rows. `fence` increments on every claim, so a worker that lost its
+    lease can never publish over the current owner's result.
+    """
+
+    __tablename__ = "engine_jobs"
+    __table_args__ = (
+        UniqueConstraint("run_id", "unit_key", name="uq_engine_job_run_unit"),
+        Index("ix_engine_jobs_state_available", "state", "available_at", "lease_until"),
+        Index("ix_engine_jobs_run", "run_id"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    run_id = Column(
+        String(64),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: "document" for the whole-document unit; finer units appear with P2.
+    unit_key = Column(String(64), nullable=False, default="document")
+    #: queued | leased | running | done | failed | cancelled
+    state = Column(String(16), nullable=False, default="queued")
+    available_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    lease_owner = Column(String(128), nullable=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    fence = Column(Integer, nullable=False, default=0)
+    attempt = Column(Integer, nullable=False, default=0)
+    payload_ref = Column(String(1024), nullable=True)
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+# --------------------------------------------------------------------------- #
+# Batches and resumable uploads (application tables, `public_*` prefix)
+# --------------------------------------------------------------------------- #
+
+class PublicBatchRow(Base):
+    """A durable container for an unbounded number of documents."""
+
+    __tablename__ = "public_batches"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "client_batch_key", name="uq_pub_batch_owner_key"),
+        Index("ix_pub_batches_owner_created", "owner_id", "created_at", "id"),
+        Index("ix_pub_batches_status", "status"),
+    )
+
+    id = Column(String(64), primary_key=True)
+    owner_id = Column(String(64), nullable=False)
+    client_batch_key = Column(String(128), nullable=False)
+    status = Column(String(32), nullable=False, default="accepting")
+    #: Optimistic-concurrency version, bumped on every state change.
+    version = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+    sealed_at = Column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class PublicBatchItemRow(Base):
+    """One logical document inside a batch; becomes exactly one conversion."""
+
+    __tablename__ = "public_batch_items"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "client_item_id", name="uq_pub_item_batch_client"),
+        Index("ix_pub_items_batch_ordinal", "batch_id", "ordinal", "id"),
+        Index("ix_pub_items_conversion", "conversion_id"),
+        Index("ix_pub_items_status", "status"),
+    )
+
+    id = Column(String(64), primary_key=True)
+    batch_id = Column(
+        String(64),
+        ForeignKey("public_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    client_item_id = Column(String(128), nullable=False)
+    ordinal = Column(Integer, nullable=False, default=0)
+    filename = Column(String(512), nullable=False)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    kind = Column(String(16), nullable=False, default="pdf")
+    options_json = Column(JSON, nullable=False, default=dict)
+    #: sha256(canonical options + filename + size); divergent replay is a 409.
+    request_fingerprint = Column(String(64), nullable=False, default="")
+    #: Pointer to the upload session currently being filled (no FK: circular).
+    upload_id = Column(String(64), nullable=True, unique=True)
+    conversion_id = Column(String(64), nullable=True, unique=True)
+    status = Column(String(32), nullable=False, default="pending_upload")
+    error_json = Column(JSON, nullable=True)
+    pages_total = Column(Integer, nullable=True)
+    pages_attempted = Column(Integer, nullable=True)
+    pages_completed = Column(Integer, nullable=True)
+    pages_failed = Column(Integer, nullable=True)
+    phase = Column(String(32), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class PublicUploadSessionRow(Base):
+    """Resumable upload of one document, transferred as independent parts."""
+
+    __tablename__ = "public_upload_sessions"
+    __table_args__ = (
+        Index("ix_pub_uploads_owner_state", "owner_id", "state", "expires_at"),
+        Index("ix_pub_uploads_item_state", "item_id", "state"),
+        Index("ix_pub_uploads_state_expiry", "state", "expires_at"),
+    )
+
+    id = Column(String(64), primary_key=True)
+    owner_id = Column(String(64), nullable=False)
+    item_id = Column(
+        String(64),
+        ForeignKey("public_batch_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    filename = Column(String(512), nullable=False)
+    expected_bytes = Column(Integer, nullable=False, default=0)
+    received_bytes = Column(Integer, nullable=False, default=0)
+    #: Transport parameter (8 MiB by default), never a document ceiling.
+    part_size = Column(Integer, nullable=False, default=8_388_608)
+    sha256 = Column(String(64), nullable=True)
+    state = Column(String(16), nullable=False, default="pending")
+    expires_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    storage_key = Column(String(512), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class PublicUploadPartRow(Base):
+    """One confirmed part. An identical retransmission is a no-op."""
+
+    __tablename__ = "public_upload_parts"
+    __table_args__ = (
+        UniqueConstraint("upload_id", "part_number", name="uq_pub_part_number"),
+        Index("ix_pub_parts_upload_number", "upload_id", "part_number"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    upload_id = Column(
+        String(64),
+        ForeignKey("public_upload_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    part_number = Column(Integer, nullable=False)
+    size = Column(Integer, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    storage_key = Column(String(512), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class PublicBatchEventRow(Base):
+    """Aggregated batch SSE event, sequenced per batch."""
+
+    __tablename__ = "public_batch_events"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "sequence", name="uq_pub_batch_event_seq"),
+        Index("ix_pub_batch_events_seq", "batch_id", "sequence"),
+    )
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    batch_id = Column(
+        String(64),
+        ForeignKey("public_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sequence = Column(Integer, nullable=False)
+    type = Column(String(24), nullable=False, default="batch")
+    item_id = Column(String(64), nullable=True)
+    status = Column(String(32), nullable=False, default="accepting")
+    item_status = Column(String(32), nullable=True)
+    message = Column(Text, nullable=False, default="")
+    payload_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+# --------------------------------------------------------------------------- #
 # Engine / session factory
 # --------------------------------------------------------------------------- #
 
@@ -716,6 +946,14 @@ __all__ = [
     "PublicConversionRow",
     "PublicEventRow",
     "IdempotencyKeyRow",
+    "EngineJobRow",
+    "PageCheckpointRow",
+    "RunCheckpointRow",
+    "PublicBatchRow",
+    "PublicBatchItemRow",
+    "PublicUploadSessionRow",
+    "PublicUploadPartRow",
+    "PublicBatchEventRow",
     "get_engine",
     "get_session_factory",
     "init_db",

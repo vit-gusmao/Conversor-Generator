@@ -67,6 +67,15 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+class RunCancelled(Exception):
+    """Raised when a cancellation was confirmed before publication.
+
+    The publication transaction refuses to commit, so a cancelled run can never
+    leave artifacts behind. The engine is the authority: the API records a
+    *request*, the engine decides whether it won.
+    """
+
+
 class RunProgressSink:
     """Persists status transitions and emits public SSE events."""
 
@@ -100,6 +109,49 @@ class ConversionRepository:
     # ------------------------------------------------------------------ #
     # Runs
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Cancellation arbitration
+    # ------------------------------------------------------------------ #
+    def cancel_requested(self, run_id: str) -> bool:
+        """True when a cancellation was requested (and not yet overridden)."""
+        with self._session() as session:
+            row = session.execute(
+                select(Run.cancel_requested_at, Run.status).where(Run.id == run_id)
+            ).first()
+            if row is None:
+                return False
+            requested, status = row
+            return requested is not None or status == "cancelled"
+
+    def confirm_cancel(self, run_id: str) -> bool:
+        """Marks the run cancelled atomically. Used by the cancel endpoint."""
+        with self._session() as session:
+            run = session.execute(
+                select(Run).where(Run.id == run_id)
+            ).scalar_one_or_none()
+            if run is None:
+                return False
+            run.cancel_requested_at = run.cancel_requested_at or utcnow()
+            if run.status not in {"completed", "completed_with_warnings"}:
+                run.status = "cancelled"
+                run.stage = "failed"
+                run.finished_at = run.finished_at or utcnow()
+            session.commit()
+            return True
+
+    def _assert_publishable(self, session, run_id: str) -> None:
+        """Refuses to publish a cancelled run.
+
+        Called at the start of the publication transaction and again right
+        before the commit: the window between the two is the whole write, and a
+        cancellation arriving inside it still wins.
+        """
+        row = session.execute(
+            select(Run.cancel_requested_at).where(Run.id == run_id)
+        ).scalar_one_or_none()
+        if row is not None:
+            raise RunCancelled(run_id)
+
     def create_run(
         self,
         *,
@@ -266,6 +318,9 @@ class ConversionRepository:
             run = session.get(Run, run_id)
             if run is None or run.status in TERMINAL:
                 return False
+            # Durable request + confirmed state: the publication transaction
+            # reads `cancel_requested_at`, and this row also ends the run now.
+            run.cancel_requested_at = run.cancel_requested_at or utcnow()
             run.status = "cancelled"
             run.quality = "failed"
             run.error_code = "CANCELLED"
@@ -305,6 +360,7 @@ class ConversionRepository:
         started = utcnow()
 
         with self._session() as session:
+            self._assert_publishable(session, run_id)
             self._clear_run(session, run_id)
 
             for page in ir.pages:
@@ -579,6 +635,10 @@ class ConversionRepository:
                         pages=int(timing.get("pages") or 0),
                     )
                 )
+            # Final arbitration point: a cancellation confirmed while the
+            # transaction was open refuses the commit, so no artifact and no
+            # cell is published.
+            self._assert_publishable(session, run_id)
             session.commit()
 
         # Artifacts (outside the DB transaction: object storage is not
@@ -876,6 +936,240 @@ class ConversionRepository:
                 "warnings": [_issue_dict(issue) for issue in warnings],
             }
 
+    def result_overview(self, run_id: str) -> dict[str, Any] | None:
+        """Compact result payload whose size is independent of the cell count.
+
+        Counts come from `output_sheets` metadata and `COUNT(*)`, so a
+        million-cell workbook returns the same shape as a tiny one. Source pages
+        are never inlined here.
+        """
+        with self._session() as session:
+            run = session.get(Run, run_id)
+            if run is None:
+                return None
+
+            sheets = session.execute(
+                select(
+                    OutputSheetRow.sheet_id,
+                    OutputSheetRow.name,
+                    OutputSheetRow.kind,
+                    OutputSheetRow.n_rows,
+                    OutputSheetRow.n_cols,
+                    OutputSheetRow.source_pages_json,
+                )
+                .where(OutputSheetRow.run_id == run_id)
+                .order_by(OutputSheetRow.order_index, OutputSheetRow.name)
+            ).all()
+
+            pages = session.execute(
+                select(func.count()).select_from(PageResultRow).where(PageResultRow.run_id == run_id)
+            ).scalar() or 0
+            pages_failed = session.execute(
+                select(func.count())
+                .select_from(PageResultRow)
+                .where(PageResultRow.run_id == run_id, PageResultRow.status == "failed")
+            ).scalar() or 0
+            tables = session.execute(
+                select(func.count()).select_from(ExtractedTableRow).where(ExtractedTableRow.run_id == run_id)
+            ).scalar() or 0
+            issue_counts = dict(
+                session.execute(
+                    select(AuditIssueRow.severity, func.count())
+                    .where(AuditIssueRow.run_id == run_id)
+                    .group_by(AuditIssueRow.severity)
+                ).all()
+            )
+            formats = [
+                row
+                for row in session.execute(
+                    select(ExportArtifactRow.format)
+                    .where(
+                        ExportArtifactRow.run_id == run_id,
+                        ExportArtifactRow.publication_status == "approved",
+                    )
+                    .group_by(ExportArtifactRow.format)
+                ).scalars()
+            ]
+
+            stats = run.stats_json or {}
+            publication = stats.get("publication_status") or "approved"
+            quality = run.quality or "pending"
+            status = run.status or "queued"
+
+            structural = [
+                sheet
+                for sheet in sheets
+                if sheet.kind in {"records", "table"} and (sheet.n_rows or 0) > 0
+            ]
+            consolidated = next(
+                (sheet for sheet in sheets if sheet.kind == "consolidated" and (sheet.n_rows or 0) > 0),
+                None,
+            )
+            text_sheet = next(
+                (sheet for sheet in sheets if sheet.kind == "text" and (sheet.n_rows or 0) > 0),
+                None,
+            )
+
+            default_sheet: str | None = None
+            if consolidated is not None and int(consolidated.n_cols or 0) <= 30:
+                default_sheet = consolidated.name
+            elif structural:
+                default_sheet = structural[0].name
+            elif text_sheet is not None:
+                default_sheet = text_sheet.name
+            elif sheets:
+                default_sheet = sheets[0].name
+
+            cells = session.execute(
+                select(func.count())
+                .select_from(OutputCellRow)
+                .where(
+                    OutputCellRow.run_id == run_id,
+                    OutputCellRow.value_text.is_not(None),
+                    OutputCellRow.value_text != "",
+                )
+            ).scalar() or 0
+
+            return {
+                "conversion_id": run.conversion_id,
+                "run_id": run.id,
+                "status": status,
+                "quality": quality,
+                "publication_status": publication,
+                "counts": {
+                    "pages": int(pages),
+                    "tables": int(tables),
+                    "sheets": len(sheets),
+                    "cells": int(cells),
+                    "records": int(stats.get("records") or 0),
+                    "fields": int(stats.get("fields") or 0),
+                },
+                "available_formats": sorted(set(formats)),
+                "default_sheet": default_sheet,
+                "warning_counts": {
+                    "total": sum(int(v) for v in issue_counts.values()),
+                    "error": int(issue_counts.get("error", 0)),
+                    "critical": int(issue_counts.get("critical", 0)),
+                    "warning": int(issue_counts.get("warning", 0)),
+                },
+                "partial": bool(pages_failed) or quality == "partial",
+                "pages_failed": int(pages_failed),
+                "pages_total": int(pages),
+                "download_url": (
+                    f"/api/v1/conversions/{run.conversion_id}/download"
+                    if status not in {"failed", "cancelled"} and publication != "quarantined"
+                    else None
+                ),
+                "audit_url": f"/api/v1/conversions/{run.conversion_id}/audit",
+            }
+
+    def sheets_page(
+        self,
+        run_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 50,
+        q: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Paginated sheet selector metadata.
+
+        `source_page_count` replaces the full page list so a 10,000-page
+        document does not inline ten thousand numbers in the selector.
+        """
+        with self._session() as session:
+            run = session.get(Run, run_id)
+            if run is None:
+                return None
+
+            query = (
+                select(
+                    OutputSheetRow.sheet_id,
+                    OutputSheetRow.name,
+                    OutputSheetRow.kind,
+                    OutputSheetRow.n_rows,
+                    OutputSheetRow.n_cols,
+                    OutputSheetRow.order_index,
+                    OutputSheetRow.table_id,
+                    OutputSheetRow.source_pages_json,
+                )
+                .where(OutputSheetRow.run_id == run_id)
+                .order_by(OutputSheetRow.order_index, OutputSheetRow.name)
+            )
+            if q:
+                query = query.where(OutputSheetRow.name.ilike("%" + q + "%"))
+            if cursor:
+                raw_order, _, after_name = cursor.partition("|")
+                try:
+                    order_value = int(raw_order)
+                except ValueError:
+                    order_value = -1
+                if order_value >= 0:
+                    query = query.where(
+                        (OutputSheetRow.order_index > order_value)
+                        | (
+                            (OutputSheetRow.order_index == order_value)
+                            & (OutputSheetRow.name > after_name)
+                        )
+                    )
+
+            size = min(max(int(limit or 50), 1), 200)
+            rows = session.execute(query.limit(size + 1)).all()
+            has_more = len(rows) > size
+            page = rows[:size]
+
+            total = session.execute(
+                select(func.count()).select_from(OutputSheetRow).where(OutputSheetRow.run_id == run_id)
+            ).scalar() or 0
+
+            items = [
+                {
+                    "id": row.sheet_id or "sheet_{:03d}".format(int(row.order_index or 0)),
+                    "name": row.name,
+                    "kind": row.kind,
+                    "rows": int(row.n_rows or 0),
+                    "columns": int(row.n_cols or 0),
+                    "source_page_count": len(row.source_pages_json or []),
+                    "table_id": row.table_id,
+                }
+                for row in page
+            ]
+            next_cursor = (
+                "{}|{}".format(int(page[-1].order_index or 0), page[-1].name)
+                if has_more and page
+                else None
+            )
+            return {"items": items, "next_cursor": next_cursor, "total": int(total)}
+
+    def sheet_source_pages(
+        self,
+        run_id: str,
+        sheet_id: str,
+        *,
+        cursor: int | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any] | None:
+        """Paginated per-page provenance for one sheet."""
+        with self._session() as session:
+            sheet = session.execute(
+                select(OutputSheetRow).where(
+                    OutputSheetRow.run_id == run_id,
+                    (OutputSheetRow.sheet_id == sheet_id) | (OutputSheetRow.name == sheet_id),
+                )
+            ).scalar_one_or_none()
+            if sheet is None:
+                return None
+            pages = sorted(int(page) for page in (sheet.source_pages_json or []))
+            start = max(0, int(cursor)) if cursor is not None else 0
+            size = min(max(int(limit or 200), 1), 1000)
+            window = pages[start : start + size]
+            next_cursor = start + size if start + size < len(pages) else None
+            return {
+                "sheet_id": sheet.sheet_id,
+                "pages": window,
+                "next_cursor": str(next_cursor) if next_cursor is not None else None,
+                "total": len(pages),
+            }
+
     def preview(self, run_id: str, sheet: str | None, offset: int, limit: int) -> dict[str, Any] | None:
         with self._session() as session:
             sheets = session.execute(
@@ -892,29 +1186,65 @@ class ConversionRepository:
             default_sheet = next((s.name for s in sheets if s.kind != "consolidated"), names[0])
             target = sheet if sheet in names else default_sheet
             meta = next(s for s in sheets if s.name == target)
-            rows = session.execute(
-                select(OutputCellRow)
-                .where(OutputCellRow.run_id == run_id, OutputCellRow.sheet == target)
-                .order_by(OutputCellRow.row_index, OutputCellRow.col_index)
-            ).scalars().all()
+            # SQL pagination: only the requested window is loaded. Listing
+            # every cell of a sheet to render 100 rows was the memory hotspot
+            # the plan calls out (a million-cell sheet has ~1M rows here).
+            header_row = session.execute(
+                select(func.min(OutputCellRow.row_index)).where(
+                    OutputCellRow.run_id == run_id, OutputCellRow.sheet == target
+                )
+            ).scalar()
 
-            grouped: dict[int, dict[int, OutputCellRow]] = {}
-            for row in rows:
-                grouped.setdefault(row.row_index, {})[row.col_index] = row
             headers = [""] * (meta.n_cols or 0)
-            if grouped:
-                first = grouped[min(grouped)]
-                for column, cell in first.items():
-                    if 1 <= column <= len(headers):
-                        headers[column - 1] = cell.header
+            if header_row is not None:
+                header_cells = session.execute(
+                    select(OutputCellRow)
+                    .where(
+                        OutputCellRow.run_id == run_id,
+                        OutputCellRow.sheet == target,
+                        OutputCellRow.row_index == header_row,
+                    )
+                    .order_by(OutputCellRow.col_index)
+                ).scalars().all()
+                for cell in header_cells:
+                    if 1 <= cell.col_index <= len(headers):
+                        headers[cell.col_index - 1] = cell.header
             headers = [h or f"Coluna {i + 1}" for i, h in enumerate(headers)]
 
-            total = len(grouped)
-            ordered = sorted(grouped)
-            page_indices = ordered[offset : offset + limit]
+            total = session.execute(
+                select(func.count(func.distinct(OutputCellRow.row_index))).where(
+                    OutputCellRow.run_id == run_id, OutputCellRow.sheet == target
+                )
+            ).scalar() or 0
+
+            page_indices = list(
+                session.execute(
+                    select(OutputCellRow.row_index)
+                    .where(OutputCellRow.run_id == run_id, OutputCellRow.sheet == target)
+                    .group_by(OutputCellRow.row_index)
+                    .order_by(OutputCellRow.row_index)
+                    .offset(max(0, offset))
+                    .limit(max(1, limit))
+                ).scalars()
+            )
+
+            grouped: dict[int, dict[int, OutputCellRow]] = {index: {} for index in page_indices}
+            if page_indices:
+                window_rows = session.execute(
+                    select(OutputCellRow)
+                    .where(
+                        OutputCellRow.run_id == run_id,
+                        OutputCellRow.sheet == target,
+                        OutputCellRow.row_index.in_(page_indices),
+                    )
+                    .order_by(OutputCellRow.row_index, OutputCellRow.col_index)
+                ).scalars().all()
+                for row in window_rows:
+                    grouped.setdefault(row.row_index, {})[row.col_index] = row
+
             out_rows: list[list[dict[str, Any]]] = []
             for index in page_indices:
-                cells = grouped[index]
+                cells = grouped.get(index, {})
                 out_rows.append(
                     [
                         {
@@ -933,7 +1263,7 @@ class ConversionRepository:
                 "sheet": target,
                 "headers": headers,
                 "rows": out_rows,
-                "total_rows": total,
+                "total_rows": int(total),
                 "offset": offset,
                 "limit": limit,
             }
@@ -1396,6 +1726,21 @@ class ConversionRepository:
             default=str,
         )
         return payload.encode("utf-8"), "application/json", f"auditoria-{run_id}.json"
+
+    def xlsx_key(self, run_id: str) -> str | None:
+        """Storage key of the generated workbook, without reading it."""
+        with self._session() as session:
+            artifact = session.execute(
+                select(ArtifactRow).where(ArtifactRow.run_id == run_id, ArtifactRow.kind == "xlsx")
+            ).scalars().first()
+        return artifact.path if artifact is not None else None
+
+    def xlsx_stream(self, run_id: str):
+        """Streaming read of the workbook (never buffers the whole file)."""
+        key = self.xlsx_key(run_id)
+        if key is None:
+            return None
+        return get_storage().open_read(key)
 
     def xlsx_bytes(self, run_id: str) -> bytes | None:
         with self._session() as session:

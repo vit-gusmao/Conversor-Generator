@@ -20,6 +20,14 @@ export interface SheetPreviewProps {
   onCellClick?: (cell: { sheet: string; address: string; value: string }) => void;
   selectedCell?: string | null;
   className?: string;
+  /**
+   * Renders the sheet tabs above the table. The result page turns this off
+   * because a single selector controls which sheet the preview shows; the
+   * audit page keeps the tabs.
+   */
+  showSheetNavigation?: boolean;
+  /** Identifies the run so a retried conversion never shows stale rows. */
+  runId?: string | null;
 }
 
 export function SheetPreview({
@@ -31,6 +39,8 @@ export function SheetPreview({
   onCellClick,
   selectedCell,
   className,
+  showSheetNavigation = true,
+  runId = null,
 }: SheetPreviewProps) {
   const [offset, setOffset] = useState(0);
   const activeSheet = sheet ?? sheets[0]?.name ?? null;
@@ -41,7 +51,7 @@ export function SheetPreview({
 
   const preview = usePreview(
     conversionId,
-    { sheet: activeSheet, offset, limit: pageSize },
+    { sheet: activeSheet, offset, limit: pageSize, runId },
     Boolean(activeSheet),
   );
 
@@ -52,7 +62,7 @@ export function SheetPreview({
 
   return (
     <div className={cn('space-y-3', className)}>
-      {(sheets.length > 1 || onSheetChange) && (
+      {showSheetNavigation && (sheets.length > 1 || onSheetChange) && (
         <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Abas do Excel">
           {sheets.map((item) => (
             <button

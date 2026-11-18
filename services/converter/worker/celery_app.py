@@ -21,8 +21,14 @@ celery_app.conf.update(
     enable_utc=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
-    task_time_limit=settings.converter_task_timeout_seconds,
-    task_soft_time_limit=max(30, settings.converter_task_timeout_seconds - 30),
+    # 0 means "no whole-document limit": units are reentrant and the watchdog
+    # is per unit, so a hard task limit would kill a long but healthy document.
+    task_time_limit=settings.converter_task_timeout_seconds or None,
+    task_soft_time_limit=(
+        max(30, settings.converter_task_timeout_seconds - 30)
+        if settings.converter_task_timeout_seconds
+        else None
+    ),
     task_default_queue="pdf-native",
     task_routes={
         "converter.execute_run": {"queue": "pdf-native"},

@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type {
-  Conversion,
-  ConversionListItem,
-  ConversionStatus,
-  Paginated,
-  Preview,
-  ResultSummary,
+import {
+  isTerminal,
+  type Conversion,
+  type ConversionListItem,
+  type ConversionStatus,
+  type Paginated,
+  type Preview,
+  type ResultSummary,
 } from '@pdf2x/contracts';
 import { STALE_TIME, queryKeys } from '@/lib/query-keys';
 import { isApiError } from '@/lib/api';
@@ -43,6 +44,15 @@ export function useConversion(id: string | null | undefined) {
     staleTime: STALE_TIME.status,
     retry: shouldRetry,
     refetchOnWindowFocus: false,
+    // SSE is the primary transport, but its connection can be dropped or
+    // interrupted by intermediate proxies. A slow poll while the
+    // conversion is active keeps the screen truthful and stops at a terminal
+    // state, so no timer survives the page.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return false;
+      return isTerminal(data.status) ? false : 5_000;
+    },
   });
 }
 
@@ -85,13 +95,19 @@ export function useResult(id: string | null | undefined) {
 
 export function usePreview(
   id: string | null | undefined,
-  params: { sheet?: string | null; offset?: number; limit?: number } = {},
+  params: { sheet?: string | null; offset?: number; limit?: number; runId?: string | null } = {},
   enabled = true,
 ) {
   const offset = params.offset ?? 0;
   const limit = params.limit ?? 100;
   return useQuery<Preview>({
-    queryKey: queryKeys.preview(id ?? '', params.sheet ?? null, offset, limit),
+    queryKey: queryKeys.preview(
+      id ?? '',
+      params.sheet ?? null,
+      offset,
+      limit,
+      params.runId ?? null,
+    ),
     queryFn: () => getPreview(id as string, { sheet: params.sheet ?? null, offset, limit }),
     enabled: Boolean(id) && enabled,
     staleTime: STALE_TIME.preview,

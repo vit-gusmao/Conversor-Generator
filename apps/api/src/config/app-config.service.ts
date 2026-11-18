@@ -6,12 +6,14 @@ import type {
   AppConfiguration,
   AuthMode,
   ConverterSection,
+  FeatureSection,
   LogLevel,
   RetentionSection,
   RuntimeMode,
   S3Section,
   StorageBackend,
   StorageSection,
+  UploadSection,
 } from './configuration';
 
 /**
@@ -23,6 +25,8 @@ import type {
 @Injectable()
 export class AppConfigService {
   private readonly _api: ApiSection;
+  private readonly _upload: UploadSection;
+  private readonly _features: FeatureSection;
   private readonly _converter: ConverterSection;
   private readonly _storage: StorageSection;
   private readonly _retention: RetentionSection;
@@ -32,15 +36,19 @@ export class AppConfigService {
 
   constructor(configService: ConfigService) {
     const api = configService.get<ApiSection>('api');
+    const upload = configService.get<UploadSection>('upload');
+    const features = configService.get<FeatureSection>('features');
     const converter = configService.get<ConverterSection>('converter');
     const storage = configService.get<StorageSection>('storage');
     const retention = configService.get<RetentionSection>('retention');
 
-    if (!api || !converter || !storage || !retention) {
+    if (!api || !upload || !features || !converter || !storage || !retention) {
       throw new Error('Configuração da aplicação não carregada');
     }
 
     this._api = api;
+    this._upload = upload;
+    this._features = features;
     this._converter = converter;
     this._storage = storage;
     this._retention = retention;
@@ -51,6 +59,10 @@ export class AppConfigService {
 
   get apiPort(): number {
     return this._api.port;
+  }
+
+  get apiHost(): string {
+    return this._api.host;
   }
 
   get databaseUrl(): string {
@@ -73,8 +85,57 @@ export class AppConfigService {
     return this._api.uploadMaxBytes;
   }
 
-  get uploadMaxPages(): number {
+  /** `null` means no ceiling: the whole document is processed. */
+  get uploadMaxPages(): number | null {
     return this._api.uploadMaxPages;
+  }
+
+  get upload(): UploadSection {
+    return this._upload;
+  }
+
+  get uploadPartBytes(): number {
+    return this._upload.partBytes;
+  }
+
+  get uploadPartMaxBytes(): number {
+    return this._upload.partMaxBytes;
+  }
+
+  get uploadConcurrency(): number {
+    return this._upload.concurrency;
+  }
+
+  get maxFilesPerBatch(): number | null {
+    return this._upload.maxFilesPerBatch;
+  }
+
+  get maxFileBytes(): number | null {
+    return this._upload.maxFileBytes;
+  }
+
+  get uploadSessionTtlHours(): number {
+    return this._upload.sessionTtlHours;
+  }
+
+  get features(): FeatureSection {
+    return this._features;
+  }
+
+  get batchUploadEnabled(): boolean {
+    return this._features.batchUpload;
+  }
+
+  get largeDocumentPipelineEnabled(): boolean {
+    return this._features.largeDocumentPipeline;
+  }
+
+  get resultCompactEnabled(): boolean {
+    return this._features.resultCompact;
+  }
+
+  get mcpEnabled(): boolean {
+    return this._features.mcp;
   }
 
   get allowedOrigins(): string[] {
@@ -140,6 +201,8 @@ export class AppConfigService {
       engineVersion: this._engineVersion,
       logLevel: this._logLevel,
       api: this._api,
+      upload: this._upload,
+      features: this._features,
       converter: this._converter,
       storage: this._storage,
       retention: this._retention,

@@ -3,6 +3,10 @@
 Este documento descreve o que acontece entre o upload e o `.xlsx`, fase por
 fase, com o módulo responsável e o critério de qualidade aplicado.
 
+Para o caminho em tempo de execução (fila, etapas e eventos), veja
+[FLOW.md](FLOW.md). Para onde cada artefato é gravado, veja
+[STORAGE.md](STORAGE.md).
+
 ## Fase 01 — Receber e validar
 
 `engine/inspector/pdf_inspector.py`
@@ -69,6 +73,27 @@ visuais. Isso elimina uma classe inteira de bugs de ordenação.
    `OCR_LOW_LEGIBILITY` — o texto é exportado, mas a auditoria diz que a fonte
    não era legível o suficiente para confiar palavra por palavra.
 
+### Motores locais
+
+Quatro caminhos de OCR são possíveis. A escolha é feita em
+`engine/ocr/engines.py` (`get_engine`): `CONVERTER_OCR_ENGINE` (`glm-ocr`,
+`rapidocr` ou `tesseract`) coloca o motor pedido na frente da ordem. Sem essa
+variável, a ordem é GLM-OCR → RapidOCR → Tesseract, e vale o primeiro disponível.
+Se nenhum estiver disponível, entra o `NullEngine` e a página falha de forma
+explícita.
+
+| Motor | Onde roda | Requisito | Observação |
+| --- | --- | --- | --- |
+| GLM-OCR | Ollama em `GLMOCR_HOST:GLMOCR_PORT` (padrão `127.0.0.1:11434`), modelo `GLMOCR_MODEL` (`glm-ocr:latest`) | Ollama no ar com o modelo instalado (`ollama pull glm-ocr:latest`) | a GPU é usada pelo próprio Ollama quando há VRAM (`ollama ps` mostra `100% GPU`). O motor não usa o cliente MaaS do SDK `glmocr` |
+| RapidOCR | CPU, via onnxruntime (`rapidocr_onnxruntime`) | extra `ocr` do pacote (`pip install -e ".[ocr]"`) | não vem na imagem do motor, porque o extra `full` não o inclui |
+| Tesseract | binário local, chamado pelo pytesseract | `tesseract-ocr` no sistema; `TESSERACT_CMD` se não estiver no `PATH` | idiomas fixos `por+eng` em `engine/ocr/engines.py`. Não há variável de idioma: a chave `ocr.languages` não existe no código. A imagem do motor traz `tesseract-ocr-por` |
+| NullEngine | — | nenhum | sem motor, a região é registrada como não reconhecida (`OCR_UNAVAILABLE`); nada é inventado |
+
+**Docling** (opcional, extra `docling`, para Python abaixo de 3.13) fornece só a
+estrutura de tabela; os caracteres continuam vindo do texto nativo ou do OCR. A
+biblioteca Docling baixa seus modelos no primeiro uso. O adapter deste repositório
+não controla esse download (comportamento da biblioteca, não verificado aqui).
+
 ### Grid que é formulário, não tabela
 
 Um bloco de texto em colunas com vários `Rótulo:` dentro das células não vira
@@ -103,7 +128,7 @@ quando há VRAM (`ollama ps` mostra `100% GPU`).
 
 | Aspecto | Decisão |
 | --- | --- |
-| Seleção | automática quando `GLMOCR_ENABLED=true` e o modelo responde; `CONVERTER_OCR_ENGINE=glm-ocr` força, `rapidocr`/`tesseract` excluem |
+| Seleção | automática quando `GLMOCR_ENABLED=true` e o modelo responde, por ser o primeiro da ordem padrão. `CONVERTER_OCR_ENGINE` muda só a ordem de preferência e não exclui os outros motores (veja [Motores locais](#motores-locais)) |
 | Prompt | `Text Recognition:` (padrão), `Table Recognition:` (regiões de tabela), `Formula Recognition:` |
 | Determinismo | `temperature=0`, `num_ctx=8192` (evita truncar páginas densas), `keep_alive=30m` (mantém o modelo quente) |
 | Geometria | `projection_v1`: linhas por projeção de tinta (NumPy) casadas 1:1 com as linhas do modelo; `even_distribution`: distribuição ancorada na extensão de tinta quando a contagem diverge; `html_grid_v1`: grade inferida a partir do HTML de tabela |
@@ -300,7 +325,11 @@ quanto a duplicação do que já foi estruturado.
   **união de todas as colunas** e duas colunas de origem (`Aba`, `Página`).
   É uma cópia do plano — nunca uma nova extração —, então não pode divergir
   das abas originais; o download continua sendo **um único `.xlsx`**;
-- limites do Excel respeitados por divisão, nunca por truncamento.
+- limites do Excel (`_apply_excel_limits`, em `resolver.py`): uma aba com mais de
+  1.048.575 linhas é dividida em abas `<nome> 1`, `<nome> 2` etc.; colunas acima de
+  16.384 **não são exportadas**: o excedente é registrado como aviso
+  (`SHEET_COLUMNS_EXCEEDED`), com a quantidade de colunas descartadas. Valores de
+  célula acima do limite de caracteres são tratados na fase 12.
 
 ## Fase 12 — Gerar o XLSX
 
@@ -308,7 +337,10 @@ quanto a duplicação do que já foi estruturado.
 
 Cabeçalho estilizado, congelamento, autofiltro, larguras, formatos numéricos.
 Identificadores com formato `@`. Nenhuma imagem. Texto acima de 32.767
-caracteres é truncado com registro.
+caracteres é **truncado na célula**, e a referência da célula é registrada no
+resultado do writer. No gate de publicação esse caso é aviso: o download continua
+liberado, com a informação (fase 16 e "Gate de publicação"). Colunas excedentes
+não são escritas (fase 11).
 
 ## Fase 13 — Auditar o arquivo
 
@@ -349,8 +381,10 @@ O OCR por região (`run_region`) está disponível no componente, mas ainda não
 acionado automaticamente pelo pipeline — por isso não aparece como degrau
 autônomo acima.
 
-Cada degrau tem limite de tentativas, tempo e memória
-(`CONVERTER_MAX_FALLBACK_ATTEMPTS`, `CONVERTER_TASK_TIMEOUT_SECONDS`). O sistema
+Cada degrau tem limite de tentativas (`CONVERTER_MAX_FALLBACK_ATTEMPTS`) e de
+tempo por chamada de OCR (`CONVERTER_OCR_CALL_TIMEOUT_SECONDS`).
+`CONVERTER_TASK_TIMEOUT_SECONDS` é `0` por padrão, ou seja, sem prazo global por
+documento. O sistema
 nunca entra em laço infinito: quando não há confiança, preserva o texto e
 registra a pendência.
 
@@ -402,3 +436,26 @@ e nenhum texto acima da confiança, falha com `NO_TEXT_RECOVERED`. Nunca há
 Falha fatal → `publication_status=quarantined`, `status=failed` e download
 bloqueado nas duas APIs. Aviso permite download informado. O manifesto registra
 a versão da política e as regras acionadas.
+
+## Documentos grandes: sem teto de páginas
+
+O fluxo padrão processa **todas** as páginas. Não existe `PAGES_NOT_PROCESSED`:
+uma página tentada tem desfecho persistido (sucesso, aviso ou falha) e o total
+planejado é sempre o total real.
+
+- `Settings.max_pages()` devolve `None` (sem teto) enquanto
+  `LARGE_DOCUMENT_PIPELINE_ENABLED=true`. Um `CONVERTER_MAX_PAGES`/
+  `UPLOAD_MAX_PAGES` antigo **não** trunca nem recusa o documento; no máximo gera aviso no inspetor.
+- Requisições que tentem impor teto (`max_pages`) são recusadas com
+  `INVALID_OPTION`.
+- Cada página recebe um checkpoint. Se o worker morrer no meio e a unidade for
+  reentregue (modo `inline`, tentativa maior que 1), as páginas já extraídas são
+  retomadas sem repetir OCR; o que não tem checkpoint é reprocessado. No modo
+  Celery não há retomada: veja [Limitações do modo Celery](DEPLOY.md#limitações-do-modo-celery).
+- O armazenamento dos artefatos desta execução (`runs/<run_id>/output.xlsx`,
+  `runs/<run_id>/audit.json.gz`) está descrito em [STORAGE.md](STORAGE.md).
+- Falha permanente em uma página com conteúdo útil mantém o resultado como
+  parcial (`completed_with_warnings`), com a lista de páginas falhas e downloads
+  identificados como parciais. Zero conteúdo útil é `failed`.
+- O TXT não recebe texto inventado para preencher páginas falhas: a ordem de
+  leitura e os separadores continuam os mesmos.

@@ -1,0 +1,31 @@
+{
+  "name": "@pdf2x/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "MCP adapter for the Conversor Generator public API: submit documents, track batches and download artifacts from an LLM host.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist/main.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "node --test \"dist-test/tests/*.test.js\"",
+    "pretest": "npm run build && tsc -p tsconfig.test.json",
+    "clean": "node -e \"const fs=require('node:fs');for(const d of ['dist','dist-test'])fs.rmSync(d,{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3"
+  }
+}

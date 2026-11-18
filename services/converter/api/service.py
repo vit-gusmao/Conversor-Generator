@@ -39,7 +39,6 @@ from storage import get_storage
 from version import ENGINE_VERSION
 
 TERMINAL = {"completed", "completed_with_warnings", "failed", "cancelled"}
-ACTIVE = {"received", "validating", "queued", "inspecting", "extracting", "structuring", "normalizing", "reconciling", "generating", "auditing"}
 
 _UNSAFE = re.compile(r"[^\w.\- ()]+", re.UNICODE)
 
@@ -76,18 +75,113 @@ def _request_hash(digest: str, options: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+#: Keys that used to cap the document. Their presence is always rejected: the
+#: default flow has no page ceiling and a request must not reintroduce one.
+_CEILING_KEYS = ("max_pages", "maxPages", "max_pages_per_document", "page_limit")
+
+#: Legacy flat aliases still accepted from older standalone clients.
+_LEGACY_KEYS = frozenset(
+    {
+        "target_formats",
+        "ocr",
+        "ocr_enabled",
+        "dpi",
+        "text_newline",
+        "page_separator",
+        "include_table_text",
+        "csv_profile",
+        "csv_delimiter",
+        "csv_table_ids",
+        "csv_formula_policy",
+        "csv_value_mode",
+    }
+)
+
+
+def _from_legacy_options(raw: dict[str, Any]) -> dict[str, Any]:
+    """Rewrites the pre-v2 flat shape into the nested contract (mirrors TS)."""
+    nested: dict[str, Any] = {}
+    if "target_formats" in raw:
+        nested["target_formats"] = raw["target_formats"]
+
+    ocr: dict[str, Any] = {}
+    if isinstance(raw.get("ocr"), bool):
+        ocr["enabled"] = raw["ocr"]
+    if isinstance(raw.get("ocr_enabled"), bool):
+        ocr["enabled"] = raw["ocr_enabled"]
+    if isinstance(raw.get("ocr"), dict):
+        ocr.update(raw["ocr"])
+    if raw.get("dpi") is not None:
+        ocr["dpi"] = raw["dpi"]
+    if ocr:
+        nested["ocr"] = ocr
+
+    text: dict[str, Any] = {}
+    if raw.get("text_newline") is not None:
+        text["newline"] = raw["text_newline"]
+    if raw.get("page_separator") is not None:
+        text["page_separator"] = raw["page_separator"]
+    if isinstance(raw.get("include_table_text"), bool):
+        text["include_table_text"] = raw["include_table_text"]
+    if isinstance(raw.get("text"), dict):
+        text.update(raw["text"])
+    if text:
+        nested["text"] = text
+
+    csv: dict[str, Any] = {}
+    if raw.get("csv_profile") is not None:
+        csv["profile"] = raw["csv_profile"]
+    if raw.get("csv_delimiter") is not None:
+        csv["delimiter"] = raw["csv_delimiter"]
+    if raw.get("csv_table_ids") is not None:
+        csv["table_ids"] = raw["csv_table_ids"]
+    if raw.get("csv_formula_policy") is not None:
+        csv["formula_policy"] = raw["csv_formula_policy"]
+    if raw.get("csv_value_mode") is not None:
+        csv["value_mode"] = raw["csv_value_mode"]
+    if isinstance(raw.get("csv"), dict):
+        csv.update(raw["csv"])
+    if csv:
+        nested["csv"] = csv
+
+    return nested
+
+
 def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
     raw = dict(raw or {})
-    unknown = set(raw) - {"schema_version", "target_formats", "ocr", "text", "csv"}
+
+    for key in _CEILING_KEYS:
+        if raw.get(key) is not None:
+            raise ApiError(
+                400,
+                "INVALID_OPTION",
+                "O limite de páginas por requisição não é suportado: o documento "
+                "é processado por inteiro.",
+                details={"option": key},
+            )
+
+    unknown = (
+        set(raw)
+        - {"schema_version", "target_formats", "ocr", "text", "csv"}
+        - _LEGACY_KEYS
+        - set(_CEILING_KEYS)
+    )
     if unknown:
         raise ApiError(
             400,
             "INVALID_OPTION",
             f"Opções desconhecidas: {sorted(unknown)}.",
-            details={"allowed": ["schema_version", "target_formats", "ocr", "text", "csv"]},
+            details={
+                "allowed": ["schema_version", "target_formats", "ocr", "text", "csv"],
+            },
         )
 
-    target = raw.get("target_formats") or settings.target_formats()
+    raw = _from_legacy_options(raw)
+
+    # Images have no spreadsheet writer, so the default must already be TXT
+    # (an explicit XLSX/CSV is still an error below).
+    default_targets = ["txt"] if kind == "image" else settings.target_formats()
+    target = raw.get("target_formats") or default_targets
     if isinstance(target, str):
         target = [item.strip() for item in target.split(",") if item.strip()]
     if not isinstance(target, list) or not target:
@@ -146,7 +240,7 @@ def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
         "ocr": {
             "enabled": bool(ocr.get("enabled", settings.converter_ocr_enabled)),
             "languages": ocr.get("languages") or ["por", "eng"],
-            "dpi": ocr.get("dpi") or settings.converter_render_dpi,
+            "dpi": ocr.get("dpi"),
             "strategy": ocr.get("strategy") or "auto",
         },
         "text": {
@@ -224,37 +318,65 @@ class ConversionService:
         normalized = _normalize_options(options, probe.kind)
         filename = _safe_filename(filename, default_ext=probe.format)
         digest = hashlib.sha256(data).hexdigest()
-        request_hash = _request_hash(digest, normalized)
 
+        storage = get_storage()
+        extension = _extension_for(probe)
+        key = f"documents/{owner_id}/{digest}{extension}"
+        if not storage.exists(key):
+            storage.put_bytes(key, data, probe.mime_type or "application/octet-stream")
+
+        # The page count is recorded for progress/budget purposes only.
+        # There is no ceiling: a document of any length is accepted.
+        pages = _estimate_pages(data) if probe.kind == "pdf" else None
+
+        return self.create_from_stored(
+            owner_id=owner_id,
+            storage_key=key,
+            sha256=digest,
+            size_bytes=len(data),
+            filename=filename,
+            mime_type=probe.mime_type or "application/octet-stream",
+            normalized=normalized,
+            page_count=pages,
+            idempotency_key=idempotency_key,
+        )
+
+    def create_from_stored(
+        self,
+        *,
+        owner_id: str,
+        storage_key: str,
+        sha256: str,
+        size_bytes: int,
+        filename: str,
+        mime_type: str,
+        normalized: dict[str, Any],
+        page_count: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Creates the conversion for an object that is already in storage.
+
+        Used by the resumable-upload path and by the legacy multipart endpoint,
+        so both produce exactly the same rows, run and queue message.
+        """
+        request_hash = _request_hash(sha256, normalized)
         session = get_session_factory()()
         try:
             if idempotency_key:
                 existing = self._idempotent(session, owner_id, idempotency_key, request_hash)
                 if existing is not None:
+                    # A replay is not a new admission: it must never fail
+                    # because the queue filled up in the meantime.
                     return existing
-
-            pages = _estimate_pages(data) if probe.kind == "pdf" else None
-            if pages and pages > settings.max_pages():
-                raise ApiError(
-                    400,
-                    "TOO_MANY_PAGES",
-                    f"O documento possui {pages} páginas, acima do limite de {settings.max_pages()}.",
-                )
-
-            storage = get_storage()
-            extension = _extension_for(probe)
-            key = f"documents/{owner_id}/{digest}{extension}"
-            if not storage.exists(key):
-                storage.put_bytes(key, data, probe.mime_type or "application/octet-stream")
 
             document = PublicDocumentRow(
                 id=f"doc_{uuid.uuid4().hex}",
                 filename=filename,
-                mime_type=probe.mime_type or "application/octet-stream",
-                size_bytes=len(data),
-                sha256=digest,
-                storage_key=key,
-                page_count=pages,
+                mime_type=mime_type,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                storage_key=storage_key,
+                page_count=page_count,
                 owner_id=owner_id,
             )
             conversion = PublicConversionRow(
@@ -269,14 +391,14 @@ class ConversionService:
                 options_json=normalized,
             )
             session.add(document)
-            session.flush()  # document must exist before the FK from conversions
+            session.flush()
             session.add(conversion)
             session.commit()
 
             run = self._start_run(
                 session,
                 conversion,
-                storage_key=key,
+                storage_key=storage_key,
                 filename=filename,
                 options=normalized,
             )
@@ -300,6 +422,9 @@ class ConversionService:
                     existing = self._idempotent(session, owner_id, idempotency_key, request_hash)
                     if existing is not None:
                         return existing
+                    raise
+                except Exception:
+                    session.rollback()
                     raise
 
             return {
@@ -473,6 +598,44 @@ class ConversionService:
             raise ApiError(404, "NOT_FOUND", "Resultado não disponível.")
         return summary
 
+    def result_overview(self, *, owner_id: str, conversion_id: str) -> dict[str, Any]:
+        """Compact result payload: safe for a million-cell workbook."""
+        run_id = self._active_run(owner_id=owner_id, conversion_id=conversion_id)
+        overview = self.repo.result_overview(run_id)
+        if overview is None:
+            raise ApiError(404, "NOT_FOUND", "Resultado não encontrado.")
+        return overview
+
+    def sheets(
+        self,
+        *,
+        owner_id: str,
+        conversion_id: str,
+        cursor: str | None = None,
+        limit: int = 50,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        run_id = self._active_run(owner_id=owner_id, conversion_id=conversion_id)
+        page = self.repo.sheets_page(run_id, cursor=cursor, limit=limit, q=q)
+        if page is None:
+            raise ApiError(404, "NOT_FOUND", "Conversão sem abas geradas.")
+        return page
+
+    def sheet_pages(
+        self,
+        *,
+        owner_id: str,
+        conversion_id: str,
+        sheet_id: str,
+        cursor: int | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        run_id = self._active_run(owner_id=owner_id, conversion_id=conversion_id)
+        page = self.repo.sheet_source_pages(run_id, sheet_id, cursor=cursor, limit=limit)
+        if page is None:
+            raise ApiError(404, "NOT_FOUND", "Aba não encontrada.")
+        return page
+
     def preview(
         self, *, owner_id: str, conversion_id: str, sheet: str | None, offset: int, limit: int
     ) -> dict[str, Any]:
@@ -481,6 +644,36 @@ class ConversionService:
         if preview is None:
             raise ApiError(404, "NOT_FOUND", "Prévia não disponível.")
         return preview
+
+    def download_stream(
+        self, *, owner_id: str, conversion_id: str
+    ) -> tuple[Any, str, str]:
+        """Same checks as `download`, but returns a file-like object."""
+        session = get_session_factory()()
+        try:
+            conversion = self._load(session, owner_id, conversion_id)
+            if conversion.status in {"failed", "cancelled"}:
+                raise ApiError(
+                    409,
+                    "NOT_READY",
+                    "A conversão não foi concluída com sucesso.",
+                    details={"status": conversion.status},
+                )
+            document = session.get(PublicDocumentRow, conversion.document_id)
+            run_id = conversion.active_run_id
+        finally:
+            session.close()
+        if not run_id:
+            raise ApiError(409, "NOT_READY", "A conversão ainda não foi executada.")
+        self._assert_publishable(owner_id, conversion_id, run_id)
+        if self.repo.xlsx_key(run_id) is None:
+            raise ApiError(409, "NOT_READY", "O arquivo XLSX ainda não está disponível.")
+        stream = self.repo.xlsx_stream(run_id)
+        if stream is None:
+            raise ApiError(409, "NOT_READY", "O arquivo XLSX ainda não está disponível.")
+        name = (document.filename if document else "conversao").rsplit(".", 1)[0]
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        return stream, f"{name}.xlsx", media
 
     def download(self, *, owner_id: str, conversion_id: str) -> tuple[bytes, str, str]:
         session = get_session_factory()()

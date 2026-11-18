@@ -78,8 +78,8 @@ async function bootstrap(): Promise<void> {
 
   await app.init();
 
-  await app.listen(config.apiPort, '0.0.0.0');
-  logger.log(`API pública em http://localhost:${config.apiPort}/api/v1`);
+  await app.listen(config.apiPort, config.apiHost);
+  logger.log(`API pública em http://${config.apiHost}:${config.apiPort}/api/v1`);
   logger.log(`Modo de autenticação: ${config.authMode} | storage: ${config.storageBackend}`);
 }
 

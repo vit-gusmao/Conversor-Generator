@@ -1,9 +1,8 @@
-// Production Prisma schema (PostgreSQL).
-// Copy over prisma/schema.prisma before `prisma generate` in a Postgres
-// deployment, e.g.:
-//   cp prisma/schema.postgres.prisma prisma/schema.prisma
-// Models are identical to the SQLite variant: JSON payloads stay TEXT so the
-// repository code is provider agnostic (switch to Json + GIN when needed).
+// Prisma schema — PostgreSQL (production).
+// SQLite variant: ./schema.prisma (identical models, different provider).
+//
+// NOTE: JSON payloads are stored as TEXT (String) on both providers so the
+// repository code is provider-agnostic. See src/database for the JSON helpers.
 
 generator client {
   provider = "prisma-client-js"
@@ -21,12 +20,15 @@ model User {
   name         String?
   role         String   @default("owner")
   isAnonymous  Boolean  @default(false)
+  // Deterministic identity for anonymous (device) sessions, sent as `x-device-id`.
   deviceId     String?  @unique
   createdAt    DateTime @default(now())
 
   documents   Document[]
   conversions Conversion[]
   keys        IdempotencyKey[]
+  batches     Batch[]
+  uploads     UploadSession[]
 
   @@index([createdAt])
 }
@@ -62,15 +64,19 @@ model Conversion {
   errorMessage   String?
   statsJson      String?
   validationJson String?
+  // Canonical ConversionOptionsV2 used by this conversion, so a retry reuses
+  // exactly what the user asked for instead of falling back to defaults.
+  optionsJson    String?
   deletedAt      DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
-  document Document         @relation(fields: [documentId], references: [id], onDelete: Cascade)
-  owner    User             @relation(fields: [ownerId], references: [id], onDelete: Cascade)
-  runs     ConversionRun[]
-  events   ConversionEvent[]
-  keys     IdempotencyKey[]
+  document  Document          @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  owner     User              @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  runs      ConversionRun[]
+  events    ConversionEvent[]
+  keys      IdempotencyKey[]
+  batchItem BatchItem?
 
   @@index([ownerId, createdAt])
   @@index([status])
@@ -143,7 +149,132 @@ model OutboxEvent {
   createdAt    DateTime  @default(now())
   dispatchedAt DateTime?
   lastError    String?
+  // Dispatch lease: one API instance owns the row until `lockedUntil`.
+  lockedBy     String?
+  lockedUntil  DateTime?
 
   @@index([status, availableAt])
+  @@index([status, lockedUntil])
   @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Batches (unbounded multi-file submissions)
+// ---------------------------------------------------------------------------
+
+model Batch {
+  id                String    @id @default(uuid())
+  ownerId           String
+  clientBatchKey    String
+  status            String    @default("accepting")
+  // Optimistic-concurrency version, bumped on every state change.
+  version           Int       @default(1)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  sealedAt          DateTime?
+  cancelRequestedAt DateTime?
+
+  owner User        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  items BatchItem[]
+  events BatchEvent[]
+
+  @@unique([ownerId, clientBatchKey])
+  @@index([ownerId, createdAt, id])
+  @@index([status])
+}
+
+model BatchItem {
+  id                 String   @id @default(uuid())
+  batchId            String
+  clientItemId       String
+  ordinal            Int
+  filename           String
+  sizeBytes          Int
+  // Declared kind; the server re-detects the real content before accepting.
+  kind               String   @default("pdf")
+  optionsJson        String
+  // Hash of canonical options + filename + size, for divergent replay detection.
+  requestFingerprint String
+  uploadId           String?  @unique
+  conversionId       String?  @unique
+  status             String   @default("pending_upload")
+  errorJson          String?
+  pagesTotal         Int?
+  pagesAttempted     Int?
+  pagesCompleted     Int?
+  pagesFailed        Int?
+  phase              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  batch      Batch          @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  // Pointer to the session the client is currently filling.
+  upload     UploadSession? @relation("ItemActiveUpload", fields: [uploadId], references: [id], onDelete: SetNull)
+  uploads    UploadSession[] @relation("ItemUploads")
+  conversion Conversion?    @relation(fields: [conversionId], references: [id], onDelete: SetNull)
+
+  @@unique([batchId, clientItemId])
+  @@index([batchId, ordinal, id])
+  @@index([conversionId])
+  @@index([status])
+}
+
+model UploadSession {
+  id            String   @id @default(uuid())
+  ownerId       String
+  itemId        String
+  filename      String
+  expectedBytes Int
+  receivedBytes Int      @default(0)
+  // Transport parameter (8 MiB by default), never a document ceiling.
+  partSize      Int
+  sha256        String?
+  state         String   @default("pending")
+  expiresAt     DateTime
+  storageKey    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  owner User       @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  item  BatchItem  @relation("ItemUploads", fields: [itemId], references: [id], onDelete: Cascade)
+  // Back-relation of `BatchItem.uploadId`; no extra column on this side.
+  activeForItem BatchItem? @relation("ItemActiveUpload")
+  parts UploadPart[]
+
+  @@index([ownerId, state, expiresAt])
+  @@index([itemId, state])
+  @@index([state, expiresAt])
+}
+
+model UploadPart {
+  id         String   @id @default(uuid())
+  uploadId   String
+  partNumber Int
+  size       Int
+  sha256     String
+  storageKey String
+  createdAt  DateTime @default(now())
+
+  upload UploadSession @relation(fields: [uploadId], references: [id], onDelete: Cascade)
+
+  @@unique([uploadId, partNumber])
+  @@index([uploadId, partNumber])
+}
+
+model BatchEvent {
+  id           String   @id @default(uuid())
+  batchId      String
+  sequence     Int
+  type         String
+  itemId       String?
+  status       String
+  itemStatus   String?
+  message      String   @default("")
+  payloadJson  String?
+  createdAt    DateTime @default(now())
+
+  batch Batch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@unique([batchId, sequence])
+  @@index([batchId, sequence])
 }

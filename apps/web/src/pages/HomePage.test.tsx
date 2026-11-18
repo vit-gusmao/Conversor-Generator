@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { AuthSession, PlatformSettings } from '@pdf2x/contracts';
+import type { AuthSession, BatchItem, BatchSummary, PlatformSettings } from '@pdf2x/contracts';
+import { defaultConversionOptions } from '@pdf2x/contracts';
 import { HomePage } from '@/pages/home-page';
 import { useAuthStore } from '@/stores/auth';
+import { useUploadQueue } from '@/stores/upload-queue';
 
 vi.mock('@/services/settings', () => ({
   getPlatformSettings: vi.fn(),
@@ -34,9 +36,34 @@ vi.mock('@/services/conversions', () => ({
   conversionEventsUrl: vi.fn(() => '/api/v1/conversions/conv-1/events'),
 }));
 
+vi.mock('@/services/batches', () => ({
+  createBatch: vi.fn(),
+  getBatch: vi.fn(),
+  registerItem: vi.fn(),
+  listBatchItems: vi.fn(),
+  sealBatch: vi.fn(),
+  cancelBatch: vi.fn(),
+  cancelItem: vi.fn(),
+  retryItem: vi.fn(),
+  batchEventsUrl: vi.fn(() => '/api/v1/batches/batch-1/events'),
+}));
+
+vi.mock('@/services/uploads', () => ({
+  putPart: vi.fn(),
+  getUpload: vi.fn(),
+  completeUpload: vi.fn(),
+  abortUpload: vi.fn(),
+}));
+
+vi.mock('@/lib/sha256', () => ({
+  sha256Hex: vi.fn().mockResolvedValue('a'.repeat(64)),
+}));
+
 import { getPlatformSettings } from '@/services/settings';
-import { getCapabilities, uploadConversion, listConversions } from '@/services/conversions';
+import { getCapabilities, listConversions } from '@/services/conversions';
 import { createAnonymousSession } from '@/services/auth';
+import { createBatch, registerItem } from '@/services/batches';
+import { completeUpload, putPart } from '@/services/uploads';
 
 const settings: PlatformSettings = {
   auth_mode: 'optional',
@@ -65,6 +92,71 @@ const session: AuthSession = {
   },
 };
 
+function pdf(name: string, content = '%PDF-1.4'): File {
+  return new File([content], name, { type: 'application/pdf' });
+}
+
+function image(name: string): File {
+  return new File(['png'], name, { type: 'image/png' });
+}
+
+function makeBatchSummary(): BatchSummary {
+  return {
+    batch_id: 'batch-1',
+    status: 'accepting',
+    client_batch_key: 'key-1',
+    counts: {
+      total_items: 2,
+      pending_upload: 2,
+      uploading: 0,
+      queued: 0,
+      processing: 0,
+      completed: 0,
+      with_warnings: 0,
+      failed: 0,
+      cancelled: 0,
+    },
+    progress: {
+      finished_items: 0,
+      pages_total: 0,
+      pages_attempted: 0,
+      pages_completed: 0,
+      pages_failed: 0,
+    },
+    created_at: new Date().toISOString(),
+    sealed_at: null,
+    cancel_requested_at: null,
+    version: 1,
+    links: { self: '', items: '', events: '', seal: '', cancel: '' },
+  };
+}
+
+function makeBatchItem(): BatchItem {
+  return {
+    item_id: 'item-1',
+    batch_id: 'batch-1',
+    client_item_id: 'client-1',
+    ordinal: 1,
+    filename: 'a.pdf',
+    size_bytes: 8,
+    kind: 'pdf',
+    status: 'pending_upload',
+    options: defaultConversionOptions('pdf'),
+    available_formats: ['xlsx', 'txt', 'csv'],
+    upload_id: 'upload-1',
+    conversion_id: null,
+    pages_total: null,
+    pages_attempted: null,
+    pages_completed: null,
+    pages_failed: null,
+    phase: null,
+    error: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    links: {},
+  };
+}
+
 function renderHome() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
@@ -76,6 +168,7 @@ function renderHome() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/conversions/:id" element={<div>Página de conversão</div>} />
+          <Route path="/batches/:id" element={<div>Página do lote</div>} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -84,6 +177,8 @@ function renderHome() {
 
 beforeEach(() => {
   useAuthStore.setState({ token: null, user: null, status: 'idle', error: null });
+  useUploadQueue.getState().reset();
+
   vi.mocked(getPlatformSettings).mockResolvedValue(settings);
   vi.mocked(createAnonymousSession).mockResolvedValue(session);
   vi.mocked(getCapabilities).mockResolvedValue({
@@ -97,47 +192,127 @@ beforeEach(() => {
     limits: { max_bytes: 10 * 1024 * 1024, max_pages: 500 },
   });
   vi.mocked(listConversions).mockResolvedValue({ items: [], total: 0, page: 1, page_size: 5 });
-  vi.mocked(uploadConversion).mockReset();
+
+  vi.mocked(createBatch).mockReset();
+  vi.mocked(registerItem).mockReset();
+  vi.mocked(putPart).mockReset();
+  vi.mocked(completeUpload).mockReset();
 });
 
 describe('HomePage', () => {
-  it('rejects an unsupported file with an accessible error and never calls the API', async () => {
+  it('queues two PDFs and one image as three items', async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    const input = screen.getByLabelText('Selecionar PDF ou imagem');
+    expect(input).toHaveAttribute('multiple');
+
+    await user.upload(input, [pdf('a.pdf'), pdf('b.pdf'), image('c.png')]);
+
+    expect(await screen.findByText('3 arquivos na fila')).toBeInTheDocument();
+    expect(screen.getByText('a.pdf')).toBeInTheDocument();
+    expect(screen.getByText('b.pdf')).toBeInTheDocument();
+    expect(screen.getByText('c.png')).toBeInTheDocument();
+    expect(useUploadQueue.getState().items.map((item) => item.kind)).toEqual([
+      'pdf',
+      'pdf',
+      'image',
+    ]);
+  });
+
+  it('accumulates a dropped file instead of replacing the queue', async () => {
+    const user = userEvent.setup();
+    renderHome();
+
+    await user.upload(screen.getByLabelText('Selecionar PDF ou imagem'), [pdf('a.pdf')]);
+    expect(await screen.findByText('1 arquivo na fila')).toBeInTheDocument();
+
+    fireEvent.drop(screen.getByTestId('home-dropzone'), {
+      dataTransfer: { files: [pdf('b.pdf')] },
+    });
+
+    expect(await screen.findByText('2 arquivos na fila')).toBeInTheDocument();
+    expect(screen.getByText('a.pdf')).toBeInTheDocument();
+    expect(screen.getByText('b.pdf')).toBeInTheDocument();
+  });
+
+  it('shows an error for an invalid file without clearing the queue', async () => {
     const user = userEvent.setup({ applyAccept: false });
     renderHome();
 
     const input = screen.getByLabelText('Selecionar PDF ou imagem');
-    await user.upload(input, new File(['hello'], 'documento.txt', { type: 'text/plain' }));
+    await user.upload(input, [pdf('valido.pdf')]);
+    expect(await screen.findByText('1 arquivo na fila')).toBeInTheDocument();
+
+    await user.upload(
+      input,
+      new File(['conteudo'], 'contrato.docx', {
+        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      }),
+    );
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(/PDF|imagem/i);
-    expect(uploadConversion).not.toHaveBeenCalled();
+    expect(screen.getByText('valido.pdf')).toBeInTheDocument();
+    expect(screen.getByText('1 arquivo na fila')).toBeInTheDocument();
   });
 
-  it('accepts a PDF, shows the selected file and navigates to the conversion', async () => {
+  it('shows the "Enviar arquivos" button disabled with an empty queue', () => {
+    renderHome();
+
+    const send = screen.getByRole('button', { name: /Enviar arquivos/i });
+    expect(send).toBeInTheDocument();
+    expect(send).toBeDisabled();
+  });
+
+  it('creates one batch, registers and uploads every queued file, then navigates', async () => {
     const user = userEvent.setup();
-    vi.mocked(uploadConversion).mockResolvedValue({
+    vi.mocked(createBatch).mockResolvedValue(makeBatchSummary());
+    vi.mocked(registerItem).mockResolvedValue({
+      item: makeBatchItem(),
+      upload_id: 'upload-1',
+      part_size: 8 * 1024 * 1024,
+      next_part: 0,
+      replayed: false,
+    });
+    vi.mocked(putPart).mockResolvedValue({
+      upload_id: 'upload-1',
+      part_number: 0,
+      size: 8,
+      sha256: 'a'.repeat(64),
+      received_bytes: 8,
+      parts_received: 1,
+      next_part: 1,
+      replayed: false,
+    });
+    vi.mocked(completeUpload).mockResolvedValue({
+      upload_id: 'upload-1',
+      item_id: 'item-1',
       conversion_id: 'conv-1',
       status: 'queued',
-      message: 'Recebido',
-      links: {},
+      message: '',
+      replayed: false,
     });
 
     renderHome();
 
-    const input = screen.getByLabelText('Selecionar PDF ou imagem');
-    await user.upload(input, new File(['%PDF-1.4'], 'relatorio.pdf', { type: 'application/pdf' }));
+    await user.upload(screen.getByLabelText('Selecionar PDF ou imagem'), [
+      pdf('a.pdf'),
+      pdf('b.pdf'),
+    ]);
+    expect(await screen.findByText('2 arquivos na fila')).toBeInTheDocument();
 
-    expect(await screen.findByText('relatorio.pdf')).toBeInTheDocument();
-    const submit = await screen.findByRole('button', { name: /^Converter$/i });
-    await user.click(submit);
+    await user.click(screen.getByRole('button', { name: /Enviar arquivos/i }));
 
-    await waitFor(() => {
-      expect(uploadConversion).toHaveBeenCalledTimes(1);
-    });
-    const call = vi.mocked(uploadConversion).mock.calls[0];
-    expect(call?.[0]?.name).toBe('relatorio.pdf');
-    expect(call?.[1]?.target_formats).toEqual(['xlsx', 'txt', 'csv']);
+    expect(await screen.findByText('Página do lote')).toBeInTheDocument();
+    expect(createBatch).toHaveBeenCalledTimes(1);
+    expect(registerItem).toHaveBeenCalledTimes(2);
+    expect(putPart).toHaveBeenCalledTimes(2);
+    expect(completeUpload).toHaveBeenCalledTimes(2);
 
-    expect(await screen.findByText('Página de conversão')).toBeInTheDocument();
+    const registration = vi.mocked(registerItem).mock.calls[0];
+    expect(registration?.[0]).toBe('batch-1');
+    expect(registration?.[1]?.filename).toBe('a.pdf');
+    expect(registration?.[1]?.options?.target_formats).toEqual(['xlsx', 'txt', 'csv']);
   });
 });

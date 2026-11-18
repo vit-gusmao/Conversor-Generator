@@ -99,7 +99,14 @@ describe('API (e2e)', () => {
 
     expect(response.body.auth_mode).toBe('optional');
     expect(response.body.max_upload_bytes).toBeGreaterThan(0);
-    expect(response.body.max_pages).toBeGreaterThan(0);
+    // The default flow has no page ceiling (full-document processing).
+    expect(response.body.max_pages).toBeNull();
+    expect(response.body.upload).toMatchObject({
+      resumable: true,
+      accepts_multiple: true,
+      part_size_bytes: expect.any(Number),
+      max_files_per_batch: null,
+    });
     expect(response.body.storage_backend).toBe('local');
     expect(response.body.capabilities.converter).toBe(true);
     expect(response.body.retention).toMatchObject({

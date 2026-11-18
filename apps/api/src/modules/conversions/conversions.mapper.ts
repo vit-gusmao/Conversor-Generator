@@ -58,6 +58,8 @@ export interface ConversionRowShape {
   errorMessage: string | null;
   statsJson: string | null;
   validationJson: string | null;
+  /** Canonical options persisted at creation (null for legacy rows). */
+  optionsJson?: string | null;
   deletedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;

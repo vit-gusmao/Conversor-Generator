@@ -1,6 +1,7 @@
 # ============================================================================
-# Production-shaped stack: PostgreSQL + Redis + MinIO + NestJS + FastAPI +
-# Celery worker + Nginx (SPA + API proxy).
+# Local container stack: PostgreSQL + Redis + MinIO + NestJS + FastAPI +
+# Celery worker + Nginx (SPA + API proxy). Intended for running the whole
+# product on this machine; every published port is bound to 127.0.0.1.
 #
 #   cd infra && docker compose up --build
 #   open http://localhost:8080
@@ -101,7 +102,6 @@ services:
       REDIS_URL: redis://redis:6379/0
       CONVERTER_INTERNAL_TOKEN: ${CONVERTER_INTERNAL_TOKEN:?set CONVERTER_INTERNAL_TOKEN}
       CONVERTER_CALLBACK_URL: http://api:3000/api/v1/internal/hooks/converter
-      CONVERTER_MAX_PAGES: ${CONVERTER_MAX_PAGES:-500}
       CONVERTER_RENDER_DPI: ${CONVERTER_RENDER_DPI:-300}
       CONVERTER_OCR_ENABLED: ${CONVERTER_OCR_ENABLED:-true}
       CONVERTER_OCR_MIN_CONFIDENCE: ${CONVERTER_OCR_MIN_CONFIDENCE:-0.45}
@@ -170,13 +170,13 @@ services:
     environment:
       NODE_ENV: production
       API_PORT: "3000"
+      API_HOST: 0.0.0.0
       DATABASE_PROVIDER: postgres
       API_POSTGRES_URL: postgresql://${POSTGRES_USER:-pdf2x}:${POSTGRES_PASSWORD:-pdf2x}@postgres:5432/pdf2x_api?schema=public
       API_DATABASE_URL: postgresql://${POSTGRES_USER:-pdf2x}:${POSTGRES_PASSWORD:-pdf2x}@postgres:5432/pdf2x_api?schema=public
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
       AUTH_MODE: ${AUTH_MODE:-optional}
       UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-52428800}
-      UPLOAD_MAX_PAGES: ${UPLOAD_MAX_PAGES:-500}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
       CONVERTER_INTERNAL_URL: http://converter:8000
       CONVERTER_INTERNAL_TOKEN: ${CONVERTER_INTERNAL_TOKEN:?set CONVERTER_INTERNAL_TOKEN}
@@ -206,7 +206,7 @@ services:
     environment:
       API_UPSTREAM: http://api:3000
     ports:
-      - "${WEB_PORT:-8080}:80"
+      - "127.0.0.1:${WEB_PORT:-8080}:80"
     networks: [backend]
     <<: *logging
 

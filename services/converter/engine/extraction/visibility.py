@@ -214,6 +214,36 @@ def invisible_ratio(stream: bytes) -> float | None:
     return invisible / total
 
 
+def page_invisible_ratios_path(path) -> list[float | None]:
+    """Same as page_invisible_ratios but reading from disk.
+
+    pypdf reads lazily from the file object, so the document is never held in
+    memory as one buffer.
+    """
+    try:
+        from pypdf import PdfReader
+    except ModuleNotFoundError:  # pragma: no cover - dependency is declared
+        return []
+    try:
+        reader = PdfReader(str(path), strict=False)
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:  # noqa: BLE001
+                return []
+        pages = []
+        for page in reader.pages:
+            try:
+                stream = page.get_contents()
+                raw = stream.get_data() if stream is not None else b""
+            except Exception:  # noqa: BLE001
+                raw = b""
+            pages.append(invisible_ratio(raw))
+        return pages
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def page_invisible_ratios(data: bytes) -> list[float | None]:
     """One ratio per page of the document; ``[]`` when the PDF cannot be read."""
     try:

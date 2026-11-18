@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, Depends, Header, Query, Response
 
 from api.capabilities import capabilities_payload
@@ -117,6 +118,43 @@ def result(run_id: str) -> dict[str, Any]:
     return data
 
 
+@router.get("/jobs/{run_id}/result-summary", dependencies=[Depends(internal_guard)])
+@router.get("/runs/{run_id}/result-summary", dependencies=[Depends(internal_guard)])
+def result_overview(run_id: str) -> dict[str, Any]:
+    data = repo.result_overview(run_id)
+    if data is None:
+        raise ApiError(404, "NOT_FOUND", "Resultado não encontrado.")
+    return data
+
+
+@router.get("/jobs/{run_id}/sheets", dependencies=[Depends(internal_guard)])
+@router.get("/runs/{run_id}/sheets", dependencies=[Depends(internal_guard)])
+def sheets(
+    run_id: str,
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    q: str | None = Query(default=None, max_length=120),
+) -> dict[str, Any]:
+    data = repo.sheets_page(run_id, cursor=cursor, limit=limit, q=q)
+    if data is None:
+        raise ApiError(404, "NOT_FOUND", "Conversão sem abas geradas.")
+    return data
+
+
+@router.get("/jobs/{run_id}/sheets/{sheet_id}/pages", dependencies=[Depends(internal_guard)])
+@router.get("/runs/{run_id}/sheets/{sheet_id}/pages", dependencies=[Depends(internal_guard)])
+def sheet_pages(
+    run_id: str,
+    sheet_id: str,
+    cursor: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    data = repo.sheet_source_pages(run_id, sheet_id, cursor=cursor, limit=limit)
+    if data is None:
+        raise ApiError(404, "NOT_FOUND", "Aba não encontrada.")
+    return data
+
+
 @router.get("/jobs/{run_id}/preview", dependencies=[Depends(internal_guard)])
 @router.get("/runs/{run_id}/preview", dependencies=[Depends(internal_guard)])
 def preview(
@@ -133,14 +171,18 @@ def preview(
 
 @router.get("/jobs/{run_id}/download", dependencies=[Depends(internal_guard)])
 @router.get("/runs/{run_id}/download", dependencies=[Depends(internal_guard)])
-def download(run_id: str) -> Response:
-    data = repo.xlsx_bytes(run_id)
-    if data is None:
+def download(run_id: str):
+    """Streams the workbook; the gateway forwards it without buffering."""
+    stream = repo.xlsx_stream(run_id)
+    if stream is None:
         raise ApiError(409, "NOT_READY", "Arquivo ainda não disponível.")
-    return Response(
-        content=data,
+    return StreamingResponse(
+        iter(lambda: stream.read(1024 * 1024), b""),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="conversao-{run_id}.xlsx"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="conversao-{run_id}.xlsx"',
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

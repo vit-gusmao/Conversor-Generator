@@ -1,111 +1,33 @@
-# Publicação (deploy)
+# Execução com containers (local)
 
-Este guia descreve a publicação recomendada do Conversor Generator:
+Este guia descreve como rodar o Conversor com containers na sua própria máquina.
+O projeto é local: não há publicação na internet, túnel nem perfil público. Para
+rodar sem containers (standalone local ou modo completo com NestJS), veja o
+[README](../README.md). O fluxo de execução está em [FLOW.md](FLOW.md), a lista
+completa de variáveis em [CONFIGURATION.md](CONFIGURATION.md), onde os arquivos
+são gravados em [STORAGE.md](STORAGE.md) e a operação diária (cópias de segurança,
+restauração) em [OPERATIONS.md](OPERATIONS.md).
 
-- **Frontend (`apps/web`)**: Vercel, como SPA estática. O `vercel.json` na raiz do
-  repositório define build, saída e reescritas.
-- **API (`apps/api`) e motor (`services/converter`)**: um host de containers de
-  longa duração (uma VM com Docker, ou uma plataforma de containers), usando os
-  Dockerfiles do repositório, com PostgreSQL e armazenamento persistente.
+O compose publica a interface somente em `127.0.0.1`: ela responde apenas nesta
+máquina. Nenhum outro serviço é publicado no host. Para acesso por outro
+dispositivo da rede local, veja [Acesso pela rede local](#acesso-pela-rede-local).
 
-Os comandos e variáveis citados existem no repositório. Onde o comportamento
-depende da plataforma escolhida, o texto diz isso explicitamente.
-
-> Ordem sugerida: primeiro o backend (para obter uma URL HTTPS), depois a Vercel
-> (para usar essa URL em `VITE_API_BASE`), e por fim o backend de novo para
-> liberar a origem da Vercel em `ALLOWED_ORIGINS`.
-
----
-
-## Arquitetura de produção
-
-```
-navegador ──HTTPS──► Vercel (SPA estática: apps/web/dist)
-    │
-    └──HTTPS (CORS: ALLOWED_ORIGINS)──► API NestJS (apps/api, :3000 interno)
-                                            │  x-internal-token (rede privada)
-                                            ▼
-                                       Motor FastAPI (services/converter, :8000 interno)
-                                            │
-                       PostgreSQL ◄─────────┴────────► armazenamento (volume ou S3/MinIO)
-                       (pdf2x_api, pdf2x_conv)
-                                            │
-                                  Tesseract (na imagem) / Ollama (opcional, GPU)
-```
-
-Somente a API precisa estar exposta à internet. O motor deve ficar em rede
-privada, acessível apenas pela API.
+Os comandos e variáveis citados existem no repositório. Nenhum comando
+administrativo é executado por este documento: instalação e subida são passos do
+operador.
 
 ---
 
-## Pré-requisitos
-
-- Repositório no GitHub (veja o README, seção "Publicando no GitHub").
-- Conta na Vercel com acesso ao repositório.
-- Um host de containers com Docker, ou uma plataforma que construa imagens a
-  partir de Dockerfile.
-- Um domínio ou subdomínio com HTTPS para a API (por exemplo,
-  `https://api.seu-dominio.exemplo`). O navegador bloqueia chamadas HTTP a partir
-  de uma página HTTPS.
-- Segredos gerados com `openssl rand -hex 32` (um para `JWT_SECRET`, outro para
-  `CONVERTER_INTERNAL_TOKEN`).
-
----
-
-## Parte A: Frontend na Vercel
-
-O `vercel.json` na raiz define o comando de instalação, o comando de build, o
-diretório de saída (`apps/web/dist`) e uma reescrita para SPA em todas as rotas,
-exceto `/api/`. Não é necessário sobrescrever essas configurações no painel.
-
-1. Na Vercel, selecione **Add New... → Project** e importe o repositório do GitHub.
-2. **Root Directory**: mantenha a **raiz do repositório** (não escolha
-   `apps/web`). O build depende de `packages/contracts`, que fica fora de
-   `apps/web`.
-3. **Framework Preset**: **Other**. O `vercel.json` é lido automaticamente.
-4. **Node.js Version**: escolha **22** nas configurações do projeto, para
-   corresponder ao `.nvmrc` na raiz e às imagens Docker.
-5. Em **Environment Variables**, adicione:
-
-   | Nome | Valor | Ambientes |
-   | --- | --- | --- |
-   | `VITE_API_BASE` | `https://api.seu-dominio.exemplo/api/v1` | Production (e Preview, se quiser testar previews) |
-
-   `VITE_API_BASE` é lida **em tempo de build**: o valor entra no bundle
-   JavaScript. Depois de alterá-la, faça um novo deploy (**Redeploy**). Mudar a
-   variável sem redeploy não tem efeito.
-6. Clique em **Deploy**.
-
-### Se `VITE_API_BASE` não estiver definida
-
-A interface usa `/api/v1` como padrão (`apps/web/src/lib/api.ts`). No domínio da
-Vercel esse caminho não existe no frontend, e a reescrita não encaminha `/api/`.
-Por isso, todas as chamadas à API falham. Defina a variável antes do primeiro
-deploy de produção.
-
-### Previews
-
-Cada deploy de preview tem um domínio próprio. Para que um preview consiga
-chamar a API, a origem exata desse domínio precisa estar em `ALLOWED_ORIGINS`.
-O CORS compara a origem por igualdade, sem curingas. Para testes de longo prazo,
-use apenas o domínio de produção.
-
-### Domínio próprio
-
-Se você adicionar um domínio personalizado à Vercel, inclua a origem nova (com
-`https://`, sem barra final) em `ALLOWED_ORIGINS` no backend e reinicie-o.
-
----
-
-## Parte B: Backend em host de containers
-
-### Opções
+## Opções
 
 | Opção | Quando usar | Observações |
 | --- | --- | --- |
-| **B1. VM com Docker e `infra/docker-compose.yml`** | stack completa, com PostgreSQL, Redis, MinIO e worker | o compose não publica a porta da API; é preciso um proxy reverso com HTTPS na VM. Não executado no ambiente de construção. |
-| **B2. Plataforma de containers (Render, Railway, Fly.io ou similar)** | evitar administrar servidores | dois serviços (`api` e `converter`), PostgreSQL gerenciado e armazenamento. O `converter` deve ficar em rede privada. Um volume costuma ser anexado a um serviço por vez; nesse caso use S3/MinIO. |
-| **B3. Modo `standalone` em um único container** | o menor número de peças | um processo FastAPI em `RUNTIME_MODE=standalone` expõe `/api/v1` com SQLite, disco local e fila `inline`. Não há NestJS nem PostgreSQL. A API pública é a mesma (`docs/API.md`). Adequado para uso individual ou carga baixa. |
+| **A. Docker Compose (`infra/docker-compose.yml`)** | stack completa na sua máquina, com PostgreSQL, Redis, MinIO, motor, worker Celery, API e interface | somente o `web` publica uma porta, em `127.0.0.1:${WEB_PORT:-8080}`; ele encaminha `/api/v1` para a API, que não publica porta no host. A composição não tem execução registrada neste repositório (veja [TESTING.md](TESTING.md)). |
+| **B. Container único do motor (`services/converter/Dockerfile`)** | um processo FastAPI em `RUNTIME_MODE=standalone`, com SQLite, disco local e fila `inline` | a imagem contém apenas `services/converter/`. Ela serve `/api/v1` e as rotas internas, **sem a interface**: `apps/web/dist` não é copiado, então o código não encontra o build da SPA. Não há NestJS nem PostgreSQL. A API é a mesma (`docs/API.md`). |
+
+A imagem do motor (opção B) só serve a interface se `apps/web/dist` for copiado
+para dentro dela, o que o Dockerfile atual não faz. Para usar a interface sem o
+compose, rode o modo standalone sem container, como descrito no README.
 
 Os Dockerfiles devem ser construídos **a partir da raiz do repositório**, porque
 ambos dependem de arquivos fora de sua pasta:
@@ -125,25 +47,29 @@ PostgreSQL, a imagem também precisa de `DATABASE_PROVIDER=postgres` em tempo de
 execução, para que o `docker-entrypoint.sh` aplique o schema com
 `prisma db push` a cada inicialização.
 
+A imagem do motor instala `".[full,postgres]"`. Ela inclui OpenCV, pytesseract,
+Celery, Redis, boto3 e psycopg. **Não** inclui os extras `ocr` (RapidOCR),
+`docling`, `migrate` (Alembic) nem `test`.
+
 ### Variáveis de ambiente do backend
 
-Defina estas variáveis no provedor (ou em `infra/.env`, no caso do compose). Não
+Defina estas variáveis no `infra/.env` (compose) ou no ambiente do container. Não
 faça commit de valores reais.
 
-**Essenciais em produção**
+**Essenciais**
 
 | Variável | Serviço | Valor |
 | --- | --- | --- |
-| `RUNTIME_MODE` | ambos | `full` (B1/B2) ou `standalone` (B3) |
-| `JWT_SECRET` | api (e motor em standalone) | segredo aleatório, 64 caracteres hexadecimais |
+| `RUNTIME_MODE` | ambos | `full` (A) ou `standalone` (B) |
+| `JWT_SECRET` | api (no compose, só a API recebe; veja [Segredos no compose](#jwt_secret-no-compose)) | segredo aleatório, 64 caracteres hexadecimais |
 | `CONVERTER_INTERNAL_TOKEN` | api e motor | **o mesmo valor** nos dois serviços |
-| `ALLOWED_ORIGINS` | api e motor | `https://<projeto>.vercel.app` (ou seu domínio), separados por vírgula, sem barra final |
-| `PUBLIC_API_URL` | api | `https://api.seu-dominio.exemplo` (exposto na configuração; no código atual não há uso funcional confirmado) |
-| `CONVERTER_INTERNAL_URL` | api | URL do motor na rede privada, por exemplo `http://converter:8000` (modo `full`) |
+| `ALLOWED_ORIGINS` | api e motor | origem da interface, por exemplo `http://localhost:8080` (padrão do compose), separadas por vírgula, sem barra final |
+| `CONVERTER_INTERNAL_URL` | api | URL do motor na rede interna, por exemplo `http://converter:8000` (modo `full`) |
+| `API_HOST` | api | `0.0.0.0` no compose, para que o `web` alcance a API dentro da rede do compose. Fora de container o padrão do NestJS é `127.0.0.1` |
 | `API_POSTGRES_URL` | api | `postgresql://usuario:senha@host:5432/pdf2x_api?schema=public` |
 | `CONVERTER_DATABASE_URL` | motor | `postgresql+psycopg://usuario:senha@host:5432/pdf2x_conv` |
 | `DATABASE_PROVIDER` | api | `postgres` (com o mesmo build arg na imagem) |
-| `STORAGE_BACKEND` | api e motor | `s3` (recomendado em B2 e B1) ou `local` (ver abaixo) |
+| `STORAGE_BACKEND` | api e motor | `s3` (no compose, via MinIO) ou `local` (ver abaixo) |
 
 **Armazenamento**
 
@@ -154,45 +80,66 @@ faça commit de valores reais.
   diretório. O motor recebe a chave de armazenamento da API e lê o PDF dela. Por
   isso, os dois serviços precisam compartilhar o mesmo volume, no mesmo caminho
   (`STORAGE_LOCAL_ROOT`). Em dois serviços separados, isso normalmente exige S3.
-  A opção local é mais simples apenas no modo B3.
+  A opção local é mais simples apenas no modo B.
+- Chaves e estrutura de pastas do storage: [STORAGE.md](STORAGE.md).
 
 **Motor e fila**
 
 | Variável | Recomendação |
 | --- | --- |
-| `CONVERTER_QUEUE` | `inline` (padrão, threads no próprio processo) ou `celery` (requer Redis e um worker separado, como no compose) |
+| `CONVERTER_QUEUE` | `inline` (padrão, threads no próprio processo) ou `celery` (requer Redis e um worker separado, como no compose). Leia [Limitações do modo Celery](#limitações-do-modo-celery) antes de escolher |
 | `CONVERTER_WORKERS` | concorrência do pool `inline` |
-| `CONVERTER_TASK_TIMEOUT_SECONDS` | `600` (padrão) |
-| `CONVERTER_MAX_PAGES`, `CONVERTER_MAX_PDF_BYTES` | valores de produção conforme o seu hardware |
+| `CONVERTER_TASK_TIMEOUT_SECONDS` | `0` (padrão): **sem prazo global por documento**. Cada chamada de OCR tem seu próprio limite (`CONVERTER_OCR_CALL_TIMEOUT_SECONDS`, padrão `300`). Um valor maior que `0` impõe um teto de tempo ao documento inteiro |
+| `CONVERTER_MAX_PDF_BYTES` | padrão `52428800` (50 MiB); ajuste conforme o seu hardware |
 
-**Limites e privacidade**
+**Limites e retenção**
 
 | Variável | Padrão | Observação |
 | --- | --- | --- |
-| `UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | aplicado pela API e pelo motor. O proxy ou o provedor pode impor limite menor: confira |
-| `UPLOAD_MAX_PAGES` | `500` | |
-| `AUTH_MODE` | `optional` | sessão por navegador, sem login. `required` aceita apenas JWT emitido por um emissor confiável; não há tela de login |
-| `RETENTION_*_DAYS` | `7` / `30` / `90` | informados em `/settings`. Não encontrei uma rotina agendada de expurgo no código; veja o item 10 do checklist pós-deploy |
+| `UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | aplicado pela API e pelo motor. Um proxy intermediário pode impor limite menor: confira |
+| `CONVERTER_MAX_PAGES`, `UPLOAD_MAX_PAGES` | vazio (sem teto) | **Legado.** O motor nunca recusa nem trunca por eles: no máximo registra aviso. No NestJS, `UPLOAD_MAX_PAGES` definida rejeita com `TOO_MANY_PAGES`. O compose não define nenhuma das duas |
+| `AUTH_MODE` | `optional` | sessão por navegador, sem login. `required` exige Bearer nas rotas protegidas. No NestJS, `POST /auth/anonymous` continua emitindo token (201); no motor standalone, esse endpoint devolve 401 nesse modo. Não há tela de login |
+| `RETENTION_PDF_DAYS`, `RETENTION_XLSX_DAYS`, `RETENTION_AUDIT_DAYS` | `7` / `30` / `90` | informados em `/settings`. Nenhum job aplica esses prazos; veja o item 10 do checklist |
 | `LOG_LEVEL`, `LOG_JSON` | `INFO`, `1` nas imagens | |
+
+**Lotes, upload por partes e checkpoints**
+
+| Variável | Padrão | Papel |
+| --- | --- | --- |
+| `BATCH_UPLOAD_ENABLED` | `true` | Liga lotes e upload por partes. Desativar interrompe **novas admissões**, nunca execuções já iniciadas |
+| `LARGE_DOCUMENT_PIPELINE_ENABLED` | `true` | Processamento do documento inteiro, página por página |
+| `UPLOAD_PART_BYTES` | `8388608` | Parte de transporte (não é teto de documento) |
+| `UPLOAD_PART_MAX_BYTES` | `33554432` | Maior parte aceita pela API |
+| `UPLOAD_CONCURRENCY` | `3` | Lida pela configuração do NestJS, mas não anunciada nem usada. A interface usa 3 fixo |
+| `UPLOAD_SESSION_TTL_HOURS` | `24` | Validade de sessão de upload incompleta |
+| `MAX_FILES_PER_BATCH` | vazio (sem teto) | Só para operadores que quiserem limitar admissão |
+| `UPLOAD_MAX_FILE_BYTES` | vazio (sem teto) | Idem, por documento |
+| `CONVERTER_PAGE_WINDOW` | `25` | Lida, mas sem efeito (nenhum leitor no código) |
+| `CONVERTER_OCR_CALL_TIMEOUT_SECONDS` | `300` | Timeout de **uma** chamada de OCR |
+| `CHECKPOINT_REUSE_ENABLED` | `true` | Reuso de checkpoints de página quando a execução é retomada |
+| `RESULT_COMPACT_ENABLED` | `true` | Tela de resultado compacta (API) |
+| `MCP_ENABLED` | `true` | Anuncia o adaptador MCP em `/settings` (API) |
 
 **OCR e assistente**
 
 - **Tesseract** já vem instalado na imagem do motor (`tesseract-ocr` e
   `tesseract-ocr-por`). Não é preciso configurar nada para ele.
 - **GLM-OCR** depende do Ollama. Dentro de um container, `GLMOCR_HOST=127.0.0.1`
-  aponta para o próprio container, e não para a máquina host. Para usá-lo, defina
-  `GLMOCR_HOST` e `GLMOCR_PORT` com um endereço alcançável, ou defina
-  `GLMOCR_ENABLED=false`. Sem Ollama, páginas digitalizadas recorrem ao Tesseract
-  ou falham de forma explícita.
-- **Ollama com GPU** exige um host com placa compatível. Plataformas de
-  containers comuns não oferecem GPU. Esse cenário não foi testado neste
-  repositório.
+  aponta para o próprio container, e não para a máquina host. O compose não repassa
+  as variáveis `GLMOCR_*` ao motor, então, com a configuração padrão, o GLM-OCR fica
+  indisponível dentro do compose. Para usá-lo, defina `GLMOCR_HOST` e `GLMOCR_PORT`
+  com um endereço alcançável (por exemplo, `host.docker.internal`) no serviço
+  `converter` e no `worker`, ou defina `GLMOCR_ENABLED=false`. Sem Ollama, páginas
+  digitalizadas recorrem ao Tesseract ou falham de forma explícita. Os motores e a
+  ordem de escolha estão em [CONVERSION.md](CONVERSION.md#motores-locais).
+- **Ollama com GPU** depende de drivers e do runtime de GPU do Docker no seu host.
+  Esse cenário não foi testado neste repositório.
 - **Assistente** (`ASSISTANT_ENABLED`) vem desativado por padrão. Ative-o apenas
   com um Ollama acessível e o modelo `qwen3.5:4b` instalado.
 - **Privacidade do OCR:** o motor fala com o Ollama diretamente, sem o cliente
   MaaS do SDK `glmocr`, que envia documentos à nuvem quando há `ZHIPU_API_KEY` no
   ambiente. Mantenha `GLMOCR_HOST` em loopback ou em rede privada e não defina
-  `ZHIPU_API_KEY` neste deploy.
+  `ZHIPU_API_KEY` nesta execução.
 
 ### Gerar segredos
 
@@ -208,6 +155,18 @@ O motor registra um aviso ao iniciar quando encontra `CONVERTER_INTERNAL_TOKEN` 
 `apps/api/src/config/configuration.ts`), que esse aviso não cobre: defina
 `JWT_SECRET` explicitamente na API.
 
+### JWT_SECRET no compose
+
+O compose passa `JWT_SECRET` apenas à API (`${JWT_SECRET:?set JWT_SECRET}`). O
+motor e o worker não recebem a variável. Por isso:
+
+- ao iniciar, o `converter` registra o aviso de `JWT_SECRET` com o valor padrão.
+  Esse aviso é esperado no compose e não indica falha;
+- o compose não encaminha tráfego para as rotas do motor que validam JWT (o `web`
+  só fala com a API), então o valor padrão do motor não é usado por usuários;
+- se quiser eliminar o aviso, defina o mesmo `JWT_SECRET` também no serviço
+  `converter`. Não é obrigatório.
+
 ### Rotação de segredos
 
 - **`CONVERTER_INTERNAL_TOKEN`**: troque nos dois serviços (API e motor) no mesmo
@@ -216,81 +175,126 @@ O motor registra um aviso ao iniciar quando encontra `CONVERTER_INTERNAL_TOKEN` 
 - **`JWT_SECRET`**: tokens já emitidos deixam de ser válidos. Os clientes obtêm
   uma nova sessão pelo fluxo de sessão local. Confirme isso no teste de fumaça
   após a troca.
-- Não coloque segredos no `vercel.json`, no código ou em logs. As variáveis
+- Não coloque segredos no repositório, nas imagens ou nos logs. As variáveis
   `VITE_*` são públicas, porque entram no bundle do navegador. Não coloque nelas
   nenhum segredo.
 
-### HTTPS, origem e cookies
+---
 
-- A API deve responder em HTTPS. A Vercel serve o frontend em HTTPS, e o
-  navegador bloqueia conteúdo misto.
-- O CORS é configurado pela lista `ALLOWED_ORIGINS`, comparada exatamente. Use
-  `https://<projeto>.vercel.app`, sem barra final e sem caminho.
-- Frontend e backend ficam em sites diferentes. Por isso, o cookie
-  `pdf2x_device_id` (SameSite=Lax) **não** é enviado nas requisições do frontend.
-  A identidade do navegador passa pelo cabeçalho `x-device-id`, que o frontend
-  envia com o valor guardado no `localStorage` do domínio da Vercel. Limpar o
-  `localStorage` cria um novo proprietário, com workspace vazio. Essa é a
-  consequência da arquitetura separada, e não um erro de configuração.
+## Origem, cookies e endereço da API
 
-### Persistência
+- `ALLOWED_ORIGINS` é comparado por igualdade: use a origem exata da interface
+  (no compose, `http://localhost:8080`), sem barra final e sem caminho. Depois de
+  qualquer mudança, reinicie a API (o CORS é lido na inicialização).
+- No compose, a interface e `/api/v1` são servidos na mesma origem pelo `web`,
+  então não há CORS entre eles. Uso local dispensa HTTPS.
+- O cookie de sessão (`pdf2x_device_id`) é sempre `HttpOnly; SameSite=Lax`. O
+  frontend guarda a identidade em `localStorage` e no cookie, e envia
+  `x-device-id` em toda requisição. Por isso limpar apenas o cache não perde o
+  histórico; limpar cookies **e** dados do site cria uma sessão nova, sem
+  recuperar os arquivos antigos. Não há conta, senha ou login.
 
-| Dado | Onde fica | O que montar |
+A resolução do endereço da API segue esta ordem:
+
+1. `VITE_API_BASE`, gravado no bundle em tempo de build;
+2. `/api/v1` (mesma origem, usado no desenvolvimento local e no compose).
+
+### Acesso pela rede local
+
+Por padrão a interface só responde em `127.0.0.1`. Para abri-la de outro
+dispositivo da mesma rede, a mudança precisa ser feita de propósito: em
+`infra/docker-compose.yml`, no serviço `web`, troque
+`"127.0.0.1:${WEB_PORT:-8080}:80"` por `"${WEB_PORT:-8080}:80"` e suba o compose de
+novo.
+
+> **Atenção.** Nessa configuração qualquer dispositivo que alcance a porta usa a
+> API sem login (`AUTH_MODE=optional`) e pode enviar arquivos. O compose não tem
+> HTTPS. Antes de fazer a mudança, restrinja a porta no firewall do host ao
+> endereço dos dispositivos que devem acessar. Como a interface chama a API pela
+> mesma origem, `ALLOWED_ORIGINS` não precisa mudar para esse acesso. Desfaça a
+> mudança quando não precisar mais dela.
+
+---
+
+## Persistência
+
+Os dados ficam em volumes nomeados do compose. A estrutura de chaves e de pastas
+do storage está em [STORAGE.md](STORAGE.md). Cópias de segurança e restauração
+estão em [OPERATIONS.md](OPERATIONS.md).
+
+| Volume | Serviço | O que guarda |
 | --- | --- | --- |
-| Banco da API | PostgreSQL (`pdf2x_api`) ou SQLite | banco gerenciado, com backup |
-| Banco do motor | PostgreSQL (`pdf2x_conv`) ou SQLite | banco gerenciado, com backup |
-| PDFs e XLSX | S3/MinIO **ou** disco local | bucket com backup, ou volume persistente |
+| `pgdata` | `postgres` | os bancos `pdf2x_api` (API) e `pdf2x_conv` (motor, runs, auditoria em tabelas) |
+| `miniodata` | `minio` | o bucket `pdf2x`: PDFs de entrada, XLSX e `runs/<run_id>/audit.json.gz` |
+| `redisdata` | `redis` | Redis com `appendonly yes`: broker do Celery (`REDIS_URL`) |
+
+Sem volume próprio no compose:
+
+- o diretório de trabalho do motor (`data/work`, com cópias temporárias do PDF
+  durante a execução) fica dentro do container e pode ser descartado;
+- o `converter` e o `worker` não publicam nem guardam nada além do banco e do
+  bucket.
+
+Notas para o modo B (container único) e para o storage local:
 
 - Nas imagens, os caminhos padrão são relativos a `/app` (`./data/...`). Defina
-  caminhos absolutos no provedor (por exemplo, `STORAGE_LOCAL_ROOT=/data/storage`
-  e `CONVERTER_DATABASE_URL=sqlite:////data/converter.db`) e monte o volume nesse
+  caminhos absolutos (por exemplo, `STORAGE_LOCAL_ROOT=/data/storage` e
+  `CONVERTER_DATABASE_URL=sqlite:////data/converter.db`) e monte o volume nesse
   caminho. A imagem do motor cria `/data/storage`, mas o padrão do código não
   aponta para ele.
 - **SQLite na imagem da API**: o `docker-entrypoint.sh` aplica o schema apenas
   para PostgreSQL. Com SQLite, as tabelas precisam existir antes do primeiro uso
   (por exemplo, com `npx prisma db push` executado no container). Por isso, em
   containers recomendamos PostgreSQL.
-- As tabelas do motor são criadas na inicialização (`init_db`). Migrações Alembic
-  (`alembic upgrade head`) são a alternativa para ambientes controlados.
-
-### Infra do compose (B1)
-
-- O compose sobe `postgres:16-alpine`, `redis:7-alpine`, `minio`, `converter`,
-  `worker` (Celery), `api` e `web`. O serviço `web` é desnecessário quando a
-  interface está na Vercel: pode ser omitido da execução.
-- Somente o `web` publica uma porta (`WEB_PORT`, padrão `8080`). Para a API, é
-  preciso incluir `ports` ou um proxy reverso com HTTPS na VM (Caddy, Traefik ou
-  nginx), encaminhando para o serviço `api` na porta `3000`.
-- Troque as credenciais padrão do MinIO (`minioadmin`) e do PostgreSQL (`pdf2x`)
-  antes de expor o host.
+- As tabelas do motor são criadas na inicialização (`init_db`). Para bancos
+  existentes ou ambientes controlados, use as migrações Alembic de
+  [Migrações de banco](#migrações-de-banco).
 
 ---
 
-## Parte C: Por que o motor não roda em funções serverless (Vercel)
+## Infra do compose (A)
 
-O motor não é adequado a funções serverless, por motivos verificáveis no código:
+- O compose sobe `postgres:16-alpine`, `redis:7-alpine`, `minio`, `minio-init`
+  (executa uma vez para criar o bucket), `converter`, `worker` (Celery), `api` e
+  `web`. O `web` é o ponto de entrada da interface; API, motor, banco, Redis e
+  MinIO ficam na rede interna `backend`.
+- Somente o `web` publica uma porta (`WEB_PORT`, padrão `8080`, em loopback). Para
+  acessar a API diretamente do host (por exemplo, com `curl`), adicione um `ports`
+  ao serviço `api` ligado em loopback, como `127.0.0.1:3000:3000`.
+- O `web` encaminha `/api/v1` para `API_UPSTREAM` (`http://api:3000`, pelo template
+  de nginx em `apps/web/nginx.conf.template`).
+- Troque as credenciais padrão do MinIO (`minioadmin`) e do PostgreSQL (`pdf2x`)
+  antes de guardar documentos que você queira preservar ou de abrir alguma porta a
+  outras máquinas.
 
-- Mantém threads de trabalho de longa duração (`CONVERTER_QUEUE=inline`). Uma
-  conversão pode durar até `CONVERTER_TASK_TIMEOUT_SECONDS` (600 s por padrão).
-  Funções serverless encerram ao fim da requisição ou ao atingir o seu próprio
-  tempo limite.
-- Usa binários nativos: Tesseract, pdfium (`pypdfium2`), OpenCV. Eles precisam de
-  um sistema de arquivos e de bibliotecas do sistema completas.
-- Grava em disco (SQLite, storage local, arquivos temporários da normalização de
-  `/Rotate`). Um disco de função não persiste entre invocações.
-- A API mantém processos de fundo: o drenador da outbox roda a cada 5 segundos
-  (`DRAIN_INTERVAL_MS`) e o SSE mantém conexões abertas por longos períodos.
-- Uploads de até 50 MiB (`UPLOAD_MAX_BYTES`) passam pelo corpo da requisição.
-  Funções serverless têm limites de corpo de requisição menores que esse valor
-  (consulte a documentação atual da Vercel).
+### Limitações do modo Celery
 
-Por isso, a Vercel hospeda apenas o frontend estático. O upload vai do navegador
-diretamente para a API.
+Com `CONVERTER_QUEUE=celery` (como no compose) o trabalho é entregue ao worker
+Celery por `send_task`. Esse caminho tem menos garantias do que o modo `inline`:
+
+- **Sem linha em `engine_jobs`.** `CeleryQueue.submit` não grava a tabela de jobs
+  duráveis. Lease, fence e reentrega dessa tabela existem apenas no modo `inline`.
+- **Sem retomada por checkpoint.** O worker Celery não passa `resume` a
+  `execute_run` (`services/converter/worker/celery_tasks.py`). O modo `inline`
+  passa `resume` quando a tentativa é maior que 1. Por isso, depois de uma falha,
+  o documento é reprocessado do zero no modo Celery, sem reaproveitar páginas já
+  extraídas.
+- **Cancelamento por revoke.** `CeleryQueue.cancel` envia `revoke` com
+  `terminate=True` e sinal `SIGTERM`. A checagem por Redis
+  (`pdf2x:cancel:<run_id>`, em `is_cancelled`) lê uma chave que nenhum código fora
+  dos testes grava. Na prática, o cancelamento depende do revoke.
+
+Hoje, a retomada por checkpoint e a reentrega com fence só são implementadas pelo
+modo `inline`. Ao escolher `celery`, considere que uma falha no meio de um
+documento exige nova execução completa.
 
 ---
 
 ## Limitações conhecidas
 
+- **Identidade sem login**: a identidade é o valor aleatório guardado no
+  navegador. Quem copiar esse valor assume a sessão. Não há limite por IP nem
+  expurgo automático de retenção.
 - **Fallback de SSE por `EventSource`**: o caminho principal de progresso usa
   `fetch` com streaming, e envia `x-device-id` e `Cache-Control` no cabeçalho.
   Esse caminho funciona entre origens porque a API libera `Cache-Control` no
@@ -298,44 +302,93 @@ diretamente para a API.
   (`apps/web/src/hooks/use-conversion-events.ts`) não consegue enviar
   `x-device-id` em requisição cross-origin. Ele só é usado quando o
   `fetch` falha; nesse caso o cabeçalho de identidade não é enviado e o
-  fallback deve ser tratado como degradado.
+  fallback deve ser tratado como degradado. A consulta de status a cada 5 s
+  (`useConversion`) mantém a tela atualizada mesmo sem o stream.
 - **`ALLOWED_ORIGINS` do motor**: o motor Python também lê `ALLOWED_ORIGINS`.
-  Inclua a origem da Vercel nele, além da API, para que o navegador possa chamar
-  o motor diretamente, se isso for usado.
+  Inclua a origem da interface nele, além da API, para que o navegador possa
+  chamar o motor diretamente, se isso for usado.
+- **Modo Celery**: veja [Limitações do modo Celery](#limitações-do-modo-celery).
 
-## Checklist pós-deploy
+## Checklist de execução com containers
 
 Execute na ordem:
 
-1. **Saúde da API**: `GET https://api.seu-dominio.exemplo/health` responde `200`
-   com `"status": "ok"` e todos os serviços `up`. Se algum estiver `down`,
-   verifique a conexão com o banco, o storage e o motor.
-2. **Motor interno**: a porta do motor não deve estar publicada na internet.
-   Confirme no provedor (ou no `ports:` do compose) que apenas a API está exposta.
-   As rotas `/internal/v1/*` exigem `x-internal-token`.
-3. **Origem liberada**: a Vercel carrega a página sem erros de CORS no console
+1. **Saúde da API**: `GET /health` na API responde `200` com `"status": "ok"` e
+   todos os serviços `up`. Se algum estiver `down`, verifique a conexão com o
+   banco, o storage e o motor.
+2. **Motor interno**: a porta do motor não deve ser publicada no host. Confira em
+   `docker compose ps` e no `ports:` do compose que só o `web` (e, se você
+   adicionou, a `api` em `127.0.0.1`) aparecem. As rotas `/internal/v1/*` exigem
+   `x-internal-token`.
+3. **Origem liberada**: a interface carrega a página sem erros de CORS no console
    do navegador. Se houver erro, confira `ALLOWED_ORIGINS`.
 4. **Frontend apontando para a API certa**: a aba de rede do navegador mostra
-   chamadas para `https://api.seu-dominio.exemplo/api/v1/...`, e não para
-   `/api/v1` no domínio da Vercel.
+   chamadas para `/api/v1/...` na mesma origem da interface, ou para o endereço
+   definido em `VITE_API_BASE`.
 5. **Teste de fumaça**: envie um PDF pequeno com texto nativo. Acompanhe o
    progresso por SSE, baixe o XLSX e abra a auditoria.
 6. **Teste de digitalizado** (se houver OCR configurado): envie uma página sem
    camada de texto e confirme que o resultado é recuperado ou que a falha é
    explícita.
-7. **Logs**: o motor não registra avisos de segredo com valor padrão ao iniciar.
-   Se o aviso aparecer, troque o segredo indicado. Os logs não devem conter
-   conteúdo de células (verifique em uma conversão de teste).
-8. **Exposição**: apenas a API (e o frontend) estão acessíveis. PostgreSQL, Redis,
-   MinIO e o motor ficam em rede privada.
-9. **Backups**: o PostgreSQL e o bucket S3 (ou o volume) têm cópias de segurança
-   configuradas e testadas.
+7. **Logs**: o motor não deve registrar aviso de `CONVERTER_INTERNAL_TOKEN` com o
+   valor padrão: se aparecer, troque o segredo. Um aviso só de `JWT_SECRET` no
+   motor é esperado no compose (veja [JWT_SECRET no compose](#jwt_secret-no-compose)).
+   Os logs não devem conter conteúdo de células (verifique em uma conversão de teste).
+8. **Portas do host**: apenas o `web` (e a API, se você a expôs em loopback)
+   aparece como porta publicada, e o `web` deve aparecer como `127.0.0.1:…`.
+   PostgreSQL, Redis, MinIO e o motor ficam na rede interna.
+9. **Cópias de segurança**: o PostgreSQL e o bucket (ou o volume) têm cópia de
+   segurança e restauração testada. Procedimento em [OPERATIONS.md](OPERATIONS.md).
 10. **Retenção**: confirme como os prazos de `RETENTION_*` serão aplicados. O
-    código informa os prazos, mas não encontrei uma rotina agendada de expurgo.
-    Defina a rotina operacional antes de tratar dados reais. A base legal (LGPD) e
-    os prazos cabem ao operador, conforme o tipo de documento; `DELETE
-    /conversions/:id` faz exclusão lógica e remove os artefatos do storage.
-11. **Limites**: confirme que o limite do proxy ou do provedor aceita o
+    código informa os prazos, mas nenhum job os aplica.
+    Se precisar que os arquivos sejam apagados nos prazos, defina a rotina
+    operacional. A exclusão feita por `DELETE /conversions/:id` é lógica. No motor
+    standalone remove `output.xlsx` e `audit.json.gz`; no NestJS remove o PDF original
+    quando nenhum outro documento usa a mesma chave e a conversão está em estado terminal.
+11. **Limites**: confirme que o limite do proxy do `web` aceita o
     `UPLOAD_MAX_BYTES` configurado.
-12. **Preview**: se usar previews da Vercel, confirme que a origem de cada um
-    está em `ALLOWED_ORIGINS`.
+
+---
+
+## Migrações de banco
+
+### Banco da API (Prisma)
+
+O projeto usa `db push`. Para ambientes versionados, aplique as mudanças aditivas
+introduzidas pelos lotes e pela fila, em ordem:
+
+- `Batch`, `BatchItem`, `UploadSession`, `UploadPart`, `BatchEvent`;
+- `Conversion.optionsJson`;
+- `OutboxEvent.lockedBy`, `OutboxEvent.lockedUntil`.
+
+Nada é destrutivo: conversões antigas ficam sem `optionsJson` e sem lote, e
+continuam legíveis. Faça cópia de segurança verificável antes e teste a
+restauração em um ambiente isolado.
+
+### Banco do motor (Alembic)
+
+Execute a partir de `services/converter`. O comando `alembic` exige o extra
+`migrate`, que não vem na imagem do motor:
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[migrate]"
+.venv\Scripts\python -m alembic upgrade head
+.venv\Scripts\python -m alembic check   # deve dizer "No new upgrade operations detected"
+```
+
+Revisões adicionadas: `c4f1a2b7d910` (lotes/uploads), `6d13f972f6c5` (tabelas de
+conhecimento/exportações e `options_json` que faltavam), `e08fecd3c89f`
+(`engine_jobs`, checkpoints e `runs.cancel_requested_at`).
+
+---
+
+## Rollout e rollback
+
+1. Suspenda novas admissões (`BATCH_UPLOAD_ENABLED=false`).
+2. Deixe os workers incrementais concluírem ou pausarem com checkpoint.
+3. Volte a versão anterior da API/UI sem apagar tabelas novas.
+4. Runs iniciados no modelo novo precisam do worker correspondente até o estado
+   terminal; o binário antigo não deve retomá-los.
+
+O primeiro mecanismo de rollback é **flag + drenagem + versão compatível**, não
+restauração destrutiva de schema.

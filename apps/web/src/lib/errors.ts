@@ -11,6 +11,8 @@ const CODE_MESSAGES: Record<string, string> = {
   IDEMPOTENT_REPLAY: 'Este upload já foi processado anteriormente.',
   VALIDATION_ERROR: 'Alguns dados enviados são inválidos.',
   RATE_LIMITED: 'Muitas requisições. Aguarde um instante e tente novamente.',
+  QUEUE_FULL: 'A fila de conversões do servidor está cheia. Tente novamente em instantes.',
+  STORAGE_UNAVAILABLE: 'O servidor está sem espaço para receber novos arquivos.',
   INTERNAL: 'A API encontrou um erro interno. Tente novamente.',
   CONVERTER_UNAVAILABLE: 'O motor de conversão está indisponível no momento.',
   NETWORK_ERROR: 'Não foi possível contatar a API. Verifique sua conexão e tente novamente.',

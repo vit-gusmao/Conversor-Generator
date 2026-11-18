@@ -1,12 +1,24 @@
 {
-  "moduleFileExtensions": ["js", "json", "ts"],
+  "moduleFileExtensions": [
+    "js",
+    "json",
+    "ts"
+  ],
   "rootDir": "..",
   "testEnvironment": "node",
   "testRegex": ".e2e-spec.ts$",
   "transform": {
-    "^.+\\.ts$": ["ts-jest", { "tsconfig": "tsconfig.json" }]
+    "^.+\\.ts$": [
+      "ts-jest",
+      {
+        "tsconfig": "tsconfig.json"
+      }
+    ]
   },
   "moduleNameMapper": {
-    "^@pdf2x/contracts$": "<rootDir>/../../packages/contracts/dist/index.js"
-  }
+    "^@pdf2x/contracts$": "<rootDir>/../../packages/contracts/src/index.ts"
+  },
+  "setupFiles": [
+    "<rootDir>/test/setup-env.ts"
+  ]
 }

@@ -138,3 +138,36 @@ __all__ = [
     "ConversationCreate",
     "ChatMessageRequest",
 ]
+
+# --------------------------------------------------------------------------- #
+# Batches and resumable uploads
+# --------------------------------------------------------------------------- #
+
+
+class CreateBatchRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    client_batch_key: str = Field(min_length=1, max_length=128)
+
+
+class RegisterBatchItemRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    client_item_id: str = Field(min_length=1, max_length=128)
+    filename: str = Field(min_length=1, max_length=512)
+    size_bytes: int = Field(gt=0)
+    options: dict[str, Any] | None = None
+
+
+class CompleteUploadRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    sha256: str = Field(min_length=64, max_length=64)
+    total_parts: int = Field(ge=0)
+
+
+class BatchRetryRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    scope: str = "conversion"
+

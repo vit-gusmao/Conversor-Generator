@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { Readable } from 'node:stream';
 
 import { Inject, Injectable } from '@nestjs/common';
 
@@ -6,8 +7,9 @@ import { ApiError } from '../common/errors/api-error';
 import { ERROR_CODES } from '../common/errors/error-codes';
 
 export interface UploadLimits {
+  /** @deprecated `null` means no page ceiling (full-document processing). */
   maxBytes: number;
-  maxPages: number;
+  maxPages: number | null;
 }
 
 export const UPLOAD_LIMITS = 'UPLOAD_LIMITS';
@@ -134,7 +136,10 @@ export class FileValidationService {
       // before it decodes (see CONVERTER_MAX_IMAGE_* settings).
       return inspection;
     }
-    if (inspection.page_count > this.limits.maxPages) {
+    // There is no page ceiling by default: `maxPages === null` means the
+    // document is processed in full. Only an operator who explicitly sets
+    // UPLOAD_MAX_PAGES keeps a legacy cap on this endpoint.
+    if (this.limits.maxPages !== null && inspection.page_count > this.limits.maxPages) {
       throw ApiError.badRequest(ERROR_CODES.TOO_MANY_PAGES, {
         reason: 'too_many_pages',
         max_pages: this.limits.maxPages,
@@ -235,6 +240,66 @@ export class FileValidationService {
 
   sha256(buffer: Buffer): string {
     return createHash('sha256').update(buffer).digest('hex');
+  }
+
+  /**
+   * Header-only inspection for the resumable path.
+   *
+   * The caller has already streamed the document to storage, so nothing here
+   * buffers it: only the first kilobyte decides PDF vs image. The engine
+   * re-validates the whole file and owns the authoritative page count.
+   */
+  inspectHeader(head: Buffer): {
+    kind: 'pdf' | 'image' | 'unknown';
+    is_pdf: boolean;
+    image_format: string | null;
+    mime_type: string | null;
+    pdf_version: string | null;
+  } {
+    const slice = head.subarray(0, MAGIC_SCAN_BYTES).toString('latin1');
+    const isPdf = slice.includes(PDF_HEADER);
+    if (isPdf) {
+      const match = /%PDF-(\d+\.\d+)/.exec(slice);
+      return {
+        kind: 'pdf',
+        is_pdf: true,
+        image_format: null,
+        mime_type: 'application/pdf',
+        pdf_version: match ? match[1] : null,
+      };
+    }
+    const imageFormat = detectImageFormat(head);
+    if (!imageFormat) {
+      return { kind: 'unknown', is_pdf: false, image_format: null, mime_type: null, pdf_version: null };
+    }
+    return {
+      kind: 'image',
+      is_pdf: false,
+      image_format: imageFormat,
+      mime_type: mimeForImageFormat(imageFormat),
+      pdf_version: null,
+    };
+  }
+
+  /**
+   * Counts `/Type /Page` across a stream with a small overlap window.
+   *
+   * Object streams are not expanded here, so the count can be an
+   * underestimate; that is reported as `page_count_estimated` and the engine
+   * replaces it. This is a progress hint, never an admission gate.
+   */
+  async countPagesStreaming(stream: Readable): Promise<number> {
+    const pattern = new RegExp(PAGE_TYPE_PATTERN.source, 'g');
+    let total = 0;
+    let carry = '';
+    for await (const chunk of stream) {
+      const text = carry + Buffer.from(chunk as Uint8Array).toString('latin1');
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(text)) !== null) total += 1;
+      carry = text.slice(-32);
+    }
+    return total;
   }
 
   /**

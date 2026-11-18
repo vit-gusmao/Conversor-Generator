@@ -5,12 +5,16 @@ import type {
   AuditEvent,
   AuditIssue,
   AuditSummary,
+  ConversionOptionsV2,
   ConversionStatus,
   PageAudit,
   Preview,
   QualityState,
+  ResultOverview,
   ResultSummary,
   RunStats,
+  SheetPage,
+  SheetSourcePages,
   ValidationReport,
 } from '@pdf2x/contracts';
 
@@ -59,8 +63,15 @@ export interface ConverterJobState {
 }
 
 export interface EnqueueOptions {
+  /**
+   * Canonical, fully normalised options. When present this is what the engine
+   * receives, so no field is lost on the way (the previous shape only carried
+   * `ocr`/`maxPages` and silently dropped TXT/CSV choices).
+   */
+  conversionOptions?: ConversionOptionsV2;
   ocr?: boolean;
   quality?: 'fast' | 'balanced' | 'thorough' | string;
+  /** @deprecated Removed from the flow: documents are processed in full. */
   maxPages?: number;
   forceOcr?: boolean;
   sheetMode?: string;
@@ -255,6 +266,38 @@ export class ConverterClient {
 
   async result(runId: string): Promise<ResultSummary> {
     return this.requestJson<ResultSummary>(runId, '/result');
+  }
+
+  /** Compact overview: payload size does not grow with the cell count. */
+  async resultOverview(runId: string): Promise<ResultOverview> {
+    return this.requestJson<ResultOverview>(runId, '/result-summary');
+  }
+
+  /** Paginated sheet selector metadata (never the full page list). */
+  async sheets(
+    runId: string,
+    params: { cursor?: string; limit?: number; q?: string } = {},
+  ): Promise<SheetPage> {
+    return this.requestJson<SheetPage>(
+      runId,
+      '/sheets',
+      {},
+      { cursor: params.cursor, limit: params.limit, q: params.q },
+    );
+  }
+
+  /** Paginated per-sheet provenance pages. */
+  async sheetPages(
+    runId: string,
+    sheetId: string,
+    params: { cursor?: number; limit?: number } = {},
+  ): Promise<SheetSourcePages> {
+    return this.requestJson<SheetSourcePages>(
+      runId,
+      `/sheets/${encodeURIComponent(sheetId)}/pages`,
+      {},
+      { cursor: params.cursor, limit: params.limit },
+    );
   }
 
   async preview(runId: string, params: PreviewParams = {}): Promise<Preview> {
@@ -555,6 +598,20 @@ export class ConverterClient {
 
   private toEngineOptions(options?: EnqueueOptions): Json {
     if (!options) return {};
+
+    // The canonical payload goes over the wire untouched. The engine treats it
+    // as `schema_version: 2` and never applies a page ceiling.
+    if (options.conversionOptions) {
+      return {
+        ...options.conversionOptions,
+        ocr: { ...options.conversionOptions.ocr },
+        text: { ...options.conversionOptions.text },
+        csv: { ...options.conversionOptions.csv },
+        target_formats: [...options.conversionOptions.target_formats],
+      } as unknown as Json;
+    }
+
+    // Legacy callers that only speak the flat shape.
     return {
       ...(options.ocr === undefined ? {} : { ocr: options.ocr }),
       ...(options.quality === undefined ? {} : { quality: options.quality }),

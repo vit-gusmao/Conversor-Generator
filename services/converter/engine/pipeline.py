@@ -48,10 +48,10 @@ from config import settings
 from engine.excel.auditor import XlsxAudit, audit_xlsx
 from engine.excel.writer import ExcelResult, write_workbook
 from engine.extraction.native_text import NativePage, classify_page, extract_native, needs_ocr
-from engine.extraction.visibility import page_invisible_ratios
+from engine.extraction.visibility import page_invisible_ratios, page_invisible_ratios_path
 from engine.fields.field_extractor import extract_fields
 from engine.fields.record_grouper import GroupingConfig, group_records
-from engine.inspector.pdf_inspector import PDFInspection, inspect_pdf
+from engine.inspector.pdf_inspector import PDFInspection, inspect_pdf, inspect_pdf_path
 from engine.layout.blocks import build_layout
 from engine.layout.reading_order import assign_reading_order
 from engine.layout.regions import (
@@ -62,6 +62,7 @@ from engine.layout.regions import (
 from engine.normalization.normalizer import LocaleProfile, detect_locale
 from engine.ocr.ocr_runner import OcrRunner, deduplicate_ocr
 from engine.reconciliation.merger import reconcile
+from engine.streaming.source import DocumentSource, sha256_file
 from engine.structure.resolver import build_workbook
 from engine.tables.table_builder import detect_tables
 from engine.validation.candidate_validator import (
@@ -70,6 +71,12 @@ from engine.validation.candidate_validator import (
     validate_plan,
 )
 from engine.validation.publication import publication_report
+from repositories.checkpoint_repository import (
+    STAGE_EXTRACT,
+    CheckpointKey,
+    CheckpointRepository,
+    options_hash as checkpoint_options_hash,
+)
 from exports.base import ExportError, ExportOptions, ExportResult
 from exports.csv_writer import export_csv
 from exports.text_plan import TextArtifactPlan, build_text_plan
@@ -133,9 +140,12 @@ class PipelineOptions:
     source_name: str | None = None
     text_newline: str = "lf"
     page_separator: str = "form_feed"
+    include_table_text: bool = True
     csv_profile: str = "interoperable"
+    csv_delimiter: str | None = None
     csv_table_ids: list[str] | None = None
     csv_formula_policy: str = "safe"
+    csv_value_mode: str = "original"
 
 
 @dataclass(slots=True)
@@ -166,6 +176,30 @@ class _PageContext:
     native: NativePage
 
 
+def extraction_fingerprint(options: PipelineOptions) -> dict:
+    """Options that change extraction output and therefore invalidate pages."""
+    return {
+        "ocr_enabled": options.ocr_enabled,
+        "dpi": options.dpi,
+        "include_table_text": options.include_table_text,
+        "schema": "extract-v1",
+    }
+
+
+def cached_pages_enabled() -> bool:
+    """Checkpoint reuse can be turned off without disabling the pipeline."""
+    return bool(getattr(settings, "checkpoint_reuse_enabled", True))
+
+
+def _engine_version() -> str:
+    try:
+        from version import ENGINE_VERSION
+
+        return ENGINE_VERSION
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 class ConversionPipeline:
     def __init__(
         self,
@@ -177,6 +211,8 @@ class ConversionPipeline:
         sink: ProgressSink | None = None,
         options: PipelineOptions | None = None,
         cancel_check=None,
+        source: DocumentSource | None = None,
+        resume: bool = False,
     ) -> None:
         self.pdf_path = Path(pdf_path)
         self.run_id = run_id
@@ -185,7 +221,14 @@ class ConversionPipeline:
         self.sink = sink
         self.options = options or PipelineOptions()
         self.cancel_check = cancel_check
-        self._data = self.pdf_path.read_bytes()
+        # The document is never held in memory: the digest is computed by
+        # streaming and every parser opens the file by path.
+        #: Only a redelivered unit may adopt checkpoints. A fresh execution
+        #: always reprocesses, so two different pipelines that happen to share
+        #: a run id can never exchange pages.
+        self.resume = resume
+        self._sha256 = source.sha256 if source is not None else sha256_file(self.pdf_path)
+        self._checkpoints = CheckpointRepository()
         self._total = 0
         self._started = time.perf_counter()
 
@@ -195,7 +238,7 @@ class ConversionPipeline:
     def run(self) -> PipelineResult:
         ir = DocumentIR(
             file_name=self.options.source_name or self.pdf_path.name,
-            sha256=hashlib.sha256(self._data).hexdigest(),
+            sha256=self._sha256,
             page_count=0,
         )
         validation: dict = {}
@@ -247,7 +290,9 @@ class ConversionPipeline:
 
             # TXT/CSV are produced from the same IR: OCR runs once per page and
             # all artifacts share the run's provenance.
-            text_plan = build_text_plan(ir)
+            text_plan = build_text_plan(
+                ir, include_table_text=self.options.include_table_text
+            )
             exports = self._export_artifacts(ir, text_plan)
             publication = publication_report(checks, quality)["status"]
             if publication == "quarantined":
@@ -398,10 +443,13 @@ class ConversionPipeline:
     # ------------------------------------------------------------------ #
     # Stages
     # ------------------------------------------------------------------ #
+    def _options_fingerprint(self) -> dict:
+        return extraction_fingerprint(self.options)
+
     def _validate(self, ir: DocumentIR) -> PDFInspection:
         self._progress("validate", 0.0, "Validando o arquivo recebido")
         self.recorder.stage_start("validate", "Validando assinatura, estrutura e permissões")
-        inspection = inspect_pdf(self._data)
+        inspection = inspect_pdf_path(self.pdf_path)
         if not inspection.is_pdf:
             self.recorder.emit(
                 EVT_DOCUMENT_REJECTED,
@@ -421,8 +469,8 @@ class ConversionPipeline:
             )
             if inspection.needs_password or inspection.encrypted:
                 code = "ENCRYPTED_PDF"
-            elif inspection.page_count > settings.max_pages():
-                code = "TOO_MANY_PAGES"
+            elif inspection.page_count <= 0:
+                code = "INVALID_FILE"
             else:
                 code = "INVALID_FILE"
             raise ConversionError(code, inspection.errors[0])
@@ -449,7 +497,9 @@ class ConversionPipeline:
             payload=capability,
         )
 
-        max_pages = self.options.max_pages or settings.max_pages()
+        # No page ceiling: every page of the document has a persisted outcome.
+        # `max_pages` is intentionally ignored here (see Settings.max_pages),
+        # so a stale environment value can no longer truncate a document.
         try:
             pdf = pdfplumber.open(str(work_path))
         except Exception as exc:  # noqa: BLE001
@@ -457,20 +507,14 @@ class ConversionPipeline:
 
         with pdf:
             pages = pdf.pages
-            total = min(len(pages), max_pages)
-            if len(pages) > total:
-                self.recorder.issue(
-                    "PAGES_NOT_PROCESSED",
-                    f"O documento tem {len(pages)} páginas; {len(pages) - total} não foram "
-                    f"processadas por causa do limite de {max_pages} páginas.",
-                    severity="warning",
-                    context={"pages": len(pages), "limit": max_pages},
-                )
+            total = len(pages)
+            if total == 0:
+                raise ConversionError("INVALID_FILE", "O PDF não contém páginas.")
             self._total = total
             self.recorder.stage_end("inspect", pages=total)
             self.recorder.stage_start("extract", f"Extraindo texto de {total} página(s)")
 
-            invisible_ratios = page_invisible_ratios(self._data)
+            invisible_ratios = page_invisible_ratios_path(work_path)
             if invisible_ratios and any((ratio or 0) >= 0.9 for ratio in invisible_ratios[:total]):
                 hidden = sum(1 for ratio in invisible_ratios[:total] if (ratio or 0) >= 0.9)
                 self.recorder.emit(
@@ -481,10 +525,53 @@ class ConversionPipeline:
                     payload={"pages": hidden},
                 )
 
+            # Checkpoints make a crash-resumed run cheap: pages extracted by a
+            # previous attempt of the SAME run are reloaded instead of redoing
+            # OCR. A user-requested retry creates a new run, so it never reuses
+            # these.
+            checkpoint_key = CheckpointKey(
+                source_sha256=ir.sha256,
+                engine_version=_engine_version(),
+                options_hash=checkpoint_options_hash(self._options_fingerprint()),
+            )
+            cached_pages = (
+                self._checkpoints.existing_pages(
+                    run_id=self.run_id, key=checkpoint_key, stage=STAGE_EXTRACT
+                )
+                if (self.resume and cached_pages_enabled())
+                else {}
+            )
+            reused = 0
+
             for index in range(total):
                 if self.cancel_check and self.cancel_check():
                     raise ConversionError("CANCELLED", "Conversão cancelada pelo usuário.")
                 page_number = index + 1
+
+                if page_number in cached_pages:
+                    restored = self._checkpoints.load_page(
+                        run_id=self.run_id,
+                        page_number=page_number,
+                        key=checkpoint_key,
+                        stage=STAGE_EXTRACT,
+                    )
+                    if restored is not None:
+                        ir.pages.append(restored)
+                        contexts.append(
+                            _PageContext(
+                                page=restored,
+                                native=NativePage(page_number, 0, 0, 0),
+                            )
+                        )
+                        ir.ocr_regions += len([r for r in restored.regions if r.text_source == "ocr"])
+                        reused += 1
+                        self._progress(
+                            "extract",
+                            (index + 1) / max(1, total),
+                            f"Página {page_number}/{total} retomada do checkpoint",
+                        )
+                        continue
+
                 try:
                     ratio = invisible_ratios[index] if index < len(invisible_ratios) else None
                     context = self._process_page(
@@ -521,6 +608,21 @@ class ConversionPipeline:
                     continue
                 contexts.append(context)
                 ir.pages.append(context.page)
+                try:
+                    self._checkpoints.save_page(
+                        run_id=self.run_id,
+                        page=context.page,
+                        key=checkpoint_key,
+                        stage=STAGE_EXTRACT,
+                    )
+                except Exception:  # noqa: BLE001 - a checkpoint is an optimisation
+                    self.recorder.emit(
+                        "CHECKPOINT_FAILED",
+                        "extract",
+                        f"O checkpoint da página {page_number} não pôde ser gravado.",
+                        severity="warning",
+                        page=page_number,
+                    )
                 fraction = (index + 1) / max(1, total)
                 self._progress(
                     "extract",
@@ -529,6 +631,13 @@ class ConversionPipeline:
                 )
 
         ir.pages.sort(key=lambda p: p.page_number)
+        if reused:
+            self.recorder.emit(
+                "PAGES_RESTORED",
+                "extract",
+                f"{reused} página(s) foram retomadas de checkpoints sem reprocessar OCR.",
+                payload={"pages": reused, "total": total},
+            )
         self.recorder.stage_end("extract", pages=len(ir.pages))
         return contexts
 
@@ -1119,6 +1228,7 @@ class ConversionPipeline:
                             format="txt",
                             newline=self.options.text_newline,
                             page_separator=self.options.page_separator,
+                            include_table_text=self.options.include_table_text,
                         ),
                     )
                 )
@@ -1136,8 +1246,10 @@ class ConversionPipeline:
                         ExportOptions(
                             format="csv",
                             csv_profile=self.options.csv_profile,
+                            csv_delimiter=self.options.csv_delimiter,
                             formula_policy=self.options.csv_formula_policy,
                             table_ids=self.options.csv_table_ids,
+                            value_mode=self.options.csv_value_mode,
                         ),
                     )
                 )

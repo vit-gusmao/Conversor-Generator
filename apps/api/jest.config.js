@@ -8,7 +8,7 @@ module.exports = {
   testEnvironment: 'node',
   testPathIgnorePatterns: ['/node_modules/', '/dist/', '/test/e2e/'],
   moduleNameMapper: {
-    '^@pdf2x/contracts$': '<rootDir>/../../packages/contracts/dist/index.js',
+    '^@pdf2x/contracts$': '<rootDir>/../../packages/contracts/src/index.ts',
   },
   collectCoverageFrom: ['src/**/*.ts'],
   coverageDirectory: './coverage',

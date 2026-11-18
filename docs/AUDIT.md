@@ -53,9 +53,11 @@ editar um dado. Cadeias gravadas por versões anteriores (que cobriam só
 aceita as duas formas.
 
 `sequence` é monotônico por execução. Qualquer alteração em um evento invalida
-todos os seguintes — `/audit` reporta `hash_chain_valid`. Um atacante com acesso
-ao banco pode reescrever a cadeia inteira; por isso a recomendação de produção é
-publicar checkpoints assinados fora do banco.
+todos os seguintes — `/audit` reporta `hash_chain_valid`. Quem tem acesso de
+escrita ao banco local pode reescrever a cadeia inteira, e a verificação sozinha
+não detecta isso. Para guardar uma prova fora do banco, copie o
+`audit.json.gz` da execução (veja [Armazenamento](#armazenamento-em-duas-camadas))
+para um local separado e registre o SHA-256 dele.
 
 ## Cobertura × precisão
 
@@ -115,13 +117,18 @@ com pontuação, para que uma conversão ruim possa ser explicada.
 9. **Inconsistências** — avisos/erros com link para a página.
 10. **Desempenho** — tempos por fase.
 11. **Auditoria Técnica** — JSON bruto dos eventos, com hashes.
-12. **Exportar** — JSON completo ou relatório TXT.
+12. **Exportar Auditoria** — JSON completo ou relatório TXT.
 
 ## Armazenamento em duas camadas
 
 - **Banco**: índice pesquisável (run, página, fase, tipo, gravidade, célula).
+  As tabelas são `audit_events` (eventos, com a cadeia de hash), `audit_issues`
+  (avisos e erros), `stage_timings` (tempos por fase), `page_results`,
+  `decisions`, `cell_evidence`, `output_cells` e `validation_results` (checagens
+  da auditoria do XLSX). Estão no banco do motor (`pdf2x_conv` no compose).
 - **Storage**: `runs/{run_id}/audit.json.gz` e `runs/{run_id}/output.xlsx`,
-  com SHA-256, versão e política de retenção.
+  com SHA-256, versão e política de retenção. Chaves e pastas em
+  [STORAGE.md](STORAGE.md).
 
 O botão consulta o banco; artefatos volumosos só são baixados sob demanda.
 

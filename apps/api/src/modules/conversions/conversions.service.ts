@@ -1,13 +1,21 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
-import type {
-  ConversionListItem,
-  Paginated,
-  Preview,
-  ResultSummary,
+import {
+  ConversionOptionsError,
+  canonicalOptionsJson,
+  normalizeConversionOptions,
+  type ConversionListItem,
+  type ConversionOptionsV2,
+  type Paginated,
+  type Preview,
+  type ResultOverview,
+  type ResultSummary,
+  type SheetPage,
+  type SheetSourcePages,
 } from '@pdf2x/contracts';
 
 import { ApiError } from '../../common/errors/api-error';
+import { requestFingerprint } from '../../common/fingerprint';
 import { ERROR_CODES } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/request-context';
 import {
@@ -46,6 +54,17 @@ import {
 import { OUTBOX_ENQUEUE, OutboxService } from './outbox.service';
 import { assertNotTerminal, assertOwnership } from './ownership';
 
+/** A document already persisted in object storage. */
+export interface StoredSource {
+  storageKey: string;
+  sha256: string;
+  sizeBytes: number;
+  filename: string;
+  mimeType: string;
+  pageCount?: number | null;
+  validation?: import('@pdf2x/contracts').ValidationReport | null;
+}
+
 @Injectable()
 export class ConversionsService {
   private readonly logger = new Logger(ConversionsService.name);
@@ -66,6 +85,7 @@ export class ConversionsService {
     user: AuthenticatedUser,
     file: UploadedPdfFile | undefined,
     idempotencyKey?: string,
+    rawOptions?: unknown,
   ): Promise<CreateConversionResponse> {
     if (!file || !file.buffer || file.buffer.length === 0) {
       throw ApiError.badRequest(ERROR_CODES.INVALID_FILE, { reason: 'empty_file' });
@@ -82,21 +102,57 @@ export class ConversionsService {
       ? extensionForImageFormat(inspection.image_format as string)
       : 'pdf';
     const mimeType = inspection.mime_type ?? (isImage ? 'image/*' : 'application/pdf');
-    const targetFormats = isImage ? ['txt'] : ['xlsx', 'txt', 'csv'];
+
+    // Options are normalised once, here, and travel to the engine untouched.
+    // Invalid choices (including any attempt to cap pages) fail before storage.
+    const options = this.normalizeOptions(rawOptions, isImage ? 'image' : 'pdf');
 
     const sha256 = inspection.sha256;
     const storageKey = storageKeyForSha256(sha256, extension, user.id);
-    const key = idempotencyKey?.trim();
+
+    await this.storage.put(storageKey, file.buffer, mimeType);
+
+    return this.createStoredConversion(
+      user,
+      {
+        storageKey,
+        sha256,
+        sizeBytes: file.buffer.length,
+        filename,
+        mimeType,
+        pageCount: inspection.page_count > 0 ? inspection.page_count : null,
+        validation: toValidationReport(inspection),
+      },
+      options,
+      { idempotencyKey: idempotencyKey?.trim() },
+    );
+  }
+
+  /**
+   * Creates the conversion (document + run + outbox) for an object that is
+   * already in storage.
+   *
+   * The resumable-upload path and the legacy multipart endpoint both land here,
+   * so both produce identical rows, events and queue messages.
+   */
+  async createStoredConversion(
+    user: AuthenticatedUser,
+    source: StoredSource,
+    options: ConversionOptionsV2,
+    meta: { idempotencyKey?: string; documentId?: string } = {},
+  ): Promise<CreateConversionResponse> {
+    const { storageKey, sha256, sizeBytes, filename, mimeType } = source;
+    const key = meta.idempotencyKey?.trim();
+    const fingerprint = requestFingerprint(sha256, options);
 
     if (key) {
       const existing = await this.prisma.idempotencyKey.findUnique({
         where: { ownerId_key: { ownerId: user.id, key } },
       });
       if (existing) {
-        if (existing.requestHash !== sha256) {
-          throw ApiError.conflict(ERROR_CODES.IDEMPOTENT_REPLAY, {
-            reason: 'payload_mismatch',
-          });
+        const matches = existing.requestHash === fingerprint || existing.requestHash === sha256;
+        if (!matches) {
+          throw ApiError.conflict(ERROR_CODES.IDEMPOTENT_REPLAY, { reason: 'payload_mismatch' });
         }
         const replayed = await this.findRow(existing.conversionId);
         if (replayed) {
@@ -105,18 +161,16 @@ export class ConversionsService {
       }
     }
 
-    await this.storage.put(storageKey, file.buffer, mimeType);
-
     const queuedProgress = progressFloorForStatus('queued');
     const created = await this.prisma.$transaction(async (tx) => {
       const document = await tx.document.create({
         data: {
           filename,
           mimeType,
-          sizeBytes: file.buffer.length,
+          sizeBytes,
           sha256,
           storageKey,
-          pageCount: inspection.page_count > 0 ? inspection.page_count : null,
+          pageCount: source.pageCount ?? null,
           ownerId: user.id,
         },
       });
@@ -129,7 +183,8 @@ export class ConversionsService {
           stage: 'receive',
           progress: 0,
           quality: 'pending',
-          validationJson: JSON.stringify(toValidationReport(inspection)),
+          validationJson: source.validation ? JSON.stringify(source.validation) : null,
+          optionsJson: canonicalOptionsJson(options),
         },
       });
 
@@ -165,7 +220,7 @@ export class ConversionsService {
             key,
             ownerId: user.id,
             conversionId: conversion.id,
-            requestHash: sha256,
+            requestHash: fingerprint,
           },
         });
       }
@@ -180,11 +235,7 @@ export class ConversionsService {
           runId: run.id,
           storageKey,
           filename,
-          options: {
-            maxPages: this.config.uploadMaxPages,
-            // The same OCR run feeds XLSX, TXT and CSV; images produce TXT.
-            targetFormats,
-          },
+          options: { conversionOptions: options },
         },
         tx,
       );
@@ -199,7 +250,11 @@ export class ConversionsService {
       progress: queuedProgress,
       message: 'Conversão recebida e enfileirada.',
       runId: created.runId,
-      payload: { filename, page_count: inspection.page_count },
+      payload: {
+        filename,
+        page_count: source.pageCount ?? null,
+        target_formats: options.target_formats,
+      },
     });
 
     // Fire and forget: the outbox row is durable, the drainer retries it.
@@ -260,6 +315,31 @@ export class ConversionsService {
     return this.converter.result(runId);
   }
 
+  /** Compact result payload used by the minimalist result screen. */
+  async getResultOverview(user: AuthenticatedUser, id: string): Promise<ResultOverview> {
+    const row = await this.findOwned(id, user);
+    return this.converter.resultOverview(this.requireRunId(row));
+  }
+
+  async getSheets(
+    user: AuthenticatedUser,
+    id: string,
+    query: { cursor?: string; limit?: number; q?: string },
+  ): Promise<SheetPage> {
+    const row = await this.findOwned(id, user);
+    return this.converter.sheets(this.requireRunId(row), query);
+  }
+
+  async getSheetPages(
+    user: AuthenticatedUser,
+    id: string,
+    sheetId: string,
+    query: { cursor?: number; limit?: number },
+  ): Promise<SheetSourcePages> {
+    const row = await this.findOwned(id, user);
+    return this.converter.sheetPages(this.requireRunId(row), sheetId, query);
+  }
+
   async getPreview(
     user: AuthenticatedUser,
     id: string,
@@ -314,6 +394,7 @@ export class ConversionsService {
 
     const attempt = (row.runs[0]?.attempt ?? 0) + 1;
     const progress = progressFloorForStatus('queued');
+    const options = this.optionsForRow(row);
 
     const run = await this.prisma.conversionRun.create({
       data: {
@@ -354,7 +435,7 @@ export class ConversionsService {
       runId: run.id,
       storageKey: row.document.storageKey,
       filename: row.document.filename,
-      options: { maxPages: this.config.uploadMaxPages },
+      options: { conversionOptions: options },
     });
     // dispatch() already persists failures, but it can still reject if the
     // failure write itself fails. Guard the process against an unhandled
@@ -479,6 +560,41 @@ export class ConversionsService {
       message,
       links: linksFor(conversion.id),
     };
+  }
+
+  /**
+   * Normalises user options, mapping contract errors onto the HTTP envelope.
+   */
+  normalizeOptions(rawOptions: unknown, kind: 'pdf' | 'image'): ConversionOptionsV2 {
+    try {
+      return normalizeConversionOptions(rawOptions, { kind, allowLegacy: true });
+    } catch (error) {
+      if (error instanceof ConversionOptionsError) {
+        throw ApiError.badRequest(error.code as never, {
+          ...error.details,
+          reason: error.code,
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Options to reuse on retry: the stored canonical payload, or the defaults
+   * inferred from the document kind for conversions created before options
+   * were persisted.
+   */
+  optionsForRow(row: ConversionWithRelations): ConversionOptionsV2 {
+    const stored = row.optionsJson;
+    if (stored) {
+      try {
+        return normalizeConversionOptions(JSON.parse(stored), { kind: 'pdf', allowLegacy: false });
+      } catch {
+        // fall through to defaults
+      }
+    }
+    const kind = (row.document.mimeType ?? '').startsWith('image/') ? 'image' : 'pdf';
+    return normalizeConversionOptions(undefined, { kind });
   }
 
   private safeFilename(original: string | undefined): string {

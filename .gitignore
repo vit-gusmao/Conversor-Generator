@@ -48,7 +48,6 @@ Thumbs.db
 npm-debug.log*
 
 # deploy / local scratch
-.vercel/
 /work/
 /study/
 /stress/

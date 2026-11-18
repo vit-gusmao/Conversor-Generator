@@ -30,6 +30,9 @@ const SettingsPage = lazy(() =>
 const AssistantPage = lazy(() =>
   import('@/pages/assistant-page').then((module) => ({ default: module.AssistantPage })),
 );
+const BatchPage = lazy(() =>
+  import('@/pages/batch-page').then((module) => ({ default: module.BatchPage })),
+);
 
 function RouteErrorPage() {
   const error = useRouteError();
@@ -51,23 +54,33 @@ function RouteErrorPage() {
   );
 }
 
-export const router = createBrowserRouter([
-  {
-    path: '/',
-    element: <AppShell />,
-    errorElement: <RouteErrorPage />,
-    children: [
-      { index: true, element: <HomePage /> },
-      { path: 'conversions/:id', element: <ConversionPage /> },
-      { path: 'conversions/:id/result', element: <ResultPage /> },
-      { path: 'conversions/:id/audit', element: <AuditPage /> },
-      { path: 'history', element: <HistoryPage /> },
-      { path: 'assistant', element: <AssistantPage /> },
-      { path: 'settings', element: <SettingsPage /> },
-      { path: '*', element: <NotFoundPage /> },
-    ],
-  },
-]);
+/**
+ * The router uses the same base Vite used for the assets (`BASE_URL`, `/` by
+ * default), so links keep working if the SPA is served from a sub-path.
+ */
+const routerBase = (import.meta.env.BASE_URL || '/').replace(/\/+$/, '') || '/';
+
+export const router = createBrowserRouter(
+  [
+    {
+      path: '/',
+      element: <AppShell />,
+      errorElement: <RouteErrorPage />,
+      children: [
+        { index: true, element: <HomePage /> },
+        { path: 'conversions/:id', element: <ConversionPage /> },
+        { path: 'conversions/:id/result', element: <ResultPage /> },
+        { path: 'conversions/:id/audit', element: <AuditPage /> },
+        { path: 'batches/:id', element: <BatchPage /> },
+        { path: 'history', element: <HistoryPage /> },
+        { path: 'assistant', element: <AssistantPage /> },
+        { path: 'settings', element: <SettingsPage /> },
+        { path: '*', element: <NotFoundPage /> },
+      ],
+    },
+  ],
+  { basename: routerBase },
+);
 
 export function App() {
   return <RouterProvider router={router} />;

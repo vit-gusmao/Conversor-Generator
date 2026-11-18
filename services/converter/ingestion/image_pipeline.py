@@ -158,8 +158,9 @@ class ImageConversionPipeline:
             for index, page in enumerate(ingested.pages):
                 if self.cancel_check and self.cancel_check():
                     raise ConversionError("CANCELLED", "Conversão cancelada pelo usuário.")
-                if page.page_number > (self.options.max_pages or settings.max_pages()):
-                    break
+                # Every decoded frame is processed: the frame budget is
+                # enforced by the decoder (CONVERTER_MAX_IMAGE_FRAMES), not by
+                # a page ceiling that would silently drop frames here.
                 page_result = PageResult(
                     page_number=page.page_number,
                     width=float(page.width),

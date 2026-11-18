@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import { Readable, Transform } from 'node:stream';
+
 import { Injectable, Logger } from '@nestjs/common';
 
 import { ApiError } from '../common/errors/api-error';
@@ -23,6 +26,12 @@ interface S3ModuleLike {
   GetObjectCommand: new (input: Record<string, unknown>) => S3Command;
   DeleteObjectCommand: new (input: Record<string, unknown>) => S3Command;
   HeadObjectCommand: new (input: Record<string, unknown>) => S3Command;
+  CopyObjectCommand: new (input: Record<string, unknown>) => S3Command;
+  CreateMultipartUploadCommand: new (input: Record<string, unknown>) => S3Command;
+  UploadPartCommand: new (input: Record<string, unknown>) => S3Command;
+  CompleteMultipartUploadCommand: new (input: Record<string, unknown>) => S3Command;
+  AbortMultipartUploadCommand: new (input: Record<string, unknown>) => S3Command;
+  Upload: new (input: Record<string, unknown>) => { done(): Promise<unknown> };
 }
 
 interface S3BodyLike {
@@ -103,6 +112,137 @@ export class S3StorageService implements StorageService {
     } catch {
       return false;
     }
+  }
+
+  /** Streams the object to S3 without buffering the whole file. */
+  async putStream(key: string, stream: Readable, contentType: string): Promise<StoredObject> {
+    const sdk = this.loadSdk();
+    const hash = createHash('sha256');
+    let size = 0;
+    const counter = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        hash.update(chunk);
+        size += chunk.length;
+        callback(null, chunk);
+      },
+    });
+    const passthrough = stream.pipe(counter);
+    try {
+      await new sdk.Upload({
+        client: this.getClient(sdk),
+        params: { Bucket: this.config.s3.bucket, Key: key, Body: passthrough, ContentType: contentType },
+      }).done();
+      return { key, size };
+    } catch (error) {
+      this.logger.error(`Falha ao enviar ${key} para o S3`, String(error));
+      throw ApiError.storageUnavailable({ backend: 's3', operation: 'put_stream' });
+    }
+  }
+
+  async openRead(key: string): Promise<Readable> {
+    const sdk = this.loadSdk();
+    const client = this.getClient(sdk);
+    const output = await client.send(
+      new sdk.GetObjectCommand({ Bucket: this.config.s3.bucket, Key: key }),
+    );
+    if (!isRecord(output) || !isRecord(output['Body'])) {
+      throw ApiError.notFound({ reason: 'storage_object_not_found', key });
+    }
+    const body = output['Body'] as S3BodyLike;
+    if (typeof body[Symbol.asyncIterator] === 'function') {
+      return Readable.from(body as AsyncIterable<Uint8Array>);
+    }
+    return Readable.from([await this.readBody(output)]);
+  }
+
+  async size(key: string): Promise<number> {
+    const sdk = this.loadSdk();
+    const client = this.getClient(sdk);
+    try {
+      const output = await client.send(
+        new sdk.HeadObjectCommand({ Bucket: this.config.s3.bucket, Key: key }),
+      );
+      const length = isRecord(output) ? output['ContentLength'] : undefined;
+      return typeof length === 'number' ? length : -1;
+    } catch {
+      return -1;
+    }
+  }
+
+  async move(sourceKey: string, targetKey: string): Promise<void> {
+    const sdk = this.loadSdk();
+    const client = this.getClient(sdk);
+    await client.send(
+      new sdk.CopyObjectCommand({
+        Bucket: this.config.s3.bucket,
+        Key: targetKey,
+        CopySource: `/${this.config.s3.bucket}/${sourceKey}`,
+      }),
+    );
+    await this.delete(sourceKey);
+  }
+
+  /**
+   * Assembles the confirmed parts server-side with a multipart upload.
+   * Memory stays bounded by the part size, not the document size.
+   */
+  async compose(partKeys: string[], targetKey: string, contentType: string): Promise<StoredObject> {
+    const sdk = this.loadSdk();
+    const client = this.getClient(sdk);
+    const created = await client.send(
+      new sdk.CreateMultipartUploadCommand({
+        Bucket: this.config.s3.bucket,
+        Key: targetKey,
+        ContentType: contentType,
+      }),
+    );
+    const uploadId = isRecord(created) ? created['UploadId'] : undefined;
+    if (typeof uploadId !== 'string') {
+      throw ApiError.storageUnavailable({ reason: 'multipart_create_failed' });
+    }
+
+    let size = 0;
+    const completed: Array<{ PartNumber: number; ETag: string }> = [];
+    try {
+      let index = 0;
+      for (const key of partKeys) {
+        index += 1;
+        const body = await this.get(key);
+        size += body.length;
+        const sent = await client.send(
+          new sdk.UploadPartCommand({
+            Bucket: this.config.s3.bucket,
+            Key: targetKey,
+            UploadId: uploadId,
+            PartNumber: index,
+            Body: body,
+          }),
+        );
+        const etag = isRecord(sent) ? sent['ETag'] : undefined;
+        if (typeof etag !== 'string') throw new Error('missing ETag');
+        completed.push({ PartNumber: index, ETag: etag });
+      }
+      await client.send(
+        new sdk.CompleteMultipartUploadCommand({
+          Bucket: this.config.s3.bucket,
+          Key: targetKey,
+          UploadId: uploadId,
+          MultipartUpload: { Parts: completed },
+        }),
+      );
+    } catch (error) {
+      await client
+        .send(
+          new sdk.AbortMultipartUploadCommand({
+            Bucket: this.config.s3.bucket,
+            Key: targetKey,
+            UploadId: uploadId,
+          }),
+        )
+        .catch(() => undefined);
+      throw error;
+    }
+    return { key: targetKey, size };
   }
 
   private getClient(sdk: S3ModuleLike): S3ClientLike {

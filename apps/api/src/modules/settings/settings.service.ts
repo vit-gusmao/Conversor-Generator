@@ -44,12 +44,19 @@ export class SettingsService {
       download: reachable,
       sse: true,
       push_events: true,
+      batch: this.config.batchUploadEnabled,
+      resumable_upload: this.config.batchUploadEnabled,
+      result_compact: this.config.resultCompactEnabled,
+      mcp: this.config.mcpEnabled,
+      full_document: this.config.largeDocumentPipelineEnabled,
       ...(health?.capabilities ?? {}),
     };
 
     return {
       auth_mode: this.config.authMode,
+      // Legacy single-shot limit; the resumable path is described by `upload`.
       max_upload_bytes: this.config.uploadMaxBytes,
+      // No page ceiling in the default flow.
       max_pages: this.config.uploadMaxPages,
       runtime_mode: this.config.runtimeMode,
       ocr_enabled: health?.ocr_enabled ?? false,
@@ -62,6 +69,15 @@ export class SettingsService {
       },
       engine_version: health?.engine_version ?? this.config.engineVersion,
       capabilities,
+      upload: {
+        resumable: this.config.batchUploadEnabled,
+        accepts_multiple: this.config.batchUploadEnabled,
+        part_size_bytes: this.config.uploadPartBytes,
+        max_part_bytes: this.config.uploadPartMaxBytes,
+        max_file_bytes: this.config.maxFileBytes,
+        max_upload_bytes: this.config.uploadMaxBytes,
+        max_files_per_batch: this.config.maxFilesPerBatch,
+      },
     };
   }
 }

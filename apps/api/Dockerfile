@@ -49,6 +49,7 @@ RUN apk add --no-cache openssl libc6-compat \
 
 ENV NODE_ENV=production \
     API_PORT=3000 \
+    API_HOST=0.0.0.0 \
     STORAGE_LOCAL_ROOT=/app/data/storage
 
 COPY --from=build --chown=app:app /app/apps/api/node_modules ./node_modules

@@ -129,6 +129,46 @@ def _pdf_version(data: bytes) -> str | None:
     return match.group(1).decode("ascii") if match else None
 
 
+INSPECT_BYTES = 64 * 1024 * 1024
+_SCAN_CHUNK = 4 * 1024 * 1024
+
+
+def _apply_active_content(inspection: PDFInspection, scan: bytes) -> None:
+    inspection.active_content = {
+        key: any(token in scan for token in tokens) for key, tokens in _DANGEROUS_TOKENS.items()
+    }
+    inspection.has_javascript = inspection.active_content.get("javascript", False)
+    inspection.has_embedded_files = inspection.active_content.get("embedded_files", False)
+    inspection.has_launch_actions = inspection.active_content.get("launch", False)
+    inspection.has_open_action = inspection.active_content.get("open_action", False)
+    inspection.has_xfa = inspection.active_content.get("xfa", False)
+
+
+def _scan_active_content(path) -> dict[str, bool]:
+    """Chunked scan for active content in a large file.
+
+    Uncompressed markers (the common case) are detected exactly. Compressed
+    object streams are not inflated here: the file is never executed, and the
+    result is a warning for the operator, so the bounded scan is preferred over
+    loading a multi-hundred-megabyte document into memory.
+    """
+    found = {key: False for key in _DANGEROUS_TOKENS}
+    carry = b""
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(_SCAN_CHUNK)
+            if not chunk:
+                break
+            window = carry + chunk
+            for key, tokens in _DANGEROUS_TOKENS.items():
+                if found[key]:
+                    continue
+                if any(token in window for token in tokens):
+                    found[key] = True
+            carry = window[-64:]
+    return found
+
+
 def inspect_pdf(data: bytes) -> PDFInspection:
     inspection = PDFInspection(ok=False, is_pdf=sniff_is_pdf(data))
     if not inspection.is_pdf:
@@ -164,6 +204,17 @@ def inspect_pdf(data: bytes) -> PDFInspection:
         inspection.errors.append(f"O PDF não pôde ser aberto: {exc}")
         return inspection
 
+    return _inspect_reader(inspection, reader)
+
+
+
+def _inspect_reader(inspection: PDFInspection, reader) -> PDFInspection:
+    """Everything that needs an open `PdfReader`.
+
+    Shared by the in-memory and path-based entry points so both apply exactly
+    the same encryption, corruption, form and page checks.
+    """
+
     if reader.is_encrypted:
         inspection.encrypted = True
         try:
@@ -194,10 +245,13 @@ def inspect_pdf(data: bytes) -> PDFInspection:
         inspection.errors.append("O PDF não contém páginas.")
         return inspection
 
-    if inspection.page_count > settings.max_pages():
-        inspection.errors.append(
-            f"O documento possui {inspection.page_count} páginas, acima do limite de "
-            f"{settings.max_pages()}."
+    # There is no page ceiling: every page of the document is processed. The
+    # page count is reported so callers can size their own budgets.
+    limit = settings.max_pages()
+    if limit is not None and inspection.page_count > limit:
+        inspection.warnings.append(
+            f"O documento possui {inspection.page_count} páginas; o limite legado de "
+            f"{limit} páginas está configurado, mas não é aplicado ao fluxo incremental."
         )
 
     for index, page in enumerate(reader.pages, start=1):
@@ -254,6 +308,61 @@ def inspect_pdf(data: bytes) -> PDFInspection:
 
     inspection.ok = not inspection.errors
     return inspection
+
+def inspect_pdf_path(path) -> PDFInspection:
+    """Inspects a PDF on disk, without loading huge documents into memory.
+
+    Small files (up to `INSPECT_BYTES`) go through the in-memory path so the
+    full active-content scan, including decompressed streams, is preserved.
+    Larger files stay on disk: pypdf reads lazily and the active-content scan
+    is chunked.
+    """
+    from pathlib import Path
+
+    target = Path(path)
+    size = target.stat().st_size
+    if size <= INSPECT_BYTES:
+        with target.open("rb") as handle:
+            return inspect_pdf(handle.read())
+
+    with target.open("rb") as handle:
+        head = handle.read(1024)
+        handle.seek(max(0, size - 2048))
+        tail = handle.read()
+
+    inspection = PDFInspection(ok=False, is_pdf=sniff_is_pdf(head))
+    if not inspection.is_pdf:
+        inspection.errors.append("O arquivo não possui a assinatura de um PDF válido.")
+        return inspection
+
+    inspection.pdf_version = _pdf_version(head)
+    inspection.truncated = b"%%EOF" not in tail
+    _apply_active_content(inspection, b"")
+    inspection.active_content = _scan_active_content(target)
+    inspection.has_javascript = inspection.active_content.get("javascript", False)
+    inspection.has_embedded_files = inspection.active_content.get("embedded_files", False)
+    inspection.has_launch_actions = inspection.active_content.get("launch", False)
+    inspection.has_open_action = inspection.active_content.get("open_action", False)
+    inspection.has_xfa = inspection.active_content.get("xfa", False)
+
+    if size > settings.max_bytes():
+        inspection.errors.append(
+            f"O arquivo excede o limite de {settings.max_bytes() // (1024 * 1024)} MiB."
+        )
+
+    try:
+        from pypdf import PdfReader
+    except ModuleNotFoundError:  # pragma: no cover - dependency is declared
+        inspection.errors.append("Biblioteca de leitura de PDF indisponível (pypdf).")
+        return inspection
+
+    try:
+        reader = PdfReader(str(target), strict=False)
+    except Exception as exc:  # noqa: BLE001
+        inspection.errors.append(f"O PDF não pôde ser aberto: {exc}")
+        return inspection
+
+    return _inspect_reader(inspection, reader)
 
 
 def _extract_form_fields(reader, fields: dict) -> list[FormField]:

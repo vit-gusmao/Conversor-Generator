@@ -14,8 +14,9 @@ from typing import Any
 from audit.events import EVT_RUN_CANCELLED, AuditRecorder
 from config import settings
 from engine.pipeline import ConversionError, ConversionPipeline, PipelineOptions
+from engine.streaming.source import DocumentSource, head_bytes, sha256_file
 from ingestion.registry import InputProbe, probe_input
-from repositories.conversion_repository import ConversionRepository
+from repositories.conversion_repository import ConversionRepository, RunCancelled
 from storage import get_storage
 from version import ENGINE_VERSION
 
@@ -48,8 +49,14 @@ def execute_run(
     filename: str = "documento.pdf",
     options: dict[str, Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    job_id: int | None = None,
+    fence: int | None = None,
+    resume: bool = False,
 ) -> None:
     repo = ConversionRepository()
+    logger.info(
+        "run %s starting (job=%s fence=%s)", run_id, job_id if job_id is not None else "-", fence if fence is not None else "-"
+    )
     repo.create_run(
         run_id=run_id,
         conversion_id=conversion_id,
@@ -60,8 +67,12 @@ def execute_run(
     work_dir = settings.data_dir / "work"
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    storage = get_storage()
     try:
-        data = get_storage().get_bytes(storage_key)
+        # Materialize the document on disk and work from the path: the whole
+        # file is never held in memory just to start a conversion.
+        pdf_path = storage.materialize(storage_key, work_dir / f"{run_id}.source")
+        size_bytes = pdf_path.stat().st_size
     except Exception as exc:  # noqa: BLE001
         recorder.emit(
             "RUN_FAILED",
@@ -83,8 +94,9 @@ def execute_run(
         return
 
     # Content-based detection, never the file name: a PNG named `.pdf` is an
-    # image, and unknown bytes fail before any pipeline starts.
-    probe = probe_input(data)
+    # image, and unknown bytes fail before any pipeline starts. Only the head
+    # of the file is read here.
+    probe = probe_input(head_bytes(pdf_path, 1024))
     if probe.kind == "unknown":
         repo.finish_run(
             run_id,
@@ -98,9 +110,18 @@ def execute_run(
         _notify_node(run_id, conversion_id, {"status": "failed", "message": "Arquivo inválido"})
         return
     suffix = _suffix_for(probe)
-    pdf_path = work_dir / f"{run_id}{suffix}"
+    if pdf_path.suffix.lower() != suffix:
+        # Keep the parser's extension hint aligned with the real content.
+        renamed = work_dir / f"{run_id}{suffix}"
+        try:
+            pdf_path.replace(renamed)
+        except OSError:
+            import shutil
 
-    pdf_path.write_bytes(data)
+            shutil.copyfile(pdf_path, renamed)
+        pdf_path = renamed
+
+    source = DocumentSource(path=pdf_path, sha256=sha256_file(pdf_path), size_bytes=size_bytes)
     try:
         pipeline_options = _options_from(options, probe)
         pipeline_options.source_name = filename
@@ -125,6 +146,8 @@ def execute_run(
                 sink=repo.progress_sink(run_id),
                 options=pipeline_options,
                 cancel_check=cancel_check,
+                source=source,
+                resume=resume,
             )
         result = pipeline.run()
         repo.persist(result, recorder)
@@ -183,8 +206,11 @@ def execute_run(
         )
         _notify_node(run_id, conversion_id, {"status": "failed", "message": str(exc)})
     finally:
+        # Never delete an object the storage layer owns; only a materialized
+        # copy under `work/` is ours to remove.
         try:
-            pdf_path.unlink(missing_ok=True)
+            if pdf_path.parent == work_dir:
+                pdf_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -214,16 +240,21 @@ def _options_from(raw: dict[str, Any] | None, probe: InputProbe | None = None) -
 
     return PipelineOptions(
         ocr_enabled=ocr_enabled,
-        max_pages=raw.get("max_pages") or settings.max_pages(),
+        max_pages=None,  # no page ceiling: the pipeline processes the whole document
         dpi=dpi,
         target_formats=target,
         text_newline=str(text.get("newline") or raw.get("text_newline") or "lf"),
         page_separator=str(text.get("page_separator") or raw.get("page_separator") or "form_feed"),
+        include_table_text=bool(
+            text.get("include_table_text", raw.get("include_table_text", True))
+        ),
         csv_profile=str(csv_options.get("profile") or raw.get("csv_profile") or "interoperable"),
+        csv_delimiter=csv_options.get("delimiter") or raw.get("csv_delimiter"),
         csv_table_ids=csv_options.get("table_ids") or raw.get("csv_table_ids"),
         csv_formula_policy=str(
             csv_options.get("formula_policy") or raw.get("csv_formula_policy") or "safe"
         ),
+        csv_value_mode=str(csv_options.get("value_mode") or raw.get("csv_value_mode") or "original"),
     )
 
 

@@ -13,14 +13,48 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 export interface ApiSection {
   port: number;
+  /** Interface the HTTP server binds to. Loopback unless overridden (containers use 0.0.0.0). */
+  host: string;
   databaseUrl: string;
   jwtSecret: string;
   jwtExpiresIn: string;
   authMode: AuthMode;
+  /** Limit of the legacy single-shot multipart endpoint, in bytes. */
   uploadMaxBytes: number;
-  uploadMaxPages: number;
+  /**
+   * @deprecated No page ceiling exists in the default flow. Only set this to
+   * a number to keep an operator-imposed cap on the *legacy* endpoint; `null`
+   * means documents are processed in full.
+   */
+  uploadMaxPages: number | null;
   allowedOrigins: string[];
   publicApiUrl: string;
+}
+
+/** Resumable upload / batch feature settings. */
+export interface UploadSection {
+  /** Default part size. A transport parameter, not a document ceiling. */
+  partBytes: number;
+  /** Largest accepted single part. */
+  partMaxBytes: number;
+  /** Client-side parallelism the server advertises. */
+  concurrency: number;
+  /** `null` means "no product ceiling on files per batch". */
+  maxFilesPerBatch: number | null;
+  /** `null` means "no product ceiling on document bytes" for the new path. */
+  maxFileBytes: number | null;
+  /** How long an incomplete session stays resumable. */
+  sessionTtlHours: number;
+  /** Reject a new session when a single document would exceed this. */
+  maxDocumentBytes: number | null;
+}
+
+/** Rollout flags. Disabling admission never interrupts runs already started. */
+export interface FeatureSection {
+  batchUpload: boolean;
+  largeDocumentPipeline: boolean;
+  resultCompact: boolean;
+  mcp: boolean;
 }
 
 export interface ConverterSection {
@@ -58,10 +92,13 @@ export interface AppConfiguration {
   engineVersion: string;
   logLevel: LogLevel;
   api: ApiSection;
+  upload: UploadSection;
+  features: FeatureSection;
   converter: ConverterSection;
   storage: StorageSection;
   retention: RetentionSection;
 }
+
 
 function env(name: string): string | undefined {
   const value = process.env[name];
@@ -81,6 +118,19 @@ export function readOptionalString(name: string): string | null {
 export function readInt(name: string, fallback: number, min = 0): number {
   const raw = env(name);
   if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < min) return fallback;
+  return parsed;
+}
+
+/**
+ * Reads an optional integer. Explicitly setting the variable to `0`, `null`,
+ * `none` or an empty value means "no limit" and returns `null`.
+ */
+export function readOptionalInt(name: string, fallback: number | null = null, min = 0): number | null {
+  const raw = env(name)?.toLowerCase();
+  if (raw === undefined) return fallback;
+  if (raw === '0' || raw === 'null' || raw === 'none' || raw === 'off') return null;
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed < min) return fallback;
   return parsed;
@@ -121,23 +171,43 @@ export function configuration(): AppConfiguration {
   const storageBackend = readEnum<StorageBackend>('STORAGE_BACKEND', ['local', 's3'], 'local');
   const logLevel = readEnum<LogLevel>('LOG_LEVEL', ['debug', 'info', 'warn', 'error'], 'info');
 
+  const partBytes = readInt('UPLOAD_PART_BYTES', 8 * 1024 * 1024, 64 * 1024);
+  const partMaxBytes = Math.max(partBytes, readInt('UPLOAD_PART_MAX_BYTES', 32 * 1024 * 1024, 64 * 1024));
+
   return {
     runtimeMode,
     engineVersion: readString('ENGINE_VERSION', '1.0.0'),
     logLevel,
     api: {
       port: readInt('API_PORT', 3000, 1),
+      host: readString('API_HOST', '127.0.0.1'),
       databaseUrl: readString('API_DATABASE_URL', 'file:./data/api.db'),
       jwtSecret: readString('JWT_SECRET', 'dev-only-insecure-secret-change-me'),
       jwtExpiresIn: readString('JWT_EXPIRES_IN', '7d'),
       authMode,
       uploadMaxBytes: readInt('UPLOAD_MAX_BYTES', 52428800, 1),
-      uploadMaxPages: readInt('UPLOAD_MAX_PAGES', 500, 1),
+      // `null` by default: full-document processing is the product behaviour.
+      uploadMaxPages: readOptionalInt('UPLOAD_MAX_PAGES', null, 1),
       allowedOrigins: readList('ALLOWED_ORIGINS', [
         'http://localhost:5173',
         'http://localhost:3000',
       ]),
       publicApiUrl: readString('PUBLIC_API_URL', 'http://localhost:3000'),
+    },
+    upload: {
+      partBytes,
+      partMaxBytes,
+      concurrency: readInt('UPLOAD_CONCURRENCY', 3, 1),
+      maxFilesPerBatch: readOptionalInt('MAX_FILES_PER_BATCH', null, 1),
+      maxFileBytes: readOptionalInt('UPLOAD_MAX_FILE_BYTES', null, 1),
+      sessionTtlHours: readInt('UPLOAD_SESSION_TTL_HOURS', 24, 1),
+      maxDocumentBytes: readOptionalInt('UPLOAD_MAX_DOCUMENT_BYTES', null, 1),
+    },
+    features: {
+      batchUpload: readBool('BATCH_UPLOAD_ENABLED', true),
+      largeDocumentPipeline: readBool('LARGE_DOCUMENT_PIPELINE_ENABLED', true),
+      resultCompact: readBool('RESULT_COMPACT_ENABLED', true),
+      mcp: readBool('MCP_ENABLED', true),
     },
     converter: {
       internalUrl: readString('CONVERTER_INTERNAL_URL', 'http://localhost:8000'),

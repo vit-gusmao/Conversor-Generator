@@ -289,15 +289,24 @@ def test_audit_summary_is_reproducible(pdf_paths, run_pdf):
     assert result.summary["metrics"]["cells_generated"] == result.stats["cells"]
 
 
-@pytest.mark.skipif(
-    not __import__("engine.ocr.engines", fromlist=["GlmOcrEngine"]).GlmOcrEngine.available(),
-    reason="GLM-OCR (Ollama + glm-ocr:latest) não disponível neste ambiente",
-)
 def test_scanned_page_is_recovered_by_glm_ocr(pdf_paths, run_pdf):
-    """With GLM-OCR installed, a text-less page is recovered instead of failing."""
+    """With GLM-OCR installed, a text-less page is recovered instead of failing.
+
+    The availability probe is cached for a minute and other tests exercise it
+    with fakes, so the guard is evaluated here (cache cleared) rather than at
+    collection time. A live model that disappears mid-suite must skip, not fail
+    as if the engine were broken.
+    """
+    from engine.ocr import glmocr
+    from engine.ocr.engines import GlmOcrEngine
+
+    glmocr._probe_cache.clear()
+    if not GlmOcrEngine.available():
+        pytest.skip("GLM-OCR (Ollama + glm-ocr:latest) não disponível neste ambiente")
+
     result, recorder = run_pdf("scanned_page", ocr=True)
 
-    assert result.status in {"completed", "completed_with_warnings"}
+    assert result.status in {"completed", "completed_with_warnings"}, result.error
     assert result.quality != "failed"
     # text really came from the recognizer, not from a nonexistent text layer
     pages = {page.page_number: page for page in result.ir.pages}

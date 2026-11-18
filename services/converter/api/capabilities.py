@@ -21,11 +21,22 @@ def capabilities_payload() -> dict[str, Any]:
             "engines": capability.get("engines"),
         },
         "limits": {
+            # Legacy single-shot body limit. The resumable path has no
+            # product ceiling on document bytes; `upload` describes it.
             "max_bytes": settings.max_bytes(),
+            # `null`: the whole document is processed.
             "max_pages": settings.max_pages(),
             "max_image_frames": settings.converter_max_image_frames,
             "max_image_megapixels": settings.converter_max_image_megapixels,
             "max_job_megapixels": settings.converter_max_job_megapixels,
+        },
+        "upload": {
+            "resumable": settings.batch_upload_enabled,
+            "accepts_multiple": settings.batch_upload_enabled,
+            "part_size_bytes": settings.upload_part_bytes,
+            "max_part_bytes": settings.upload_part_bytes,
+            "max_file_bytes": None,
+            "max_files_per_batch": settings.max_files_per_batch,
         },
         "assistant": {
             "enabled": settings.assistant_enabled,

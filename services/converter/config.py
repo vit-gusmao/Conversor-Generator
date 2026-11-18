@@ -57,13 +57,18 @@ class Settings(BaseSettings):
     # -- queue -------------------------------------------------------------
     converter_queue: str = Field(default="inline", alias="CONVERTER_QUEUE")
     converter_workers: int = Field(default=2, alias="CONVERTER_WORKERS")
+    #: Whole-document wall-clock limit. 0 disables it: a document is no longer
+    #: bounded by time, only each OCR call and each unit have their own timeout.
     converter_task_timeout_seconds: int = Field(
-        default=600, alias="CONVERTER_TASK_TIMEOUT_SECONDS"
+        default=0, alias="CONVERTER_TASK_TIMEOUT_SECONDS"
     )
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
 
     # -- limits ------------------------------------------------------------
-    converter_max_pages: int = Field(default=500, alias="CONVERTER_MAX_PAGES")
+    #: Deprecated page ceiling. `None` (the default) means the whole document
+    #: is processed. A positive value is *not* applied while the full-document
+    #: pipeline is enabled; it is only honoured as a legacy compatibility cap.
+    converter_max_pages: int | None = Field(default=None, alias="CONVERTER_MAX_PAGES")
     converter_max_pdf_bytes: int = Field(
         default=52_428_800, alias="CONVERTER_MAX_PDF_BYTES"
     )
@@ -79,12 +84,33 @@ class Settings(BaseSettings):
         default=2, alias="CONVERTER_MAX_FALLBACK_ATTEMPTS"
     )
     # -- generalized ingestion --------------------------------------------
+    #: Frame/pixel budgets are resource guards, not page-count ceilings.
     converter_max_image_frames: int = Field(default=500, alias="CONVERTER_MAX_IMAGE_FRAMES")
     converter_max_image_megapixels: float = Field(
         default=40.0, alias="CONVERTER_MAX_IMAGE_MEGAPIXELS"
     )
     converter_max_job_megapixels: float = Field(
         default=200.0, alias="CONVERTER_MAX_JOB_MEGAPIXELS"
+    )
+
+    # -- large documents / batches -----------------------------------------
+    #: Master switch for incremental full-document processing.
+    large_document_pipeline_enabled: bool = Field(
+        default=True, alias="LARGE_DOCUMENT_PIPELINE_ENABLED"
+    )
+    batch_upload_enabled: bool = Field(default=True, alias="BATCH_UPLOAD_ENABLED")
+    #: `None` means "no product ceiling on files per batch".
+    max_files_per_batch: int | None = Field(default=None, alias="MAX_FILES_PER_BATCH")
+    upload_part_bytes: int = Field(default=8_388_608, alias="UPLOAD_PART_BYTES")
+    upload_concurrency: int = Field(default=3, alias="UPLOAD_CONCURRENCY")
+    upload_session_ttl_hours: int = Field(default=24, alias="UPLOAD_SESSION_TTL_HOURS")
+    #: Reuse per-page checkpoints when the same run is re-executed after a crash.
+    checkpoint_reuse_enabled: bool = Field(default=True, alias="CHECKPOINT_REUSE_ENABLED")
+    #: Pages processed per checkpoint window. Affects fairness/latency only.
+    converter_page_window: int = Field(default=25, alias="CONVERTER_PAGE_WINDOW")
+    #: Timeout of one OCR call, in seconds (a unit, not the whole document).
+    converter_ocr_call_timeout_seconds: int = Field(
+        default=300, alias="CONVERTER_OCR_CALL_TIMEOUT_SECONDS"
     )
     converter_target_formats: str = Field(
         default="xlsx,txt,csv", alias="CONVERTER_TARGET_FORMATS"
@@ -146,7 +172,8 @@ class Settings(BaseSettings):
         default=None, alias="CONVERTER_CALLBACK_URL"
     )
     upload_max_bytes: int = Field(default=52_428_800, alias="UPLOAD_MAX_BYTES")
-    upload_max_pages: int = Field(default=500, alias="UPLOAD_MAX_PAGES")
+    #: Deprecated page ceiling (see `converter_max_pages`).
+    upload_max_pages: int | None = Field(default=None, alias="UPLOAD_MAX_PAGES")
 
     @field_validator("runtime_mode")
     @classmethod
@@ -217,8 +244,28 @@ class Settings(BaseSettings):
             p = SERVICE_DIR / p
         return p
 
-    def max_pages(self) -> int:
-        return min(self.converter_max_pages, self.upload_max_pages)
+    def max_pages(self) -> int | None:
+        """Effective page ceiling, or `None` for "process everything".
+
+        The full-document pipeline never truncates. A positive value in the
+        environment is kept only so an operator that explicitly disables the
+        new pipeline keeps the old behaviour; it also produces a deprecation
+        warning (see `deprecated_page_limits`).
+        """
+        if self.large_document_pipeline_enabled:
+            return None
+        configured = [v for v in (self.converter_max_pages, self.upload_max_pages) if v]
+        return min(configured) if configured else None
+
+    @property
+    def deprecated_page_limits(self) -> dict[str, int]:
+        """Configured page ceilings that no longer apply to the default flow."""
+        found: dict[str, int] = {}
+        if self.converter_max_pages:
+            found["CONVERTER_MAX_PAGES"] = int(self.converter_max_pages)
+        if self.upload_max_pages:
+            found["UPLOAD_MAX_PAGES"] = int(self.upload_max_pages)
+        return found
 
     def max_bytes(self) -> int:
         return min(self.converter_max_pdf_bytes, self.upload_max_bytes)

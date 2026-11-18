@@ -21,9 +21,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from api.batch_routes import router as batch_router
 from api.internal_routes import router as internal_router
 from api.knowledge_routes import router as knowledge_router
 from api.public_routes import router as public_router
+from api.upload_routes import router as upload_router
 from config import SERVICE_DIR, settings
 from logging_setup import configure_logging
 from models.db import init_db
@@ -72,6 +74,9 @@ def create_app() -> FastAPI:
             "recuperado recebe um destino auditável."
         ),
         lifespan=lifespan,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
     )
 
     app.add_middleware(
@@ -80,17 +85,25 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Device-Id", "Content-Disposition", "Last-Event-ID"],
+        expose_headers=[
+            "X-Device-Id",
+            "Content-Disposition",
+            "Last-Event-ID",
+            "Retry-After",
+            "X-Request-ID",
+        ],
     )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException):  # noqa: ANN001
         detail = exc.detail
+        headers = getattr(exc, "headers", None)
         if isinstance(detail, dict) and "error" in detail:
-            return JSONResponse(content=detail, status_code=exc.status_code)
+            return JSONResponse(content=detail, status_code=exc.status_code, headers=headers)
         return JSONResponse(
             content={"error": {"code": "HTTP_ERROR", "message": str(detail), "details": {}}},
             status_code=exc.status_code,
+            headers=headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -120,9 +133,11 @@ def create_app() -> FastAPI:
             },
         )
 
-    app.include_router(internal_router)
     app.include_router(public_router)
+    app.include_router(batch_router)
+    app.include_router(upload_router)
     app.include_router(knowledge_router)
+    app.include_router(internal_router)
 
     @app.get("/health", tags=["system"], include_in_schema=False)
     def root_health():
@@ -135,8 +150,8 @@ def create_app() -> FastAPI:
         return {
             "service": "pdf2x-converter",
             "version": ENGINE_VERSION,
-            "docs": "/docs",
             "api": "/api/v1",
+            "docs": "/docs",
         }
 
     if (WEB_DIST / "index.html").exists():

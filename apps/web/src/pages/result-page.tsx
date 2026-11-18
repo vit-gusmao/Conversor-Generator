@@ -1,94 +1,95 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import {
-  ArrowRight,
-  Download,
-  FileSpreadsheet,
-  LayoutGrid,
-  Loader2,
-  Rows3,
-  ShieldCheck,
-  Table2,
-  TriangleAlert,
-} from 'lucide-react';
+import { ArrowRight, ShieldCheck } from 'lucide-react';
+
+import { Alert } from '@/components/ui/alert';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Alert } from '@/components/ui/alert';
-import { Separator } from '@/components/ui/separator';
 import { PageHeader } from '@/components/layout/page-header';
 import { EmptyBlock, ErrorBlock, LoadingBlock } from '@/components/layout/states';
-import { StatCard } from '@/components/stat-card';
-import { QualityBadge, SeverityBadge, StatusBadge } from '@/components/status-badge';
+import { QualityBadge, StatusBadge } from '@/components/status-badge';
 import { SheetPreview } from '@/components/sheet-preview';
-import { ExportsPanel } from '@/components/exports-panel';
-import { useConversion, useDownloadExcel, useResult } from '@/hooks/use-conversions';
+import { SheetSelector } from '@/components/sheet-selector';
+import { ResultActions } from '@/components/result-actions';
+import { ResultSummaryLine } from '@/components/result-summary';
+import { useConversion } from '@/hooks/use-conversions';
+import { useResultOverview, useSheets } from '@/hooks/use-results';
 import { useEnsureSession } from '@/hooks/use-session';
 import { explainError } from '@/lib/errors';
-import { basename, formatBytes, formatNumber } from '@/lib/format';
-import { SHEET_KIND_LABELS } from '@/lib/labels';
-import { isSuccessful } from '@/lib/status';
-import { downloadBlob } from '@/lib/download';
-import { cn } from '@/lib/utils';
-import { toast } from '@/stores/ui';
+import { formatBytes } from '@/lib/format';
 
+/**
+ * Minimalist result screen: name, status, actions and ONE preview.
+ *
+ * Everything technical (hashes, engines, per-stage counts) lives behind
+ * "Detalhes", and the audit trail keeps its own route. Nothing is removed from
+ * the generated workbook: the screen only stops showing it all at once.
+ */
 export function ResultPage() {
   const { id = '' } = useParams<{ id: string }>();
   useEnsureSession();
+
   const conversionQuery = useConversion(id);
-  const resultQuery = useResult(id);
-  const download = useDownloadExcel();
+  const overviewQuery = useResultOverview(id);
   const [activeSheet, setActiveSheet] = useState<string | null>(null);
 
-  const result = resultQuery.data;
+  const overview = overviewQuery.data;
   const conversion = conversionQuery.data;
+  const sheetsQuery = useSheets(id, { limit: 50 });
+  const sheets = sheetsQuery.data?.items ?? [];
+  // `SheetPreview` only needs name/kind/rows/columns to draw its caption; the
+  // page list lives behind the paginated provenance endpoint.
+  const previewSheets = sheets.map((sheet) => ({
+    name: sheet.name,
+    kind: sheet.kind,
+    rows: sheet.rows,
+    columns: sheet.columns,
+    source_pages: [] as number[],
+    table_id: sheet.table_id,
+  }));
 
+  // The default sheet comes from the server; a stale selection (after a retry)
+  // falls back to it instead of showing an empty table.
   useEffect(() => {
-    if (result && result.sheets.length > 0 && !activeSheet) {
-      setActiveSheet(result.sheets[0]?.name ?? null);
-    }
-  }, [result, activeSheet]);
-
-  useEffect(() => {
-    if (!result) return;
-    if (!result.sheets.some((sheet) => sheet.name === activeSheet)) {
-      setActiveSheet(result.sheets[0]?.name ?? null);
-    }
-  }, [result, activeSheet]);
+    if (!overview) return;
+    const stale =
+      activeSheet !== null &&
+      sheets.length > 0 &&
+      !sheets.some((sheet) => sheet.name === activeSheet);
+    if (activeSheet === null || stale) setActiveSheet(overview.default_sheet);
+  }, [overview, sheets, activeSheet]);
 
   if (!id) {
-    return <ErrorBlock title="Resultado inválido" message="O identificador da conversão não foi informado." />;
-  }
-
-  if (conversionQuery.isPending || (resultQuery.isPending && conversionQuery.data?.status !== 'failed')) {
     return (
-      <div className="space-y-4">
-        <LoadingBlock label="Carregando resultado" />
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {[0, 1, 2, 3].map((item) => (
-            <div key={item} className="h-24 animate-pulse rounded-[var(--radius-card)] border border-border bg-surface/50" />
-          ))}
-        </div>
-      </div>
+      <ErrorBlock title="Resultado inválido" message="O identificador da conversão não foi informado." />
     );
   }
 
   const failed =
     conversion?.status === 'failed' ||
     conversion?.status === 'cancelled' ||
-    (!result && resultQuery.isError);
+    overview?.status === 'failed' ||
+    overview?.status === 'cancelled';
 
-  if (failed && !result) {
+  if (overviewQuery.isPending) {
+    return <LoadingBlock label="Carregando resultado" />;
+  }
+
+  if (failed && !overview) {
     return (
       <div className="space-y-4">
         <PageHeader
           backTo={{ to: `/conversions/${id}`, label: 'Processamento' }}
           eyebrow="Resultado"
-          title="Esta conversão não gerou um Excel"
+          title="Esta conversão não gerou um arquivo"
           description={conversion?.document.filename}
         />
-        <Alert variant="error" title={conversion?.error ? `Código: ${conversion.error.code}` : 'Falha no processamento'}>
-          {conversion?.error?.message ?? explainError(resultQuery.error)}
+        <Alert
+          variant="error"
+          title={conversion?.error ? `Código: ${conversion.error.code}` : 'Falha no processamento'}
+        >
+          {conversion?.error?.message ?? explainError(overviewQuery.error)}
         </Alert>
         {conversion?.status === 'cancelled' ? (
           <Alert variant="warning">A conversão foi cancelada antes da geração do arquivo.</Alert>
@@ -106,21 +107,18 @@ export function ResultPage() {
               Abrir processamento
             </Link>
           </Button>
-          <Button asChild variant="ghost">
-            <Link to="/history">Histórico</Link>
-          </Button>
         </div>
       </div>
     );
   }
 
-  if (resultQuery.isError || !result) {
+  if (overviewQuery.isError || !overview) {
     return (
       <div className="space-y-4">
         <ErrorBlock
           title="Não foi possível carregar o resultado"
-          message={explainError(resultQuery.error)}
-          onRetry={() => void resultQuery.refetch()}
+          message={explainError(overviewQuery.error)}
+          onRetry={() => void overviewQuery.refetch()}
         />
         <p className="text-xs text-muted-2">
           Se a conversão ainda estiver em andamento, acompanhe em{' '}
@@ -137,190 +135,124 @@ export function ResultPage() {
     );
   }
 
-  const quality = result.quality;
-  const success = isSuccessful(result.status);
-  const warnings = result.warnings ?? [];
-  const highlighted = warnings.slice(0, 4);
-
-  function handleDownload() {
-    download.mutate(id, {
-      onSuccess: (blob) => {
-        const name = conversion?.document.filename ?? 'conversao.pdf';
-        downloadBlob(blob, `${basename(name)}.xlsx`);
-        toast({ title: 'Download iniciado', description: 'O arquivo .xlsx foi gerado pela API.', variant: 'success' });
-      },
-      onError: (cause) => {
-        toast({ title: 'Falha no download', description: explainError(cause), variant: 'error' });
-      },
-    });
-  }
+  const filename = conversion?.document.filename ?? 'documento.pdf';
+  const quarantined = overview.publication_status === 'quarantined';
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <PageHeader
-        backTo={{ to: `/conversions/${id}`, label: 'Processamento' }}
+        backTo={{ to: `/conversions/${id}`, label: 'Voltar' }}
         eyebrow="Resultado"
-        title={success ? 'Conversão concluída' : 'Resultado parcial'}
+        title={filename}
         description={
           <span className="flex flex-wrap items-center gap-2">
-            <span>{conversion?.document.filename ?? 'documento.pdf'}</span>
+            <StatusBadge status={overview.status} />
+            <QualityBadge quality={overview.quality} />
             {conversion ? (
-              <>
-                <span className="text-muted-2">· {formatBytes(conversion.document.size_bytes)}</span>
-                <QualityBadge quality={quality} />
-                <StatusBadge status={result.status} />
-              </>
+              <span className="text-muted-2">{formatBytes(conversion.document.size_bytes)}</span>
             ) : null}
+            {overview.partial ? <Badge variant="warning">Resultado parcial</Badge> : null}
           </span>
         }
-        actions={
-          <>
-            <Button onClick={handleDownload} disabled={download.isPending}>
-              {download.isPending ? (
-                <Loader2 className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
-              ) : (
-                <Download aria-hidden="true" />
-              )}
-              {download.isPending ? 'Preparando…' : 'Baixar Excel'}
-            </Button>
-            <Button asChild variant="secondary">
-              <Link to={`/conversions/${id}/audit`}>
-                <ShieldCheck aria-hidden="true" />
-                Ver Auditoria
-              </Link>
-            </Button>
-            <Button asChild variant="outline">
-              <Link to="/assistant">
-                Perguntar sobre este documento
-              </Link>
-            </Button>
-          </>
-        }
+        actions={<ResultActions conversionId={id} overview={overview} filename={filename} />}
       />
 
-      <ExportsPanel conversionId={id} hasTables={(result.tables ?? 0) > 0} />
-
-      {quality === 'partial' ? (
-        <Alert variant="warning" title="Conversão concluída com avisos">
-          {warnings.length > 0
-            ? `${warnings.length} inconsistência(s) foram registradas. Revise a auditoria antes de usar os dados.`
-            : 'Alguns elementos do PDF não puderam ser interpretados com confiança.'}{' '}
-          <Link className="font-medium underline" to={`/conversions/${id}/audit?tab=issues`}>
-            Ver inconsistências
+      {quarantined ? (
+        <Alert variant="error" title="Artefato em quarentena">
+          A auditoria final reprovou o arquivo gerado, então o download está bloqueado. O
+          diagnóstico continua acessível.{' '}
+          <Link className="font-medium underline" to={`/conversions/${id}/audit`}>
+            Abrir auditoria
           </Link>
         </Alert>
       ) : null}
 
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <StatCard label="Páginas" value={formatNumber(result.pages)} icon={<LayoutGrid className="size-4" aria-hidden="true" />} />
-        <StatCard label="Tabelas" value={formatNumber(result.tables)} icon={<Table2 className="size-4" aria-hidden="true" />} />
-        <StatCard label="Células" value={formatNumber(result.cells)} icon={<FileSpreadsheet className="size-4" aria-hidden="true" />} />
-        <StatCard label="Registros" value={formatNumber(result.records)} icon={<Rows3 className="size-4" aria-hidden="true" />} />
-      </div>
+      {overview.partial && !quarantined ? (
+        <Alert variant="warning" title="Resultado incompleto">
+          {overview.pages_failed > 0
+            ? `${overview.pages_failed} de ${overview.pages_total} página(s) não puderam ser processadas. O arquivo contém apenas o conteúdo recuperado.`
+            : 'Alguns elementos do documento não puderam ser interpretados com confiança.'}{' '}
+          <Link className="font-medium underline" to={`/conversions/${id}/audit?tab=pages`}>
+            Ver páginas
+          </Link>
+        </Alert>
+      ) : null}
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)]">
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle>Abas geradas</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2 pt-0">
-            {result.sheets.length === 0 ? (
-              <EmptyBlock title="Nenhuma aba" description="O arquivo gerado não possui abas." />
-            ) : (
-              <ul className="space-y-1.5">
-                {result.sheets.map((sheet) => (
-                  <li key={sheet.name}>
-                    <button
-                      type="button"
-                      onClick={() => setActiveSheet(sheet.name)}
-                      aria-pressed={activeSheet === sheet.name}
-                      className={cn(
-                        'flex w-full flex-col gap-1 rounded-xl border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
-                        activeSheet === sheet.name
-                          ? 'border-accent/40 bg-accent-soft/30'
-                          : 'border-border bg-surface-2/40 hover:border-border-strong hover:bg-surface-2/70',
-                      )}
-                    >
-                      <span className="flex items-center justify-between gap-2">
-                        <span className="truncate text-sm font-medium text-foreground">{sheet.name}</span>
-                        <Badge variant="outline">{SHEET_KIND_LABELS[sheet.kind] ?? sheet.kind}</Badge>
-                      </span>
-                      <span className="text-[11px] text-muted-2">
-                        {formatNumber(sheet.rows)} linhas × {formatNumber(sheet.columns)} colunas · páginas{' '}
-                        {sheet.source_pages.join(', ') || '—'}
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <Separator className="my-3" />
-            <p className="text-[11px] text-muted-2">
-              {formatNumber(result.fields)} campos identificados em {formatNumber(result.sheets_count)} abas.
-            </p>
-          </CardContent>
-        </Card>
+      <ResultSummaryLine conversionId={id} overview={overview} />
 
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <CardTitle>Prévia da aba</CardTitle>
-              <span className="text-xs text-muted-2">100 linhas por página</span>
-            </div>
-          </CardHeader>
-          <CardContent className="pt-0">
+      <Card>
+        <CardHeader className="space-y-3 pb-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle>Prévia</CardTitle>
+            {overview.counts.sheets > 0 ? (
+              <span className="text-xs text-muted-2">{overview.counts.sheets} aba(s) no arquivo</span>
+            ) : null}
+          </div>
+          {overview.counts.sheets > 0 ? (
+            <SheetSelector conversionId={id} value={activeSheet} onChange={setActiveSheet} />
+          ) : null}
+        </CardHeader>
+        <CardContent className="pt-0">
+          {overview.counts.sheets === 0 ? (
+            <EmptyBlock
+              title="Sem tabela para prévia"
+              description="Este documento foi entregue apenas como texto; abra o arquivo TXT."
+            />
+          ) : (
             <SheetPreview
               conversionId={id}
               sheet={activeSheet}
-              sheets={result.sheets}
-              onSheetChange={setActiveSheet}
+              sheets={previewSheets}
+              // The selector above is the only sheet control on this page.
+              showSheetNavigation={false}
+              runId={overview.run_id}
             />
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <CardTitle className="flex items-center gap-2">
-              <TriangleAlert className="size-4 text-warning" aria-hidden="true" />
-              Principais avisos
-            </CardTitle>
-            <Link
-              to={`/conversions/${id}/audit?tab=issues`}
-              className="text-xs font-medium text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              Abrir inconsistências na auditoria
-            </Link>
-          </div>
-        </CardHeader>
-        <CardContent className="pt-0">
-          {highlighted.length === 0 ? (
-            <p className="text-sm text-muted">Nenhum aviso registrado nesta conversão.</p>
-          ) : (
-            <ul className="space-y-2">
-              {highlighted.map((issue) => (
-                <li
-                  key={issue.issue_id}
-                  className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface-2/40 px-3 py-2.5"
-                >
-                  <SeverityBadge severity={issue.severity} />
-                  <span className="font-mono text-[11px] text-muted-2">{issue.code}</span>
-                  <span className="min-w-0 flex-1 text-sm text-foreground/85">{issue.message}</span>
-                  {issue.page_number !== null ? (
-                    <Link
-                      className="text-xs text-accent hover:underline"
-                      to={`/conversions/${id}/audit?tab=pages&page=${issue.page_number}`}
-                    >
-                      Página {issue.page_number}
-                    </Link>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
           )}
         </CardContent>
       </Card>
+
+      <details className="rounded-[var(--radius-card)] border border-border bg-surface/50">
+        <summary className="cursor-pointer list-none px-4 py-3 text-sm font-medium text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
+          Detalhes do documento
+        </summary>
+        <div className="space-y-3 border-t border-border px-4 py-3 text-xs text-muted">
+          <dl className="grid gap-x-6 gap-y-1.5 sm:grid-cols-2">
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-2">Execução</dt>
+              <dd className="truncate font-mono text-foreground/80">{overview.run_id}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-2">Publicação</dt>
+              <dd>{overview.publication_status}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-2">Campos</dt>
+              <dd>{overview.counts.fields}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-2">Avisos</dt>
+              <dd>
+                {overview.warning_counts.total} ({overview.warning_counts.error} erro(s))
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-2">Formatos</dt>
+              <dd>{overview.available_formats.join(', ') || '—'}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-2">Aba inicial</dt>
+              <dd className="truncate">{overview.default_sheet ?? '—'}</dd>
+            </div>
+          </dl>
+          <p className="text-[11px] text-muted-2">
+            Hashes, evidências por célula, motores e tempos por etapa ficam na{' '}
+            <Link className="text-accent hover:underline" to={`/conversions/${id}/audit`}>
+              auditoria
+            </Link>
+            .
+          </p>
+        </div>
+      </details>
     </div>
   );
 }
