@@ -122,6 +122,63 @@ def validate_source(
     }
 
 
+@router.post("/sources/{source_id}/imports", status_code=202)
+def start_import(
+    source_id: str,
+    payload: dict[str, Any] = Body(default={}),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    if not idempotency_key or len(idempotency_key) > 128:
+        raise ApiError(
+            400,
+            "INVALID_PAYLOAD",
+            "O header Idempotency-Key é obrigatório (1–128 caracteres).",
+        )
+    from sources.importer import ImportService
+
+    service = ImportService()
+    record = service.start(
+        owner_id=user["id"],
+        source_id=source_id,
+        request=payload,
+        idempotency_key=idempotency_key,
+    )
+    service.run_async(record["id"], user["id"])
+    return record
+
+
+@router.get("/imports/{import_id}")
+def get_import(
+    import_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    from sources.importer import ImportService
+
+    return ImportService().get(import_id, user["id"])
+
+
+@router.get("/imports/{import_id}/items")
+def list_import_items(
+    import_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    from sources.importer import ImportService
+
+    items = ImportService().items(import_id, user["id"])
+    return {"items": items, "next_cursor": None}
+
+
+@router.post("/imports/{import_id}/cancel", status_code=202)
+def cancel_import(
+    import_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    from sources.importer import ImportService
+
+    return ImportService().cancel(import_id, user["id"])
+
+
 # --------------------------------------------------------------------------
 # Internal: root grants (operator token / desktop host credential only)
 # --------------------------------------------------------------------------

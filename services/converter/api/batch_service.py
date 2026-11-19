@@ -465,6 +465,7 @@ class BatchService:
         filename: str,
         size_bytes: int,
         options: dict[str, Any] | None,
+        allow_stamped: bool = False,
     ) -> dict[str, Any]:
         client_key = (client_item_id or "").strip()
         if not client_key or len(client_key) > 128:
@@ -490,9 +491,9 @@ class BatchService:
             raise ApiError(
                 400,
                 "INVALID_FILE",
-                "Envie um PDF ou uma imagem (PNG, JPEG, TIFF, GIF, BMP, WebP…).",
+                "Envie um PDF, uma imagem (PNG, JPEG, TIFF, GIF, BMP, WebP…) ou uma planilha (.xlsx/.csv).",
             )
-        normalized = _normalize_options(options, kind)
+        normalized = _normalize_options(options, kind, allow_stamped=allow_stamped)
         fingerprint = item_fingerprint(normalized, safe_name, size)
 
         session = get_session_factory()()
