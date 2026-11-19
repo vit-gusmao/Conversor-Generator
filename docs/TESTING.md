@@ -347,3 +347,33 @@ os números com OCR vêm apenas da amostra estratificada acima.
 - O resultado com OCR vem de **amostra**, não do corpus inteiro.
 - Os números dependem do corpus local, que não é versionado: reproduzir a
   medição exige o mesmo corpus.
+
+## Upgrade de fontes/planilhas/agendador/desktop
+
+### Suítes determinísticas (CI)
+
+| Suíte | Comando | Cobre |
+| --- | --- | --- |
+| Python | `.venv/Scripts/python.exe -m pytest tests -q` | contratos v3, migrações, leitores XLSX/CSV, fontes/snapshots, importador, calendário/claims, executor, indexação durável, diagnóstico de modelos |
+| API (Jest) | `npm --prefix apps/api test` | opções/fingerprints, validação de arquivo, paridade de contrato |
+| API (e2e) | `npm --prefix apps/api run test:e2e` | RAG Prisma→run autorizado, submissão interna idempotente |
+| Web (Vitest) | `npm --prefix apps/web test` | telas de Fontes/Agendamentos, validação de upload, upload queue |
+| Desktop (Vitest) | `npm --prefix apps/desktop test` | supervisor, perfil atômico, IPC, gerenciador de modelos |
+
+### Testes de integração e manuais
+
+- `scripts/smoke-upgrade.ps1` sobe o backend real (entry point congelável) em um
+  `APP_DATA_DIR` temporário e exercita: readiness, health, SPA na raiz,
+  capabilities, sessão, concessão de raiz, validação, importação e agendamento.
+  Resultado medido nesta máquina: readiness em ~1,6 s; importação `completed`
+  com 1 arquivo; `run-now` terminando em `no_changes` (dedup correto).
+- Empacotamento Windows real e instalação em máquina limpa: workflow
+  `.github/workflows/desktop.yml` (executa PyInstaller, smoke do binário
+  congelado, electron-builder e verifica `conversor-generator.exe`).
+
+### O que NÃO é coberto por automação aqui
+
+- Instalação em Windows limpo sem Node/Python/Docker.
+- OCR/LLM com GPU real (depende de hardware; `GLMOCR_*`/`ASSISTANT_*`).
+- Assinatura de código e auto-update.
+- Medições de instalador/memória em cenários grandes.

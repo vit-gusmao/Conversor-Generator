@@ -26,6 +26,23 @@ onde foi.
 
 ---
 
+## Fontes por caminho, planilhas e agendamentos
+
+Além do upload tradicional, o projeto agora aceita **planilhas XLSX/CSV** e
+**pastas autorizadas** no computador que executa o conversor, com importação
+manual ou **agendada** (diária ou por intervalo), histórico e retomada após
+quedas.
+
+- Telas novas: **Fontes** (`/sources`) e **Agendamentos** (`/schedules`).
+- Aplicativo Windows (`conversor-generator.exe`) que supervisa o backend e
+  configura GLM-OCR/LLM local — ver [docs/DESKTOP.md](docs/DESKTOP.md).
+- Comportamento detalhado, políticas de atraso/sobreposição, limites de formatos
+  e flags: [docs/SOURCES_AND_AUTOMATION.md](docs/SOURCES_AND_AUTOMATION.md).
+
+O navegador nunca ganha acesso ao disco ao digitar um caminho: raízes são
+concedidas explicitamente pelo operador local (ou pelo desktop), e o backend
+continua validando dono, raiz e caminho real em cada leitura.
+
 ## Sumário
 
 - [Visão geral](#visão-geral)

@@ -1,0 +1,101 @@
+name: Desktop (Windows)
+
+# Pipeline de distribuição do aplicativo Windows. Separado da CI Linux: depende
+# de toolchain Windows e de um ambiente Python fixado para o PyInstaller.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: windows x64 (backend + electron)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            packages/contracts/package-lock.json
+            apps/web/package-lock.json
+            apps/desktop/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # --- backend (contracts/SPA + venv fixado + PyInstaller) ---------------
+      - name: Build contracts and SPA
+        run: |
+          npm --prefix packages/contracts ci
+          npm --prefix packages/contracts run build
+          npm --prefix apps/web ci
+          npm --prefix apps/web run build
+
+      - name: Install converter dependencies
+        working-directory: services/converter
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --upgrade pip
+          .venv\Scripts\python.exe -m pip install -e ".[test,migrate]" pyinstaller
+
+      - name: Run converter tests
+        working-directory: services/converter
+        run: .venv\Scripts\python.exe -m pytest tests -q
+
+      - name: Freeze backend (onedir)
+        working-directory: services/converter
+        run: .venv\Scripts\pyinstaller.exe --clean --noconfirm packaging/converter.spec
+
+      - name: Smoke test the frozen backend (clean cwd, no repo on PATH)
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:RUNNER_TEMP "cg-userdata"
+          $env:APP_DATA_DIR = $data
+          $env:WORK_DIR = Join-Path $data "work"
+          $env:LOG_DIR = Join-Path $data "logs"
+          $env:STORAGE_LOCAL_ROOT = Join-Path $data "storage"
+          $env:WEB_DIST_DIR = Join-Path $env:GITHUB_WORKSPACE "apps/web/dist"
+          $env:CONVERTER_OCR_ENABLED = "false"
+          $out = & .\dist\converter\converter.exe --no-serve
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($out -notmatch "CONVERTER_READY") { throw "readiness ausente" }
+          if (-not (Test-Path (Join-Path $data "converter.db"))) { throw "banco não criado" }
+
+      # --- desktop shell ----------------------------------------------------
+      - name: Desktop unit tests
+        run: |
+          npm --prefix apps/desktop ci
+          npm --prefix apps/desktop test
+          npm --prefix apps/desktop run build
+
+      - name: Package installer
+        run: npx --prefix apps/desktop electron-builder --config apps/desktop/electron-builder.yml --win nsis --x64
+
+      - name: Verify executable name and artifacts
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem apps/desktop/release -Recurse -Filter "conversor-generator.exe" | Select-Object -First 1
+          if (-not $exe) { throw "conversor-generator.exe ausente" }
+          $setup = Get-ChildItem apps/desktop/release -Filter "conversor-generator-setup-*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "instalador ausente" }
+          Write-Host "EXE:" $exe.FullName
+          Write-Host "SETUP:" $setup.FullName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conversor-generator-windows-x64
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.blockmap
+          if-no-files-found: error

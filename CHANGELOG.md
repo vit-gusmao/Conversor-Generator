@@ -7,6 +7,36 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
+### Adicionado — upgrade de fontes, planilhas, agendador e desktop
+
+- **Contratos v3 de opções** com seção `spreadsheet` (abas, cabeçalho, encoding e
+  dialeto CSV, política de fórmulas), `reader_version` estampada pelo servidor e
+  fingerprint estável; v2 continua idêntico. Fixtures compartilhados garantem
+  paridade Python/TypeScript.
+- **Entrada XLSX/CSV**: leitura por conteúdo (OOXML), orçamentos de expansão,
+  preservação de valores originais e endereços reais de célula, fórmulas sem
+  cache como texto com aviso, CSV com encoding/dialeto explícitos. Saídas XLSX
+  normalizado, TXT e CSV.
+- **Fontes autorizadas**: raízes concedidas, contenção por componentes, rejeição
+  de UNC/rede, junctions não seguidas, snapshots com hash e detecção de arquivo
+  em edição/bloqueado.
+- **Importação durável**: idempotência por chave, deduplicação por conteúdo e
+  opções, retomada após queda sem duplicar lote/conversão, estados parcial e
+  sem-novidades.
+- **Agendador** diário/intervalo com fuso IANA, DST determinístico, políticas de
+  atraso e sobreposição, leases com fence, histórico e eventos SSE.
+- **Executor retomável** com fases e snapshot congelado da fonte; **indexação
+  agendada durável** com recuperação de jobs órfãos.
+- **Telas** de Fontes, detalhe da fonte, lista/formulário de agendamento e
+  ocorrência, com prévia das próximas cinco execuções.
+- **Aplicativo Windows (Electron)**: supervisor do backend empacotável,
+  diretórios explícitos em `userData`, perfil de modelos atômico, IPC validado,
+  bandeja e configuração visual de GLM-OCR/LLM.
+- **Diagnóstico real de modelos** (visão + geração) e importação de GGUF via
+  Modelfile gerado pelo app.
+- **Flags publicadas** em `/capabilities` e documentação em
+  `docs/SOURCES_AND_AUTOMATION.md` e `docs/DESKTOP.md`.
+
 ### Adicionado
 
 - **Lotes persistentes** (`/batches`): número ilimitado de documentos por lote,
