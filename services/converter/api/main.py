@@ -137,6 +137,11 @@ def create_app() -> FastAPI:
     app.include_router(batch_router)
     app.include_router(upload_router)
     app.include_router(knowledge_router)
+    from api.source_routes import internal_router as source_internal_router
+    from api.source_routes import router as source_router
+
+    app.include_router(source_router)
+    app.include_router(source_internal_router)
     app.include_router(internal_router)
 
     @app.get("/health", tags=["system"], include_in_schema=False)
