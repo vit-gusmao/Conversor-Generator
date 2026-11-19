@@ -291,7 +291,12 @@ class SourceService:
             "enabled": bool(source.enabled),
             "version": source.version,
             "runtime_id": root.runtime_id if root else "local",
-            "runtime_available": bool(root is not None and Path(root.canonical_path).exists()),
+            # Revocation wins: a source under a revoked root is unavailable.
+            "runtime_available": bool(
+                root is not None
+                and root.revoked_at is None
+                and Path(root.canonical_path).exists()
+            ),
             "created_at": source.created_at.isoformat(),
             "updated_at": source.updated_at.isoformat(),
         }
