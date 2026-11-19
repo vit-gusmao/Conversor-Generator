@@ -382,6 +382,77 @@ def internal_create_index_job(
     return indexer.submit(owner_id=owner, request=body.model_dump())
 
 
+@router.post(
+    "/knowledge/authorized-index",
+    dependencies=[Depends(internal_guard)],
+)
+def internal_authorized_index(body: dict[str, Any]) -> dict[str, Any]:
+    """Full-mode RAG entry: the gateway has ALREADY verified ownership and the
+    conversion → document/run links (Prisma). The engine indexes straight from
+    the authorized refs — it never resolves foreign conversion_ids here."""
+    owner_id = str(body.get("owner_id") or "").strip()
+    collection_id = str(body.get("collection_id") or "").strip()
+    conversion_id = str(body.get("conversion_id") or "").strip()
+    document_id = str(body.get("document_id") or "").strip()
+    run_id = str(body.get("run_id") or "").strip()
+    filename = body.get("filename")
+    if not (owner_id and collection_id and conversion_id and document_id):
+        raise ApiError(
+            400,
+            "INVALID_PAYLOAD",
+            "owner_id, collection_id, conversion_id e document_id são obrigatórios.",
+        )
+    return indexer.index_authorized(
+        owner_id=owner_id,
+        collection_id=collection_id,
+        conversion_id=conversion_id,
+        document_id=document_id,
+        run_id=run_id,
+        filename=filename,
+    )
+
+
+@router.post(
+    "/automation/validate-import",
+    dependencies=[Depends(internal_guard)],
+)
+def internal_validate_import(body: dict[str, Any]) -> dict[str, Any]:
+    """Gateway-side admission check for a manual or scheduled import.
+
+    The gateway confirms that the persisted import exists for the owner and,
+    when the submission comes from an occurrence, that the linkage exists.
+    """
+    from models.db import AutomationRunRow, SourceImportRow, get_session_factory
+    from sqlalchemy import select as _select
+
+    owner_id = str(body.get("owner_id") or "").strip()
+    import_id = str(body.get("import_id") or "").strip()
+    schedule_run_id = body.get("schedule_run_id")
+    if not (owner_id and import_id):
+        raise ApiError(400, "INVALID_PAYLOAD", "owner_id e import_id são obrigatórios.")
+    session = get_session_factory()()
+    try:
+        record = session.execute(
+            _select(SourceImportRow).where(
+                SourceImportRow.id == import_id, SourceImportRow.owner_id == owner_id
+            )
+        ).scalar_one_or_none()
+        if record is None:
+            return {"valid": False, "code": "IMPORT_NOT_FOUND"}
+        if schedule_run_id:
+            run = session.execute(
+                _select(AutomationRunRow).where(
+                    AutomationRunRow.id == str(schedule_run_id),
+                    AutomationRunRow.owner_id == owner_id,
+                )
+            ).scalar_one_or_none()
+            if run is None or run.import_id not in (None, import_id):
+                return {"valid": False, "code": "RUN_LINK_INVALID"}
+        return {"valid": True, "code": None, "source_id": record.source_id}
+    finally:
+        session.close()
+
+
 @router.get("/knowledge/index-jobs/{job_id}", dependencies=[Depends(internal_guard)])
 def internal_get_index_job(job_id: str, owner: str = Header(alias="x-owner-id")) -> dict[str, Any]:
     job = knowledge_repo.get_job(owner, job_id)

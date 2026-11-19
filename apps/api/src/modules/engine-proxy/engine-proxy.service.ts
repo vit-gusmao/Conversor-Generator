@@ -44,7 +44,12 @@ export class EngineProxyService {
 
   async json<T>(
     path: string,
-    options: { method?: string; body?: unknown; ownerId?: string } = {},
+    options: {
+      method?: string;
+      body?: unknown;
+      ownerId?: string;
+      headers?: Record<string, string>;
+    } = {},
   ): Promise<T> {
     let response: globalThis.Response;
     try {
@@ -53,6 +58,7 @@ export class EngineProxyService {
         headers: {
           ...this.headers,
           ...(options.ownerId ? { 'x-owner-id': options.ownerId } : {}),
+          ...(options.headers ?? {}),
         },
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
       });

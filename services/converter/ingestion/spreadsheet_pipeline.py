@@ -181,6 +181,8 @@ class SpreadsheetConversionPipeline:
                     status="ok" if sheet.non_empty_rows() else "partial",
                     metrics={"cells": len(table_cells)},
                 )
+                # The text plan renders page.tables (per page), not ir.tables.
+                page.tables = [table]
                 page.coverage = CoverageRow(
                     page_number=page_number,
                     text_blocks=0,

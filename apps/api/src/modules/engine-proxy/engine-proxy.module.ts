@@ -6,5 +6,7 @@ import { EngineProxyService } from './engine-proxy.service';
 @Module({
   controllers: [EngineProxyController],
   providers: [EngineProxyService],
+  // The automation proxy module reuses the authenticated engine transport.
+  exports: [EngineProxyService],
 })
 export class EngineProxyModule {}

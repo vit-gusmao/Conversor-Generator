@@ -17,6 +17,7 @@ import { RealtimeModule } from './modules/realtime/realtime.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { UploadsModule } from './modules/uploads/uploads.module';
 import { UploadModule } from './upload/upload.module';
+import { AutomationModule } from './modules/automation/automation.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { UploadModule } from './upload/upload.module';
     BatchesModule,
     UploadsModule,
     EngineProxyModule,
+    AutomationModule,
     AuditModule,
     SettingsModule,
     HealthModule,

@@ -221,4 +221,197 @@ def revoke_root(
     return {"revoked": True}
 
 
+# --------------------------------------------------------------------------
+# Internal: source/schedule management proxy (full-mode gateway passthrough)
+# The gateway authenticates the browser session and forwards the owner id.
+# --------------------------------------------------------------------------
+
+
+def _require_owner(x_owner_id: str | None) -> str:
+    if not x_owner_id:
+        raise ApiError(400, "INVALID_PAYLOAD", "x-owner-id é obrigatório.")
+    return x_owner_id
+
+
+@internal_router.get("/source-roots")
+def internal_list_roots(
+    x_owner_id: str | None = Header(default=None),
+    session=Depends(get_db),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    return {"items": SourceService().list_roots(session, owner_id=_require_owner(x_owner_id))}
+
+
+@internal_router.get("/sources")
+def internal_list_sources(
+    x_owner_id: str | None = Header(default=None),
+    session=Depends(get_db),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    return {"items": SourceService().list_sources(session, owner_id=_require_owner(x_owner_id))}
+
+
+@internal_router.post("/sources", status_code=201)
+def internal_create_source(
+    payload: dict[str, Any] = Body(default={}),
+    x_owner_id: str | None = Header(default=None),
+    session=Depends(get_db),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    payload.pop("owner_id", None)
+    payload.pop("ownerId", None)
+    return SourceService().create_source(
+        session, owner_id=_require_owner(x_owner_id), payload=payload
+    )
+
+
+@internal_router.get("/sources/{source_id}")
+def internal_get_source(
+    source_id: str,
+    x_owner_id: str | None = Header(default=None),
+    session=Depends(get_db),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    payload = SourceService().get_source(
+        session, source_id=source_id, owner_id=_require_owner(x_owner_id)
+    )
+    if payload is None:
+        raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
+    return payload
+
+
+@internal_router.patch("/sources/{source_id}")
+@internal_router.put("/sources/{source_id}")
+def internal_update_source(
+    source_id: str,
+    payload: dict[str, Any] = Body(default={}),
+    x_owner_id: str | None = Header(default=None),
+    session=Depends(get_db),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    payload.pop("owner_id", None)
+    payload.pop("ownerId", None)
+    version = payload.pop("version", None)
+    if not isinstance(version, int):
+        raise ApiError(400, "INVALID_PAYLOAD", "Edição exige o campo 'version' (controle otimista).")
+    updated = SourceService().update_source(
+        session,
+        source_id=source_id,
+        owner_id=_require_owner(x_owner_id),
+        version=version,
+        changes=payload,
+    )
+    if updated is None:
+        raise ApiError(
+            409,
+            "VERSION_CONFLICT",
+            "Versão da fonte divergente: releia e reaplique.",
+            details={"source_id": source_id},
+        )
+    return updated
+
+
+@internal_router.delete("/sources/{source_id}")
+def internal_archive_source(
+    source_id: str,
+    x_owner_id: str | None = Header(default=None),
+    session=Depends(get_db),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    archived = SourceService().archive_source(
+        session, source_id=source_id, owner_id=_require_owner(x_owner_id)
+    )
+    if not archived:
+        raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
+    return {"archived": True}
+
+
+@internal_router.post("/sources/{source_id}/validate")
+def internal_validate_source(
+    source_id: str,
+    x_owner_id: str | None = Header(default=None),
+    session=Depends(get_db),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    validation = SourceService().validate_source(
+        session, source_id=source_id, owner_id=_require_owner(x_owner_id)
+    )
+    return {
+        "source_id": validation.source_id,
+        "ok": validation.ok,
+        "available": validation.available,
+        "code": validation.code,
+        "message": validation.message,
+        "sample": [
+            {
+                "relative_path": item.relative_path,
+                "size_bytes": item.size_bytes,
+                "mtime_ns": item.mtime_ns,
+            }
+            for item in validation.sample
+        ],
+        "estimated_files": validation.estimated_files,
+        "estimated_bytes": validation.estimated_bytes,
+        "warnings": validation.warnings,
+    }
+
+
+@internal_router.post("/sources/{source_id}/imports", status_code=202)
+def internal_start_import(
+    source_id: str,
+    payload: dict[str, Any] = Body(default={}),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_owner_id: str | None = Header(default=None),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    owner_id = _require_owner(x_owner_id)
+    if not idempotency_key or len(idempotency_key) > 128:
+        raise ApiError(400, "INVALID_PAYLOAD", "O header Idempotency-Key é obrigatório.")
+    from sources.importer import ImportService
+
+    service = ImportService()
+    record = service.start(
+        owner_id=owner_id,
+        source_id=source_id,
+        request=payload,
+        idempotency_key=idempotency_key,
+    )
+    service.run_async(record["id"], owner_id)
+    return record
+
+
+@internal_router.get("/imports/{import_id}")
+def internal_get_import(
+    import_id: str,
+    x_owner_id: str | None = Header(default=None),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    from sources.importer import ImportService
+
+    return ImportService().get(import_id, _require_owner(x_owner_id))
+
+
+@internal_router.get("/imports/{import_id}/items")
+def internal_list_import_items(
+    import_id: str,
+    x_owner_id: str | None = Header(default=None),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    from sources.importer import ImportService
+
+    items = ImportService().items(import_id, _require_owner(x_owner_id))
+    return {"items": items, "next_cursor": None}
+
+
+@internal_router.post("/imports/{import_id}/cancel", status_code=202)
+def internal_cancel_import(
+    import_id: str,
+    x_owner_id: str | None = Header(default=None),
+    _guard: None = Depends(internal_guard),
+) -> dict[str, Any]:
+    from sources.importer import ImportService
+
+    return ImportService().cancel(import_id, _require_owner(x_owner_id))
+
+
 __all__ = ["router", "internal_router"]

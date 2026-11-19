@@ -19,6 +19,7 @@ import type { AuthenticatedUser } from '../../common/request-context';
 import { OptionalJwtGuard } from '../../auth/guards/optional-jwt.guard';
 
 import { EngineProxyService } from './engine-proxy.service';
+import { PrismaService } from '../../database/prisma.service';
 
 function requireUser(user: AuthenticatedUser | undefined): AuthenticatedUser {
   if (!user) throw ApiError.unauthenticated();
@@ -34,7 +35,10 @@ function requireUser(user: AuthenticatedUser | undefined): AuthenticatedUser {
 @Controller()
 @UseGuards(OptionalJwtGuard)
 export class EngineProxyController {
-  constructor(private readonly proxy: EngineProxyService) {}
+  constructor(
+    private readonly proxy: EngineProxyService,
+    private readonly prisma: PrismaService,
+  ) {}
 
   @Get('capabilities')
   capabilities(): Promise<unknown> {
@@ -159,11 +163,47 @@ export class EngineProxyController {
     @CurrentUser() user: AuthenticatedUser | undefined,
   ): Promise<unknown> {
     const owner = requireUser(user);
-    return this.proxy.json('/internal/v1/knowledge/index-jobs', {
-      method: 'POST',
-      body,
-      ownerId: owner.id,
-    });
+    // Full mode (T6): conversions live in Prisma, so the engine cannot resolve
+    // conversion_ids from its own tables. The gateway verifies ownership and
+    // hands the engine authorized references instead of raw ids.
+    const payload = (body ?? {}) as { conversion_ids?: unknown; source_paths?: unknown };
+    const conversionIds = Array.isArray(payload.conversion_ids)
+      ? payload.conversion_ids.map(String)
+      : [];
+    const documents: Array<Record<string, unknown>> = [];
+    let chunks = 0;
+    let failed = 0;
+    for (const conversionId of conversionIds) {
+      const conversion = (await this.prisma.conversion.findFirst({
+        where: { id: conversionId, ownerId: owner.id, deletedAt: null },
+      })) as { id: string; documentId: string; activeRunId: string | null; filename: string } | null;
+      if (!conversion) {
+        documents.push({ conversion_id: conversionId, status: 'not_found', chunks: 0 });
+        failed += 1;
+        continue;
+      }
+      const result = (await this.proxy.json('/internal/v1/knowledge/authorized-index', {
+        method: 'POST',
+        body: {
+          owner_id: owner.id,
+          conversion_id: conversion.id,
+          document_id: conversion.documentId,
+          run_id: conversion.activeRunId,
+          filename: conversion.filename ?? null,
+        },
+        ownerId: owner.id,
+      })) as { chunks?: number; status?: string };
+      documents.push({ conversion_id: conversion.id, ...result });
+      chunks += Number(result.chunks ?? 0);
+      if (result.status !== 'indexed') failed += 1;
+    }
+    return {
+      documents,
+      chunks,
+      failed,
+      indexed_at: new Date().toISOString(),
+      source: { conversion_ids: conversionIds, source_paths: payload.source_paths ?? [] },
+    };
   }
 
   @Get('knowledge/index-jobs/:jobId')

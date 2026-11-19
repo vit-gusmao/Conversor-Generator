@@ -184,6 +184,77 @@ class KnowledgeIndexer:
             "chunks": count,
         }
 
+    def index_authorized(
+        self,
+        *,
+        owner_id: str,
+        collection_id: str,
+        conversion_id: str,
+        document_id: str,
+        run_id: str,
+        filename: str | None,
+    ) -> dict[str, Any]:
+        """Index from gateway-verified references (full mode).
+
+        In full mode the conversion lives in the gateway's Prisma database,
+        not in ``public_conversions``: the gateway resolves ownership and the
+        ``conversion → document/run`` links, then hands the authorized refs to
+        this method. This endpoint never trusts free ``conversion_id`` input
+        from a public client.
+        """
+        if not run_id:
+            return {
+                "document_id": document_id,
+                "conversion_id": conversion_id,
+                "status": "skipped",
+                "reason": "A conversão ainda não possui execução.",
+                "chunks": 0,
+            }
+        payload = self.conversions.text_plan(run_id)
+        if payload is None:
+            return {
+                "document_id": document_id,
+                "conversion_id": conversion_id,
+                "run_id": run_id,
+                "status": "skipped",
+                "reason": "Plano textual não disponível (conversão anterior ao upgrade).",
+                "chunks": 0,
+            }
+
+        from exports.text_plan import plan_from_payload
+
+        plan = plan_from_payload(payload)
+        drafts = chunk_text_plan(
+            plan,
+            owner_id=owner_id,
+            collection_id=collection_id,
+            document_id=document_id,
+            run_id=run_id,
+        )
+        for draft in drafts:
+            draft.metadata.update(
+                {
+                    "document_name": filename,
+                    "run_id": run_id,
+                    "conversion_id": conversion_id,
+                    "source_type": payload.get("source_type") or "pdf",
+                }
+            )
+        count = self.repo.replace_document_chunks(
+            owner_id=owner_id,
+            collection_id=collection_id,
+            document_id=document_id,
+            drafts=drafts,
+        )
+        return {
+            "document_id": document_id,
+            "conversion_id": conversion_id,
+            "run_id": run_id,
+            "name": filename,
+            "status": "indexed",
+            "chunks": count,
+        }
+
     # -- study -------------------------------------------------------------
     def _index_study_file(self, owner_id: str, collection_id: str, source_path: str) -> dict[str, Any]:
         path = (STUDY_ROOT / source_path).resolve() if not Path(source_path).is_absolute() else Path(source_path).resolve()
