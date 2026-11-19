@@ -389,3 +389,11 @@ class TestRealGlmOcrIntegration:
         assert "9.876,54" in text
         assert all(w.bbox_px[1] >= 0 for w in words)
         assert engine.boxing_method in {"projection_v1", "even_distribution"}
+
+
+def test_model_present_rejects_same_family_different_size():
+    # AU2-16: qwen3.5:4b configured, only qwen3.5:9b installed -> not present.
+    body = {"models": [{"name": "qwen3.5:9b"}]}
+    getter = lambda *a, **k: _FakeResponse(200, body)  # noqa: E731
+    assert GlmOcrClient(getter=getter, model="qwen3.5:4b").model_present() is False
+    assert GlmOcrClient(getter=getter, model="qwen3.5").model_present() is False

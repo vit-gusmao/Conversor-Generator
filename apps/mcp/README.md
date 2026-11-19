@@ -23,7 +23,7 @@ The adapter is a thin, local, single-user client:
 
 ## Requirements
 
-- Node.js **22+** (developed and verified on Node 24).
+- Node.js **22+** (`engines` do `package.json`).
 - A reachable Conversor Generator API. In `standalone` mode the converter
   serves `/api/v1` itself (`http://localhost:8000` by default); in `full` mode
   use the NestJS public API.
@@ -145,7 +145,7 @@ PDF2X_MCP_TRANSPORT=http PDF2X_MCP_PORT=7801 node apps/mcp/dist/main.js
 
 The server listens on `PDF2X_MCP_HOST:PDF2X_MCP_PORT`, which defaults to
 `127.0.0.1:7801`. The endpoint is `POST/GET /mcp` (Streamable HTTP) and `GET /health`
-returns `{"status":"ok"}`. There is no authentication on this port, so do not
+returns `{"status":"ok","transport":"http","name":"pdf2x-mcp"}`. There is no authentication on this port, so do not
 bind it to a public interface. Without a `destination`, `download_artifact` returns a
 short-lived API reference (`{remote: true, download_url, expires_at}`) instead of
 writing on the server filesystem.

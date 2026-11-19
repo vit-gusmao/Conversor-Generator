@@ -455,7 +455,9 @@ class SpreadsheetConversionPipeline:
         else:
             decision = "technical"
 
-        if decision == "first_row":
+        # An empty sheet has no first row to promote: it is technical, whatever
+        # the option says (the EMPTY_SHEET warning already describes it).
+        if decision == "first_row" and sheet.rows:
             labels = [
                 self._display_value(cell) if cell is not None and not cell.is_empty else f"col_{i + 1}"
                 for i, cell in enumerate(sheet.rows[0] or [])

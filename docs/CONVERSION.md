@@ -11,7 +11,11 @@ Para o caminho em tempo de execução (fila, etapas e eventos), veja
 
 `engine/inspector/pdf_inspector.py`
 
-- assinatura `%PDF-` (com tolerância a lixo inicial);
+- assinatura `%PDF-` com tolerância a lixo inicial: o cabeçalho precisa começar
+  até o deslocamento 512 (`_looks_like_pdf` no motor). A validação da API
+  (gateway) procura `%PDF-` nos primeiros 1024 bytes e aceita o mesmo deslocamento
+  máximo de 512. Um arquivo com assinatura de imagem no início é classificado
+  como imagem, mesmo que contenha `%PDF-` depois;
 - abertura por parser (`pypdf`), contagem de páginas;
 - criptografia: tenta senha de usuário vazia; se falhar, `ENCRYPTED_PDF`;
 - tamanho e número de páginas contra os limites configurados;
@@ -248,7 +252,15 @@ identificador, código, booleano, vazio.
   `€`, `£`) tanto na exibição quanto no formato da célula;
 - separador decidido **por valor**, não pelo locale do documento: um mesmo PDF
   pode imprimir preços com ponto (`308.36`) e um campo de valor com vírgula
-  (`R$ 153,18`). Confiar só no locale transformava `153,18` em `15318`;
+  (`R$ 153,18`). Confiar só no locale transformava `153,18` em `15318`. Regra
+  para um único separador (`,` ou `.`) entre dois grupos:
+  - parte final com 1 ou 2 dígitos → decimal (`308.36`, `153,18`);
+  - parte final com mais de 3 dígitos → decimal (`0,0125`);
+  - parte final com exatamente 3 dígitos → ambíguo (`1,234`): o locale do
+    documento decide;
+  - mais de um separador com parte final de 1 ou 2 dígitos → o último é decimal
+    (`6,706,36` → `6706.36`); com parte final de 3 dígitos, é separador de milhar
+    (`1.234.567`);
 - números com mais de **15 dígitos significativos** ficam como texto (`@`):
   o Excel arredonda acima disso, e a célula deixaria de corresponder ao plano
   (o artefato era reprovado na própria auditoria);
@@ -411,7 +423,12 @@ O mesmo IR alimenta todos os artefatos de uma execução: o OCR roda uma vez e
 - `formula_policy=safe` prefixa apóstrofo em campos textuais que começariam com
   `=`, `+`, `-`, `@` ou caractere de controle, sem alterar números negativos;
 - o CSV não promete tipos do XLSX; zeros iniciais podem ser reinterpretados
-  pelo Excel, e o manifesto explica.
+  pelo Excel, e o manifesto explica;
+- `value_mode=original` (padrão) grava o valor como o documento o apresentou.
+  `value_mode=canonical` normaliza só números inequívocos: `1.234,56` vira
+  `1234.56`, e `1.234` (milhar) vira `1234`. Um único ponto com parte final
+  curta, como `3.14`, é o separador decimal e fica como está. Identificadores
+  com zero à esquerda (`00123`) e texto livre nunca mudam;
 
 ## Imagens → TXT
 

@@ -8,6 +8,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { posix, win32 } from 'node:path';
 
 export interface GrantRequest {
   ownerId: string;
@@ -32,8 +33,10 @@ export class GrantError extends Error {
 
 export interface GrantClientOptions {
   baseUrl: string;
-  /** Bootstrap secret of THIS backend boot (never exposed to the renderer). */
+  /** Internal token of THIS backend boot (never exposed to the renderer). */
   bootstrapSecret: string;
+  /** Desktop host secret of THIS backend process (x-desktop-host). */
+  hostSecret: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -61,6 +64,7 @@ export class LocalGrants extends EventEmitter {
       headers: {
         'content-type': 'application/json',
         'x-internal-token': this.options.bootstrapSecret,
+        'x-desktop-host': this.options.hostSecret,
       },
       body: JSON.stringify({
         owner_id: request.ownerId,
@@ -90,6 +94,7 @@ export class LocalGrants extends EventEmitter {
         method: 'DELETE',
         headers: {
           'x-internal-token': this.options.bootstrapSecret,
+          'x-desktop-host': this.options.hostSecret,
           'x-owner-id': ownerId,
         },
       },
@@ -98,6 +103,22 @@ export class LocalGrants extends EventEmitter {
       throw new GrantError('GRANT_REVOKE_FAILED', 'Não foi possível revogar a raiz.');
     }
   }
+}
+
+/**
+ * Directory to grant for a single selected file (F16): its parent folder.
+ * A file directly under a drive root keeps the root's trailing separator, so
+ * the granted path is a valid absolute root ("C:\").
+ */
+export function parentDirectoryForGrant(
+  filePath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === 'win32') {
+    const parent = win32.dirname(filePath);
+    return /^[a-zA-Z]:$/.test(parent) ? `${parent}\\` : parent;
+  }
+  return posix.dirname(filePath);
 }
 
 export function isAbsolutePath(path: string): boolean {

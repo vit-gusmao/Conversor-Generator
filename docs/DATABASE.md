@@ -98,6 +98,22 @@ Em `full`, lotes e uploads vivem no Prisma (`Batch`, `BatchItem`, `UploadSession
 | `run_checkpoints` | Cursor por fase (`structure`, `export`) e última sequência de evento | único `run_id, phase` |
 | `engine_jobs` | Backlog durável: `state`, `available_at`, `lease_owner`, `lease_until`, `fence`, `attempt`, `payload_ref`, `cancel_requested_at` | único `run_id, unit_key` |
 
+Tabelas do domínio de fontes e automação (importação por caminho). Todas são
+aditivas. Colunas acrescentadas depois, em `knowledge_index_jobs` e
+`automation_runs`, estão em [Colunas aditivas](#colunas-aditivas).
+
+| Tabela | Conteúdo | Chave/unicidade |
+| --- | --- | --- |
+| `source_roots` | Concessão de raiz: `owner_id`, `runtime_id`, `canonical_path`, `grant_channel`, `revoked_at` | `id` (índice `owner_id, revoked_at`) |
+| `file_sources` | Fonte cadastrada: caminho relativo, tipo, filtros, recursividade, `version` | `id`; índice `owner_id, enabled` |
+| `source_imports` | Execução de importação: `idempotency_key`, `request_hash`, `definition_json` (definição congelada), contadores, lease/fence | único `owner_id, idempotency_key` |
+| `source_import_items` | Item por arquivo: caminho, sha256, snapshot, upload/conversão, estado, erros | único `import_id, client_item_id` |
+| `source_file_versions` | Última versão bem-sucedida por arquivo lógico | único `owner_id, source_id, relative_path, sha256, options_hash` |
+| `source_knowledge_heads` | Cabeça de cada arquivo lógico na coleção: `active_document_id`, `active_run_id`, `index_generation` (geração vigente) e `source_missing` (origem sumiu da fonte) | único `owner_id, collection_id, source_id, relative_path` |
+| `automation_schedules` | Definição da agenda: regra, fuso, `revision`, `next_run_at`, políticas | `id`; índice `enabled, next_run_at` |
+| `automation_runs` | Ocorrência: `occurrence_key`, snapshot, estado/fase, lease/fence, `cancel_requested_at`, `next_attempt_at` (horário mínimo de nova tentativa após falha transitória) | único global `occurrence_key` |
+| `automation_events` | Linha do tempo por ocorrência | único `run_id, sequence` |
+
 Os modelos de conhecimento e assistente:
 
 | Tabela | Conteúdo |
@@ -161,6 +177,11 @@ nulos ou têm padrão, e não reescrevem dados antigos:
   cancelamento contra a publicação.
 - `public_conversions.options_json`: passa a ser preenchido em toda conversão nova.
   Conversões anteriores ficam com `NULL` e usam os padrões do tipo.
+- `knowledge_index_jobs.attempt`, `fence`, `lease_owner` e `lease_expires_at`
+  (revisão `d5e0a7c31b92`): lease e fence dos jobs de indexação. Jobs anteriores
+  recebem `attempt = 0` e `fence = 0`, sem lease.
+- `automation_runs.next_attempt_at` (revisão `d5e0a7c31b92`): horário mínimo para
+  a próxima tentativa de uma ocorrência com falha transitória. `NULL` para o resto.
 
 ## JSON
 
@@ -172,24 +193,39 @@ nulos ou têm padrão, e não reescrevem dados antigos:
 
 ## Migrações
 
+Cadeia do motor (ordem): `a95827baa7d8` → `c4f1a2b7d910` → `6d13f972f6c5` →
+`e08fecd3c89f` → `f2a8c61b9e73` (fontes e automação) →
+`b7c4d2e91f38` (`automation_runs.cancel_requested_at`) →
+`d5e0a7c31b92` (lease e fence dos jobs de indexação e `automation_runs.next_attempt_at`).
+**A revisão-cabeça é `d5e0a7c31b92`.** Todas aditivas; o standalone continua
+funcionando com `create_all` e as mesmas tabelas.
+
 | Serviço | Ferramenta | Como aplicar |
 | --- | --- | --- |
-| Motor | `init_db()` na inicialização, em qualquer modo | cria as tabelas ausentes e aplica colunas aditivas faltantes |
+| Motor | `init_db()` na inicialização, em qualquer modo | cria as tabelas ausentes e aplica colunas e índices aditivos faltantes |
+| Motor, desktop empacotado | `runtime/db_migrate.py` (sem Alembic) | trava de arquivo, backup do SQLite antes de mudar o schema, `init_db()` e gravação manual de `d5e0a7c31b92` em `alembic_version` |
 | Motor | Alembic, versionado | `pip install -e ".[migrate]"` em `services/converter`, depois `alembic upgrade head` |
 | Gateway | Prisma `db push`, sem migrações versionadas | `npm run db:push` na raiz. No PostgreSQL, `apps/api/docker-entrypoint.sh` roda `prisma db push` a cada inicialização |
 
 Detalhes:
 
-- `init_db()` usa `create_all`, que não altera tabelas existentes. Por isso as
-  colunas aditivas são aplicadas separadamente, e só quando faltam. Alterações
-  destrutivas ficam com o Alembic.
+- `init_db()` usa `create_all`, que não altera tabelas existentes. Por isso, em
+  seguida, `_ensure_additive_columns` acrescenta, de forma genérica, toda coluna
+  e índice que o modelo declara e a tabela não tem. Colunas nulas entram como
+  estão. Colunas `NOT NULL` com padrão escalar entram com esse `DEFAULT`, para
+  preencher as linhas antigas. Colunas `NOT NULL` sem padrão aproveitável entram
+  como nulas. Não há remoção nem alteração de tipo. Alterações destrutivas ficam
+  com o Alembic. Pode ser executado repetidamente.
 - Cadeia do Alembic (`services/converter/migrations/versions/`):
 
   ```
   a95827baa7d8  initial_schema                       (sem pai)
   c4f1a2b7d910  batches_and_uploads                  ← a95827baa7d8
   6d13f972f6c5  knowledge_exports_and_conversion_options ← c4f1a2b7d910
-  e08fecd3c89f  durable_jobs_and_page_checkpoints    ← 6d13f972f6c5   (head)
+  e08fecd3c89f  durable_jobs_and_page_checkpoints    ← 6d13f972f6c5
+  f2a8c61b9e73  sources_and_automation               ← e08fecd3c89f
+  b7c4d2e91f38  run_cancel_requested                 ← f2a8c61b9e73
+  d5e0a7c31b92  index_job_leases_and_run_retry       ← b7c4d2e91f38   (head)
   ```
 
   A migração inicial foi gerada contra um banco vazio a partir de `models/db.py`.

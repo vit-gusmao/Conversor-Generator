@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 
 import { ConversionsModule } from '../conversions/conversions.module';
 
@@ -7,7 +7,7 @@ import { BatchesController } from './batches.controller';
 import { BatchesService } from './batches.service';
 
 @Module({
-  imports: [ConversionsModule],
+  imports: [forwardRef(() => ConversionsModule)],
   controllers: [BatchesController],
   providers: [BatchesService, BatchEventsService],
   exports: [BatchesService, BatchEventsService],

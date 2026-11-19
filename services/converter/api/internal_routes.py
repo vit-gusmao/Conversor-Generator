@@ -521,6 +521,55 @@ def internal_automation_status() -> dict[str, Any]:
     }
 
 
+@router.get("/runtime/activity", dependencies=[Depends(internal_guard)])
+def runtime_activity() -> dict[str, Any]:
+    """Non-terminal work counted from existing tables.
+
+    The desktop host reads this before a profile apply restarts the backend:
+    anything non-zero means the restart is deferred (or forced by the operator).
+    Read-only; no state is changed.
+    """
+    from sqlalchemy import func, select
+
+    from automation.models import AutomationRunRow
+    from models.db import EngineJobRow, KnowledgeIndexJobRow, get_session_factory
+    from sources.models import SourceImportRow
+    from sources.types import IMPORT_TERMINAL_STATUSES
+
+    session = get_session_factory()()
+    try:
+
+        def count(model, *conditions) -> int:
+            stmt = select(func.count()).select_from(model).where(*conditions)
+            return int(session.execute(stmt).scalar_one() or 0)
+
+        queued = count(EngineJobRow, EngineJobRow.state == "queued")
+        running = count(EngineJobRow, EngineJobRow.state.in_(("leased", "running")))
+        waiting_children = count(AutomationRunRow, AutomationRunRow.state == "waiting_children")
+        automation_running = count(
+            AutomationRunRow, AutomationRunRow.state.in_(("running", "cancelling"))
+        )
+        active_imports = count(
+            SourceImportRow, SourceImportRow.status.notin_(tuple(IMPORT_TERMINAL_STATUSES))
+        )
+        indexing = count(
+            KnowledgeIndexJobRow,
+            KnowledgeIndexJobRow.status.notin_(("completed", "partial", "failed", "cancelled")),
+        )
+    finally:
+        session.close()
+
+    counts = {
+        "queued": queued,
+        "running": running,
+        "waiting_children": waiting_children,
+        "automation_running": automation_running,
+        "active_imports": active_imports,
+        "indexing": indexing,
+    }
+    return {**counts, "total": sum(counts.values())}
+
+
 @router.post("/automation/pause", dependencies=[Depends(internal_guard)])
 def internal_automation_pause(
     x_owner_id: str | None = Header(default=None, alias="x-owner-id"),
@@ -533,11 +582,16 @@ def internal_automation_pause(
     from models.db import AutomationScheduleRow, get_session_factory
     from sqlalchemy import update as _update
 
+    if not x_owner_id:
+        # Without an owner the update would match every tenant's schedules.
+        raise ApiError(400, "INVALID_PAYLOAD", "x-owner-id é obrigatório.")
+
     session = get_session_factory()()
     try:
-        query = _update(AutomationScheduleRow).where(AutomationScheduleRow.enabled.is_(True))
-        if x_owner_id:
-            query = query.where(AutomationScheduleRow.owner_id == x_owner_id)
+        query = _update(AutomationScheduleRow).where(
+            AutomationScheduleRow.enabled.is_(True),
+            AutomationScheduleRow.owner_id == x_owner_id,
+        )
         result = session.execute(query.values(enabled=False))
         session.commit()
         return {"paused": int(result.rowcount or 0)}

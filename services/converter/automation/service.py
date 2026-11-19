@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from api.deps import ApiError
+from api.serialization import iso_utc
 from automation.calendar import Calendar, next_occurrences
 from automation.models import AutomationScheduleRow
 from automation.repository import AutomationRepository
@@ -64,6 +65,9 @@ class ScheduleService:
             raise ApiError(409, "SOURCE_DISABLED", "A fonte está desativada.")
         rule_json = create.rule.model_dump()
         timezone = validate_timezone(create.timezone).key
+        options = self._validated_options(
+            session, owner_id=owner_id, source_id=create.source_id, options=create.options
+        )
         next_run = Calendar.next_after(create.rule, timezone, datetime.now(UTC))
         schedule = self.repository.create_schedule(
             session,
@@ -75,7 +79,7 @@ class ScheduleService:
             next_run_at=next_run,
             misfire_policy=create.misfire_policy,
             overlap_policy=create.overlap_policy,
-            options=create.options or {},
+            options=options,
             index_collection_id=create.index_collection_id,
         )
         return self.schedule_payload(schedule)
@@ -126,9 +130,17 @@ class ScheduleService:
             if source is None:
                 raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
             updates["source_id"] = source.id
-        for key in ("options", "index_collection_id"):
-            if key in changes:
-                updates["options_json" if key == "options" else key] = changes[key]
+        if "options" in changes or "source_id" in updates:
+            # Options are checked against the source they will run on: an edit
+            # to either side re-validates, so no occurrence fails later.
+            updates["options_json"] = self._validated_options(
+                session,
+                owner_id=owner_id,
+                source_id=updates.get("source_id", schedule.source_id),
+                options=changes.get("options", schedule.options_json),
+            )
+        if "index_collection_id" in changes:
+            updates["index_collection_id"] = changes["index_collection_id"]
         for key in ("misfire_policy", "overlap_policy"):
             if key in changes:
                 value = str(changes[key])
@@ -198,10 +210,53 @@ class ScheduleService:
         return {
             "timezone": timezone,
             "rule": create.rule.model_dump(),
-            "next_occurrences": [instant.isoformat() for instant in occurrences],
+            "next_occurrences": [iso_utc(instant) for instant in occurrences],
         }
 
     # ---------------------------------------------------------------- helpers
+    def _validated_options(
+        self,
+        session: Session,
+        *,
+        owner_id: str,
+        source_id: str,
+        options: Any,
+    ) -> dict[str, Any]:
+        """Validate options with the importer's own normalizer (AU1-33).
+
+        The normalizer picks the kind from the source's declared formats, exactly
+        as a run would. Only the validation is used: the stored value is the raw
+        client input, because the normalizer's output (for example the
+        spreadsheet ``reader_version`` stamp) is itself rejected when normalized
+        a second time. Invalid options raise ``400 INVALID_OPTION``.
+        """
+        if options is None:
+            return {}
+        if not isinstance(options, dict):
+            raise ApiError(400, "INVALID_OPTION", "options deve ser um objeto JSON.")
+        from sources.importer import ImportService
+        from sources.types import SourceDefinitionSnapshot
+
+        source = self.sources.get_source(session, source_id=source_id, owner_id=owner_id)
+        if source is None:
+            raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
+        root = self.sources.get_root(session, root_id=source.root_id, owner_id=owner_id)
+        definition = SourceDefinitionSnapshot.from_json(
+            {
+                "source_id": source.id,
+                "root_id": source.root_id,
+                "root_canonical_path": root.canonical_path if root is not None else "",
+                "relative_path": source.relative_path,
+                "kind": source.kind,
+                "recursive": bool(source.recursive),
+                "include_patterns": source.include_patterns,
+                "exclude_patterns": source.exclude_patterns,
+                "version": source.version,
+            }
+        )
+        ImportService()._normalize_for_source(options, definition)
+        return dict(options)
+
     def schedule_payload(self, schedule: AutomationScheduleRow) -> dict[str, Any]:
         return {
             "id": schedule.id,
@@ -213,13 +268,13 @@ class ScheduleService:
             "revision": schedule.revision,
             "rule": dict(schedule.rule_json or {}),
             "timezone": schedule.timezone,
-            "next_run_at": schedule.next_run_at.isoformat() if schedule.next_run_at else None,
+            "next_run_at": iso_utc(schedule.next_run_at),
             "misfire_policy": schedule.misfire_policy,
             "overlap_policy": schedule.overlap_policy,
             "options": dict(schedule.options_json or {}),
             "index_collection_id": schedule.index_collection_id,
-            "created_at": schedule.created_at.isoformat(),
-            "updated_at": schedule.updated_at.isoformat(),
+            "created_at": iso_utc(schedule.created_at),
+            "updated_at": iso_utc(schedule.updated_at),
         }
 
     @staticmethod

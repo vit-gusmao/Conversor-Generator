@@ -11,15 +11,16 @@ worker can no longer finalize results.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from automation.calendar import Calendar, occurrence_key
+from automation.calendar import Calendar, as_utc, occurrence_key
 from automation.models import AutomationEventRow, AutomationRunRow, AutomationScheduleRow
 from automation.repository import AutomationRepository
 from automation.types import (
@@ -29,11 +30,19 @@ from automation.types import (
     RunLease,
 )
 
+logger = logging.getLogger("automation.scheduler")
+
 LEASE_SECONDS = 120
 HEARTBEAT_SECONDS = 30
 MISFIRE_TOLERANCE_SECONDS = 30
 MAX_DUE_BATCH = 50
+CLAIM_CANDIDATES = 5
 ACTIVE_STATES = ("running", "waiting_children", "cancelling")
+
+
+def _iso(value: datetime) -> str:
+    """UTC ISO string with an explicit offset (naive values are UTC)."""
+    return as_utc(value).isoformat()
 
 
 class ClaimError(Exception):
@@ -65,8 +74,13 @@ class AutomationScheduler:
     def create_due_occurrences(
         self, session: Session, *, now: datetime | None = None
     ) -> list[AutomationRunRow]:
-        """Create occurrences for due schedules (bounded batch, short txn)."""
-        now = (now or datetime.now(UTC)).astimezone(UTC)
+        """Create occurrences for due schedules (bounded batch, short txn).
+
+        Each schedule commits on its own. A failing schedule is logged and
+        skipped, and a rollback never discards occurrences already created for
+        other schedules in this pass (S1).
+        """
+        now = as_utc(now or datetime.now(UTC))
         due_rows = list(
             session.execute(
                 select(AutomationScheduleRow)
@@ -92,11 +106,16 @@ class AutomationScheduler:
                     observed_next_run_at=observed_next,
                     now=now,
                 )
+                session.commit()
             except ClaimError:
                 session.rollback()
                 continue
             except IntegrityError:
                 # Another process inserted the same occurrence key first.
+                session.rollback()
+                continue
+            except Exception:  # noqa: BLE001 - one bad schedule must not stop the pass
+                logger.exception("occurrence creation failed for schedule %s", schedule.id)
                 session.rollback()
                 continue
             if run is not None:
@@ -136,8 +155,8 @@ class AutomationScheduler:
                 raise ClaimError("OCCURRENCE_EXISTS", "A ocorrência já foi registrada.")
             snapshot = self._snapshot(schedule)
             snapshot["skip_reason"] = "misfire_skip"
-            snapshot["missed_from"] = observed_next_run_at.isoformat()
-            snapshot["next_run_at"] = next_after.isoformat()
+            snapshot["missed_from"] = _iso(observed_next_run_at)
+            snapshot["next_run_at"] = _iso(next_after)
             skipped = AutomationRunRow(
                 id=f"arun_{self._new_id()}",
                 owner_id=schedule.owner_id,
@@ -159,8 +178,8 @@ class AutomationScheduler:
                 "MISFIRE_COALESCED",
                 {
                     "policy": "skip",
-                    "missed_from": observed_next_run_at.isoformat(),
-                    "next_run_at": next_after.isoformat(),
+                    "missed_from": _iso(observed_next_run_at),
+                    "next_run_at": _iso(next_after),
                 },
                 run_id=skipped.id,
             )
@@ -210,7 +229,7 @@ class AutomationScheduler:
             session,
             schedule,
             "OCCURRENCE_DUE",
-            {"run_id": run.id, "scheduled_for": scheduled_for.isoformat(), "state": state},
+            {"run_id": run.id, "scheduled_for": _iso(scheduled_for), "state": state},
             run_id=run.id,
         )
         if due.coalesced:
@@ -221,7 +240,7 @@ class AutomationScheduler:
                 {
                     "policy": schedule.misfire_policy,
                     "coalesced": due.coalesced,
-                    "scheduled_for": scheduled_for.isoformat(),
+                    "scheduled_for": _iso(scheduled_for),
                 },
                 run_id=run.id,
             )
@@ -234,6 +253,10 @@ class AutomationScheduler:
         next_run_at: datetime,
         now: datetime,
     ) -> _Due | None:
+        # SQLite hands back naive datetimes; comparing them with aware values
+        # raises TypeError, so every instant is normalised to UTC first.
+        next_run_at = as_utc(next_run_at)
+        now = as_utc(now)
         if schedule.misfire_policy == "skip":
             tolerance = timedelta(seconds=MISFIRE_TOLERANCE_SECONDS)
             if next_run_at + tolerance < now:
@@ -258,52 +281,146 @@ class AutomationScheduler:
         return _Due(schedule, latest, coalesced)
 
     # ---------------------------------------------------------------- claims
+    @staticmethod
+    def _claimable(now: datetime):
+        """Rows a worker may claim now (same predicate for selection and CAS).
+
+        * ``queued`` occurrences whose not-before time has passed;
+        * active rows whose lease is gone (crash) or was never written. A
+          ``cancelling`` row with a live lease belongs to its running attempt
+          and is NOT claimable, so two workers never advance one occurrence.
+        """
+        return (
+            (
+                (AutomationRunRow.state == "queued")
+                & (
+                    AutomationRunRow.next_attempt_at.is_(None)
+                    | (AutomationRunRow.next_attempt_at <= now)
+                )
+            )
+            | (
+                AutomationRunRow.state.in_(ACTIVE_STATES)
+                & (
+                    AutomationRunRow.lease_until.is_(None)
+                    | (AutomationRunRow.lease_until < now)
+                )
+            )
+        )
+
     def claim_due(
         self, session: Session, *, now: datetime | None = None, worker_id: str | None = None
     ) -> RunLease | None:
         """Claim one queued (or lease-expired) occurrence, bumping the fence."""
-        now = (now or datetime.now(UTC)).astimezone(UTC)
+        now = as_utc(now or datetime.now(UTC))
         worker = worker_id or self.worker_id
-        expiry = now
-        run = session.execute(
-            select(AutomationRunRow)
-            .where(
-                (AutomationRunRow.state == "queued")
-                # A queued cancellation is reclaimed so it can finish as
-                # `cancelled` instead of staying "cancelling" forever.
-                | (AutomationRunRow.state == "cancelling")
-                | (
-                    AutomationRunRow.state.in_(ACTIVE_STATES)
-                    & AutomationRunRow.lease_until.is_not(None)
-                    & (AutomationRunRow.lease_until < expiry)
-                )
+        for _ in range(CLAIM_CANDIDATES):
+            candidate = session.execute(
+                select(AutomationRunRow.id, AutomationRunRow.fence)
+                .where(self._claimable(now))
+                .order_by(AutomationRunRow.scheduled_for)
+                .limit(1)
+            ).first()
+            if candidate is None:
+                return None
+            lease = self._claim_cas(
+                session,
+                run_id=candidate.id,
+                observed_fence=candidate.fence,
+                now=now,
+                worker=worker,
             )
-            .order_by(AutomationRunRow.scheduled_for)
-            .limit(1)
-        ).scalars().first()
-        if run is None:
-            return None
+            if lease is not None:
+                return lease
+            # Another claimant won this row between our read and write: look
+            # at the next candidate instead of reporting a false empty queue.
+        return None
 
-        observed_fence = run.fence
-        recovered = run.state in ACTIVE_STATES
-        run.state = "running"
-        run.lease_owner = worker
-        run.lease_until = now + timedelta(seconds=self.lease_seconds)
-        run.fence = observed_fence + 1
-        run.attempt = (run.attempt or 0) + 1
-        if run.started_at is None:
-            run.started_at = now
-        session.flush()
+    def claim_run(
+        self,
+        session: Session,
+        *,
+        run_id: str,
+        owner_id: str,
+        now: datetime | None = None,
+        worker_id: str | None = None,
+    ) -> RunLease | None:
+        """Claim one specific occurrence (run-now), under the same fence rules.
+
+        Returns None when the occurrence is missing, belongs to another owner,
+        or is already leased by an attempt that is still alive.
+        """
+        now = as_utc(now or datetime.now(UTC))
+        worker = worker_id or self.worker_id
+        candidate = session.execute(
+            select(AutomationRunRow.id, AutomationRunRow.fence).where(
+                AutomationRunRow.id == run_id,
+                AutomationRunRow.owner_id == owner_id,
+            )
+        ).first()
+        if candidate is None:
+            return None
+        return self._claim_cas(
+            session,
+            run_id=candidate.id,
+            observed_fence=candidate.fence,
+            now=now,
+            worker=worker,
+            owner_id=owner_id,
+        )
+
+    def _claim_cas(
+        self,
+        session: Session,
+        *,
+        run_id: str,
+        observed_fence: int,
+        now: datetime,
+        worker: str,
+        owner_id: str | None = None,
+    ) -> RunLease | None:
+        """Compare-and-set claim: the UPDATE only applies if the row is still
+        claimable at the fence we observed (S5). Rowcount 0 means we lost."""
+        observed = session.execute(
+            select(AutomationRunRow.state).where(AutomationRunRow.id == run_id)
+        ).first()
+        if observed is None:
+            return None
+        recovered = observed.state in ACTIVE_STATES
+        lease_until = now + timedelta(seconds=self.lease_seconds)
+        criteria = [
+            AutomationRunRow.id == run_id,
+            AutomationRunRow.fence == observed_fence,
+            self._claimable(now),
+        ]
+        if owner_id is not None:
+            criteria.append(AutomationRunRow.owner_id == owner_id)
+        result = session.execute(
+            update(AutomationRunRow)
+            .where(*criteria)
+            .values(
+                state="running",
+                lease_owner=worker,
+                lease_until=lease_until,
+                fence=observed_fence + 1,
+                attempt=AutomationRunRow.attempt + 1,
+                next_attempt_at=None,
+                started_at=func.coalesce(AutomationRunRow.started_at, now),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            return None
+        new_fence = observed_fence + 1
         self.repository.append_event(
             session,
-            run_id=run.id,
+            run_id=run_id,
             type="LEASE_RECOVERED" if recovered else "RUN_CLAIMED",
-            payload={"worker": worker, "fence": run.fence},
+            payload={"worker": worker, "fence": new_fence},
         )
-        return RunLease(run_id=run.id, fence=run.fence, lease_until=run.lease_until)
+        return RunLease(run_id=run_id, fence=new_fence, lease_until=lease_until)
 
     def heartbeat(self, session: Session, run_id: str, fence: int, *, now: datetime | None = None) -> bool:
-        now = (now or datetime.now(UTC)).astimezone(UTC)
+        now = as_utc(now or datetime.now(UTC))
         run = session.get(AutomationRunRow, run_id)
         if run is None or run.fence != fence or run.state not in ACTIVE_STATES + ("running",):
             return False
@@ -341,11 +458,18 @@ class AutomationScheduler:
         request_key: str,
         now: datetime | None = None,
     ) -> AutomationRunRow:
-        """Run-now: idempotent by request key, never shifts the calendar."""
-        now = (now or datetime.now(UTC)).astimezone(UTC)
+        """Run-now: idempotent by request key, never shifts the calendar.
+
+        The replay lookup is scoped to the caller's owner, so another owner who
+        guesses a schedule id and request key can never read this occurrence (AU1-36).
+        """
+        now = as_utc(now or datetime.now(UTC))
         key = f"manual:{schedule_id}:{request_key}"
         existing = session.execute(
-            select(AutomationRunRow).where(AutomationRunRow.occurrence_key == key)
+            select(AutomationRunRow).where(
+                AutomationRunRow.occurrence_key == key,
+                AutomationRunRow.owner_id == owner_id,
+            )
         ).scalar_one_or_none()
         if existing is not None:
             return existing

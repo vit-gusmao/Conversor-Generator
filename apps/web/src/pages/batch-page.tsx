@@ -218,8 +218,13 @@ export function BatchPage() {
   }
 
   function handleRetryItem(item: BatchItem) {
+    // `upload_failed` is not retried from here: the server cannot receive the
+    // bytes from this page, so the retry would leave the item stuck uploading.
+    if (item.status === 'upload_failed') return;
     retryItemMutation.mutate(
-      { itemId: item.item_id, scope: item.status === 'upload_failed' ? 'upload' : 'conversion' },
+      // Only an item that has a conversion can retry the conversion; an item
+      // without one (e.g. cancelled before its upload finished) must upload again.
+      { itemId: item.item_id, scope: item.conversion_id ? 'conversion' : 'upload' },
       {
         onSuccess: () => {
           toast({ title: 'Nova tentativa iniciada', description: item.filename, variant: 'info' });
@@ -373,6 +378,12 @@ export function BatchPage() {
                               {item.error.message}
                             </p>
                           ) : null}
+                          {item.status === 'upload_failed' ? (
+                            <p className="text-xs text-muted-2" aria-live="polite">
+                              O envio deste arquivo foi interrompido e não pode ser retomado nesta tela. Envie o
+                              arquivo novamente pela tela inicial.
+                            </p>
+                          ) : null}
                         </div>
 
                         <BatchItemStatusBadge status={item.status} />
@@ -390,9 +401,7 @@ export function BatchPage() {
                               Cancelar
                             </Button>
                           ) : null}
-                          {item.status === 'failed' ||
-                          item.status === 'upload_failed' ||
-                          item.status === 'cancelled' ? (
+                          {item.status === 'failed' || item.status === 'cancelled' ? (
                             <Button
                               variant="secondary"
                               size="sm"

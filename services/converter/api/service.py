@@ -15,10 +15,11 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from api.deps import ApiError
+from api.serialization import iso_utc
 from config import settings
 from exports.base import ExportError, ExportOptions
 from exports.registry import run_export
@@ -534,9 +535,10 @@ class ConversionService:
             session.add(document)
             session.flush()
             session.add(conversion)
-            session.commit()
+            session.flush()
+            conversion_id = conversion.id
 
-            run = self._start_run(
+            run_id, payload = self._stage_run(
                 session,
                 conversion,
                 storage_key=storage_key,
@@ -544,35 +546,41 @@ class ConversionService:
                 options=normalized,
             )
 
+            # The idempotency row is part of the same transaction as the
+            # conversion: a lost race rolls everything back, so the loser never
+            # leaves a queued run behind.
             if idempotency_key:
                 session.add(
                     IdempotencyKeyRow(
                         owner_id=owner_id,
                         key=idempotency_key[:128],
-                        conversion_id=conversion.id,
+                        conversion_id=conversion_id,
                         request_hash=request_hash,
                     )
                 )
-                try:
-                    session.commit()
-                except IntegrityError:
-                    # Two requests with the same key raced: the unique constraint
-                    # picked a winner and this request replays that conversion
-                    # instead of creating a duplicate or failing with 500.
-                    session.rollback()
+            try:
+                session.commit()
+            except IntegrityError:
+                # Two requests with the same key raced: the unique constraint
+                # picked a winner and this request replays that conversion
+                # instead of creating a duplicate or failing with 500.
+                session.rollback()
+                if idempotency_key:
                     existing = self._idempotent(session, owner_id, idempotency_key, request_hash)
                     if existing is not None:
                         return existing
-                    raise
-                except Exception:
-                    session.rollback()
-                    raise
+                raise
+            except Exception:
+                session.rollback()
+                raise
 
+            # Only the request that committed the rows admits the job.
+            self.queue.submit(run_id, payload)
             return {
-                "conversion_id": conversion.id,
-                "status": run.status,
+                "conversion_id": conversion_id,
+                "status": "queued",
                 "message": "Conversão recebida e enfileirada.",
-                "links": _links(conversion.id),
+                "links": _links(conversion_id),
             }
         finally:
             session.close()
@@ -605,7 +613,7 @@ class ConversionService:
             "links": _links(conversion.id),
         }
 
-    def _start_run(
+    def _stage_run(
         self,
         session,
         conversion: PublicConversionRow,
@@ -613,7 +621,13 @@ class ConversionService:
         storage_key: str,
         filename: str,
         options: dict[str, Any] | None = None,
-    ) -> Run:
+    ) -> tuple[str, dict[str, Any]]:
+        """Adds the run and its first event to the session. Does not commit.
+
+        Returns the run id and the queue payload. The caller submits the job
+        only after its transaction has committed, so a rolled-back admission
+        never reaches a worker.
+        """
         attempt = 1
         if conversion.active_run_id:
             previous = session.get(Run, conversion.active_run_id)
@@ -633,6 +647,8 @@ class ConversionService:
             started_at=_now(),
         )
         session.add(run)
+        # The run row must exist before the conversion points at it.
+        session.flush()
         conversion.active_run_id = run_id
         conversion.status = "queued"
         conversion.stage = "receive"
@@ -653,18 +669,13 @@ class ConversionService:
                 payload_json={"attempt": attempt},
             )
         )
-        session.commit()
-
-        self.queue.submit(
-            run_id,
-            {
-                "conversion_id": conversion.id,
-                "storage_key": storage_key,
-                "filename": filename,
-                "options": effective_options,
-            },
-        )
-        return run
+        payload = {
+            "conversion_id": conversion.id,
+            "storage_key": storage_key,
+            "filename": filename,
+            "options": effective_options,
+        }
+        return run_id, payload
 
     # ------------------------------------------------------------------ #
     # Read
@@ -714,8 +725,8 @@ class ConversionService:
                         "size_bytes": document.size_bytes,
                         "tables": stats.get("tables"),
                         "cells": stats.get("cells"),
-                        "created_at": conversion.created_at.isoformat(),
-                        "updated_at": conversion.updated_at.isoformat(),
+                        "created_at": iso_utc(conversion.created_at),
+                        "updated_at": iso_utc(conversion.updated_at),
                     }
                 )
             return {"items": items, "total": total, "page": page, "page_size": page_size}
@@ -1071,21 +1082,45 @@ class ConversionService:
             document = session.get(PublicDocumentRow, conversion.document_id)
             if document is None:
                 raise ApiError(404, "NOT_FOUND", "Documento original não encontrado.")
-            run = self._start_run(
+            storage_key = document.storage_key
+            filename = document.filename
+
+            # Claim the terminal conversion atomically. Two retries that both
+            # read the same terminal status race here: only one UPDATE matches
+            # the WHERE clause, the other loses and is told the work is active.
+            claimed = session.execute(
+                update(PublicConversionRow)
+                .where(
+                    PublicConversionRow.id == conversion.id,
+                    PublicConversionRow.status.in_(TERMINAL),
+                )
+                .values(status="queued")
+                .execution_options(synchronize_session=False)
+            ).rowcount
+            if claimed != 1:
+                session.rollback()
+                raise ApiError(409, "ALREADY_ACTIVE", "A conversão já está em andamento.")
+            session.refresh(conversion)
+
+            run_id, payload = self._stage_run(
                 session,
                 conversion,
-                storage_key=document.storage_key,
-                filename=document.filename,
+                storage_key=storage_key,
+                filename=filename,
                 options=conversion.options_json or {},
             )
-            return {
-                "conversion_id": conversion.id,
-                "status": run.status,
-                "message": "Nova execução criada.",
-                "links": _links(conversion.id),
-            }
+            session.commit()
+            conversion_ref = conversion.id
         finally:
             session.close()
+
+        self.queue.submit(run_id, payload)
+        return {
+            "conversion_id": conversion_ref,
+            "status": "queued",
+            "message": "Nova execução criada.",
+            "links": _links(conversion_ref),
+        }
 
     def cancel(self, *, owner_id: str, conversion_id: str) -> dict[str, Any]:
         session = get_session_factory()()
@@ -1217,14 +1252,20 @@ def _detail(conversion, document, run) -> dict[str, Any]:
             "size_bytes": document.size_bytes,
             "sha256": document.sha256,
             "page_count": document.page_count,
-            "created_at": document.created_at.isoformat(),
+            "created_at": iso_utc(document.created_at),
         },
-        "run": {
-            "run_id": run.id,
-            "attempt": run.attempt,
-            "started_at": run.started_at.isoformat() if run.started_at else None,
-            "finished_at": run.finished_at.isoformat() if run.finished_at else None,
-        },
+        # A conversion can exist before its first run is recorded; the detail
+        # is still meaningful without one.
+        "run": (
+            {
+                "run_id": run.id,
+                "attempt": run.attempt,
+                "started_at": iso_utc(run.started_at),
+                "finished_at": iso_utc(run.finished_at),
+            }
+            if run is not None
+            else None
+        ),
         "stats": stats or None,
         "validation": validation,
         "error": (
@@ -1237,8 +1278,8 @@ def _detail(conversion, document, run) -> dict[str, Any]:
             if run and run.error_code
             else None
         ),
-        "created_at": conversion.created_at.isoformat(),
-        "updated_at": conversion.updated_at.isoformat(),
+        "created_at": iso_utc(conversion.created_at),
+        "updated_at": iso_utc(conversion.updated_at),
         "links": _links(conversion.id),
     }
 

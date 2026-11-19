@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from config import SERVICE_DIR
-from knowledge.chunker import chunk_study_text, chunk_text_plan
+from knowledge.chunker import ChunkDraft, chunk_study_text, chunk_text_plan
 from knowledge.repository import KnowledgeRepository
 from models.db import PublicConversionRow, PublicDocumentRow, get_session_factory
 from repositories.conversion_repository import ConversionRepository
@@ -38,6 +38,11 @@ class IndexingError(Exception):
 
 
 class KnowledgeIndexer:
+    #: Marks user-facing jobs that run on their own in-process thread and take
+    #: no lease. The lease dispatcher must never recover or claim them, or the
+    #: same job would run twice.
+    LEGACY_DISPATCH = "legacy-thread"
+
     def __init__(self, repository: KnowledgeRepository | None = None) -> None:
         self.repo = repository or KnowledgeRepository()
         self.conversions = ConversionRepository()
@@ -57,6 +62,7 @@ class KnowledgeIndexer:
                 "conversion_ids": request.get("conversion_ids") or [],
                 "source_paths": request.get("source_paths") or [],
                 "scope": request.get("scope") or "documents",
+                "dispatch": self.LEGACY_DISPATCH,
             },
         )
         _executor.submit(self.run_job, job["job_id"], owner_id)
@@ -75,7 +81,28 @@ class KnowledgeIndexer:
                 conversion_ids=source.get("conversion_ids") or [],
                 source_paths=source.get("source_paths") or [],
             )
-            self.repo.update_job(job_id, status="completed", stats=stats)
+            # Same outcome rules as KnowledgeJobRunner.execute: a partial result is
+            # reported as "partial", never as a clean "completed".
+            failed = int(stats.get("failed") or 0)
+            total_documents = len(stats.get("documents") or [])
+            if failed and not stats.get("chunks"):
+                self.repo.update_job(
+                    job_id,
+                    status="failed",
+                    stats=stats,
+                    error_code="INDEX_FAILED",
+                    error_message="Nenhum documento foi indexado.",
+                )
+            elif failed:
+                self.repo.update_job(
+                    job_id,
+                    status="partial",
+                    stats=stats,
+                    error_code="INDEX_PARTIAL",
+                    error_message=f"{failed} de {total_documents} documento(s) não foram indexados.",
+                )
+            else:
+                self.repo.update_job(job_id, status="completed", stats=stats)
         except IndexingError as exc:
             self.repo.update_job(
                 job_id, status="failed", error_code=exc.code, error_message=exc.message
@@ -169,10 +196,12 @@ class KnowledgeIndexer:
                     "source_type": payload.get("source_type") or "pdf",
                 }
             )
-        count = self.repo.replace_document_chunks(
+        count, status = self._write_document(
             owner_id=owner_id,
             collection_id=collection_id,
+            conversion_id=conversion_id,
             document_id=conversion.document_id,
+            run_id=run_id,
             drafts=drafts,
         )
         return {
@@ -180,7 +209,7 @@ class KnowledgeIndexer:
             "conversion_id": conversion_id,
             "run_id": run_id,
             "name": filename,
-            "status": "indexed",
+            "status": status,
             "chunks": count,
         }
 
@@ -240,10 +269,12 @@ class KnowledgeIndexer:
                     "source_type": payload.get("source_type") or "pdf",
                 }
             )
-        count = self.repo.replace_document_chunks(
+        count, status = self._write_document(
             owner_id=owner_id,
             collection_id=collection_id,
+            conversion_id=conversion_id,
             document_id=document_id,
+            run_id=run_id,
             drafts=drafts,
         )
         return {
@@ -251,9 +282,61 @@ class KnowledgeIndexer:
             "conversion_id": conversion_id,
             "run_id": run_id,
             "name": filename,
-            "status": "indexed",
+            "status": status,
             "chunks": count,
         }
+
+    def _write_document(
+        self,
+        *,
+        owner_id: str,
+        collection_id: str,
+        conversion_id: str,
+        document_id: str,
+        run_id: str,
+        drafts: list[ChunkDraft],
+    ) -> tuple[int, str]:
+        """Write a document's chunks, then promote it as the logical file's head.
+
+        Chunks are committed before the head moves, so search never sees a
+        generation whose chunks are incomplete. The head is read before the
+        write and promoted by compare-and-set: if another generation was
+        promoted in between, this document stays inactive and is reported as
+        ``superseded``. If the write raises, the previous head is untouched.
+
+        Conversions that did not come from a source import have no logical file
+        and keep the plain behaviour (``indexed``, always searchable).
+        """
+        origin = self.repo.source_origin(owner_id, conversion_id)
+        if origin is None:
+            count = self.repo.replace_document_chunks(
+                owner_id=owner_id,
+                collection_id=collection_id,
+                document_id=document_id,
+                drafts=drafts,
+            )
+            return count, "indexed"
+
+        expected = self.repo.head_generation(owner_id, collection_id, origin)
+        for draft in drafts:
+            draft.metadata.update(
+                {"source_id": origin["source_id"], "relative_path": origin["relative_path"]}
+            )
+        count = self.repo.replace_document_chunks(
+            owner_id=owner_id,
+            collection_id=collection_id,
+            document_id=document_id,
+            drafts=drafts,
+        )
+        promoted = self.repo.promote_source_head(
+            owner_id=owner_id,
+            collection_id=collection_id,
+            origin=origin,
+            document_id=document_id,
+            run_id=run_id,
+            expected_generation=expected,
+        )
+        return count, ("indexed" if promoted else "superseded")
 
     # -- study -------------------------------------------------------------
     def _index_study_file(self, owner_id: str, collection_id: str, source_path: str) -> dict[str, Any]:

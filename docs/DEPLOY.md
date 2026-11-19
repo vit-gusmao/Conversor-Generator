@@ -98,7 +98,7 @@ faça commit de valores reais.
 | --- | --- | --- |
 | `UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | aplicado pela API e pelo motor. Um proxy intermediário pode impor limite menor: confira |
 | `CONVERTER_MAX_PAGES`, `UPLOAD_MAX_PAGES` | vazio (sem teto) | **Legado.** O motor nunca recusa nem trunca por eles: no máximo registra aviso. No NestJS, `UPLOAD_MAX_PAGES` definida rejeita com `TOO_MANY_PAGES`. O compose não define nenhuma das duas |
-| `AUTH_MODE` | `optional` | sessão por navegador, sem login. `required` exige Bearer nas rotas protegidas. No NestJS, `POST /auth/anonymous` continua emitindo token (201); no motor standalone, esse endpoint devolve 401 nesse modo. Não há tela de login |
+| `AUTH_MODE` | `optional` | sessão por navegador, sem login. `required` exige Bearer nas rotas protegidas. `POST /auth/anonymous` responde 201 em qualquer modo, tanto no NestJS quanto no motor standalone. Não há tela de login |
 | `RETENTION_PDF_DAYS`, `RETENTION_XLSX_DAYS`, `RETENTION_AUDIT_DAYS` | `7` / `30` / `90` | informados em `/settings`. Nenhum job aplica esses prazos; veja o item 10 do checklist |
 | `LOG_LEVEL`, `LOG_JSON` | `INFO`, `1` nas imagens | |
 
@@ -110,7 +110,7 @@ faça commit de valores reais.
 | `LARGE_DOCUMENT_PIPELINE_ENABLED` | `true` | Processamento do documento inteiro, página por página |
 | `UPLOAD_PART_BYTES` | `8388608` | Parte de transporte (não é teto de documento) |
 | `UPLOAD_PART_MAX_BYTES` | `33554432` | Maior parte aceita pela API |
-| `UPLOAD_CONCURRENCY` | `3` | Lida pela configuração do NestJS, mas não anunciada nem usada. A interface usa 3 fixo |
+| `UPLOAD_CONCURRENCY` | `3` | Lida pela configuração do NestJS e do motor, mas não é anunciada em `/capabilities` nem altera o paralelismo das rotas verificadas |
 | `UPLOAD_SESSION_TTL_HOURS` | `24` | Validade de sessão de upload incompleta |
 | `MAX_FILES_PER_BATCH` | vazio (sem teto) | Só para operadores que quiserem limitar admissão |
 | `UPLOAD_MAX_FILE_BYTES` | vazio (sem teto) | Idem, por documento |
@@ -255,9 +255,16 @@ Notas para o modo B (container único) e para o storage local:
 ## Infra do compose (A)
 
 - O compose sobe `postgres:16-alpine`, `redis:7-alpine`, `minio`, `minio-init`
-  (executa uma vez para criar o bucket), `converter`, `worker` (Celery), `api` e
-  `web`. O `web` é o ponto de entrada da interface; API, motor, banco, Redis e
+  (executa uma vez para criar o bucket), `converter`, `worker` (Celery), `automation`,
+  `api` e `web`. O `web` é o ponto de entrada da interface; API, motor, banco, Redis e
   MinIO ficam na rede interna `backend`.
+- O serviço `automation` roda `python -m automation.cli` (mesma imagem do motor, sem
+  HTTP). Ele liga `AUTOMATION_EXECUTOR_ENABLED=true` e envia os efeitos pelo gateway
+  NestJS (`CONVERTER_PUBLIC_URL=http://api:3000`). Ele monta a pasta do host definida
+  por `SOURCE_ROOTS_DIR` (padrão `./sources`, relativo a `infra/`) como `/sources`
+  somente leitura. Registre as raízes dentro do container como `/sources/<nome>`, não
+  como caminhos do host. O `converter` não deve ligar o executor ao mesmo tempo, para
+  haver um único calendário.
 - Somente o `web` publica uma porta (`WEB_PORT`, padrão `8080`, em loopback). Para
   acessar a API diretamente do host (por exemplo, com `curl`), adicione um `ports`
   ao serviço `api` ligado em loopback, como `127.0.0.1:3000:3000`.

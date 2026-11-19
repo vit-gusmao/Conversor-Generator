@@ -236,6 +236,24 @@ Isso não significa nuvem. Quando `S3_ENDPOINT` aponta para o MinIO do compose (
 
 O `work/` continua local mesmo com S3: `materialize` baixa o objeto para `work/<run_id>.source` antes do run (veja a seção 2.4).
 
+### 5.1 Erros do S3
+
+O mapeamento de erros é diferente em cada processo:
+
+- **Gateway** (`apps/api/src/upload/s3-storage.service.ts`): ausência do objeto
+  (`NoSuchKey`, `NotFound` ou HTTP 404) vira `404 NOT_FOUND` com
+  `reason: storage_object_not_found` nas leituras. `exists` devolve `false` nesse
+  caso. Qualquer outra falha vira `503 STORAGE_UNAVAILABLE`, com `backend: s3` e a
+  operação (`put`, `get`, `exists`, `put_stream`, `open_read`, criação de envio
+  em partes).
+- **Motor** (`services/converter/storage/s3.py`): `exists` e `delete` devolvem
+  `False` em qualquer erro, sem distinguir causa. `get_bytes` e `open_read` deixam
+  a exceção do boto3 subir. Nas rotas que leem o objeto, isso chega ao cliente
+  como `500 INTERNAL`, e não como `404` ou `503`.
+
+O backend local (`LocalStorage`) não tem esse mapeamento: `exists` devolve
+`False` quando o arquivo não existe.
+
 ---
 
 ## 6. Ciclo de vida e retenção
@@ -249,7 +267,7 @@ O `work/` continua local mesmo com S3: `materialize` baixa o objeto para `work/<
 Outros comportamentos com a mesma característica:
 
 - **Partes de upload não são apagadas após `complete`**. Nos dois lados (converter e NestJS), a montagem cria o documento final e as partes permanecem. Um documento enviado por partes passa a ocupar aproximadamente **2 vezes o tamanho do arquivo** (partes mais documento final) até alguém limpar manualmente.
-- **Sessões de upload expiram só na prática**. `UPLOAD_SESSION_TTL_HOURS` (padrão 24) é verificado apenas em `PUT` de parte, que passa a responder `410`. Não há varredura de sessões antigas.
+- **Sessões de upload expiram só na prática**. `UPLOAD_SESSION_TTL_HOURS` (padrão 24) é verificado no `PUT` de parte, que passa a responder `410` no standalone e `409 UPLOAD_EXPIRED` no gateway. No gateway, o `complete` também verifica a expiração (`409 UPLOAD_EXPIRED`) antes de montar o documento. No standalone, o `complete` não verifica: uma sessão expirada com todas as partes ainda pode ser concluída. Não há varredura de sessões antigas.
 - **Exclusão de conversão é lógica**. A linha recebe `deleted_at` em `public_conversions`, e só `runs/<run_id>/output.xlsx` e `runs/<run_id>/audit.json.gz` são removidos (melhor esforço, erros ignorados).
 
 ### 6.2 O que sobra no disco

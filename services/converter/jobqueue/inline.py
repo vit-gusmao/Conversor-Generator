@@ -61,7 +61,7 @@ class InlineQueue(JobQueue):
         self._scheduler.wake()
 
     # -- execution ---------------------------------------------------------
-    def _run_lease(self, *, lease, repo: JobRepository) -> None:
+    def _run_lease(self, *, lease, repo: JobRepository, lease_lost: threading.Event | None = None) -> None:
         from worker.tasks import execute_run
 
         payload: dict = {}
@@ -71,9 +71,21 @@ class InlineQueue(JobQueue):
             except ValueError:
                 payload = {}
 
+        # The timer may fire at any moment, including just after the unit has
+        # finished. `finished` is set under `gate` before the timer is cancelled,
+        # so a late firing can no longer mark a completed unit as timed out.
+        gate = threading.Lock()
+        finished = False
+
+        def _fire_timeout() -> None:
+            with gate:
+                if finished:
+                    return
+                self._on_timeout(lease.run_id)
+
         timer: threading.Timer | None = None
         if self._timeout and self._timeout > 0:
-            timer = threading.Timer(max(1, self._timeout), self._on_timeout, args=(lease.run_id,))
+            timer = threading.Timer(max(1, self._timeout), _fire_timeout)
             timer.daemon = True
             timer.start()
 
@@ -85,7 +97,7 @@ class InlineQueue(JobQueue):
                 storage_key=payload.get("storage_key", ""),
                 filename=payload.get("filename", "documento.pdf"),
                 options=payload.get("options") or {},
-                cancel_check=self._check(lease.run_id),
+                cancel_check=self._check(lease.run_id, lease_lost),
                 job_id=lease.job_id,
                 fence=lease.fence,
                 # A re-claim (attempt > 1) is a redelivery: it may adopt the
@@ -96,6 +108,8 @@ class InlineQueue(JobQueue):
         except Exception:  # noqa: BLE001 - the worker must never kill the pool
             logger.exception("inline worker crashed for run %s", lease.run_id)
         finally:
+            with gate:
+                finished = True
             if timer is not None:
                 timer.cancel()
             with self._lock:
@@ -123,12 +137,12 @@ class InlineQueue(JobQueue):
             "run %s exceeded the %ss time limit and was asked to stop", run_id, self._timeout
         )
 
-    def _check(self, run_id: str):
+    def _check(self, run_id: str, lease_lost: threading.Event | None = None):
         """Cancellation gate handed to the pipeline.
 
         The in-process flags cover the local case; the durable request is read
         too, so a cancellation issued by another process is observed between
-        pages as well.
+        pages as well. A lost lease also stops the unit: another owner holds it.
         """
 
         def check() -> bool:
@@ -143,7 +157,7 @@ class InlineQueue(JobQueue):
                     f"A conversão excedeu o tempo máximo de {self._timeout}s.",
                     retryable=True,
                 )
-            if cancelled:
+            if cancelled or (lease_lost is not None and lease_lost.is_set()):
                 return True
             try:
                 return self.repo.cancel_requested(run_id)

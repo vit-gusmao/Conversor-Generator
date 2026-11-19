@@ -221,6 +221,7 @@ def _write_header(worksheet, sheet_plan: SheetPlan) -> int:
         cell.border = _BORDER
         cell.alignment = Alignment(vertical="center", horizontal="left", wrap_text=True)
     worksheet.row_dimensions[1].height = 22
+    return replaced_total
 
 
 def _write_widths(worksheet, sheet_plan: SheetPlan, widths: dict[int, int]) -> None:

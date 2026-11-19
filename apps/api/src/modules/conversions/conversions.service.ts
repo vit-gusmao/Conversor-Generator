@@ -1,5 +1,5 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
-import type { Prisma } from '@prisma/client';
+import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
+import type { Conversion, Prisma } from '@prisma/client';
 import {
   ConversionOptionsError,
   canonicalOptionsJson,
@@ -34,6 +34,7 @@ import {
   extensionForImageFormat,
   type FileInspection,
 } from '../../upload/file-validation.service';
+import { BatchesService } from '../batches/batches.service';
 import { ConversionEventsService } from '../realtime/conversion-events.service';
 
 import { ConverterClient, type DownloadPayload } from './converter.client';
@@ -54,6 +55,18 @@ import {
 } from './conversions.mapper';
 import { OUTBOX_ENQUEUE, OutboxService } from './outbox.service';
 import { assertNotTerminal, assertOwnership } from './ownership';
+
+/** Rows written by one queued-conversion transaction. */
+interface QueuedInsert {
+  conversion: Conversion;
+  runId: string;
+  outboxId: string;
+}
+
+/** Prisma's unique-constraint violation (P2002), e.g. a racing duplicate. */
+function isUniqueViolation(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2002';
+}
 
 /** A document already persisted in object storage. */
 export interface StoredSource {
@@ -78,6 +91,7 @@ export class ConversionsService {
     private readonly config: AppConfigService,
     private readonly events: ConversionEventsService,
     private readonly outbox: OutboxService,
+    @Inject(forwardRef(() => BatchesService)) private readonly batches: BatchesService,
   ) {}
 
   /* ------------------------------- create -------------------------------- */
@@ -142,7 +156,7 @@ export class ConversionsService {
     options: ConversionOptionsV2 | ConversionOptionsV3,
     meta: { idempotencyKey?: string; documentId?: string } = {},
   ): Promise<CreateConversionResponse> {
-    const { storageKey, sha256, sizeBytes, filename, mimeType } = source;
+    const { sha256, filename } = source;
     const key = meta.idempotencyKey?.trim();
     const fingerprint = requestFingerprint(sha256, options);
 
@@ -151,19 +165,89 @@ export class ConversionsService {
         where: { ownerId_key: { ownerId: user.id, key } },
       });
       if (existing) {
-        const matches = existing.requestHash === fingerprint || existing.requestHash === sha256;
-        if (!matches) {
-          throw ApiError.conflict(ERROR_CODES.IDEMPOTENT_REPLAY, { reason: 'payload_mismatch' });
-        }
-        const replayed = await this.findRow(existing.conversionId);
-        if (replayed) {
-          return this.queuedResponse(replayed, 'Conversão já recebida anteriormente.');
-        }
+        const replayed = await this.replayIdempotent(existing, fingerprint, sha256);
+        if (replayed) return replayed;
       }
     }
 
     const queuedProgress = progressFloorForStatus('queued');
-    const created = await this.prisma.$transaction(async (tx) => {
+    let created: QueuedInsert;
+    try {
+      created = await this.insertQueuedConversion(user, source, options, {
+        key,
+        fingerprint,
+        queuedProgress,
+      });
+    } catch (error) {
+      // Two requests with the same key raced past the lookup above. The unique
+      // index on (ownerId, key) rejected the later one, so the winner's
+      // conversion is the answer for both (A-21).
+      if (key && isUniqueViolation(error)) {
+        const winner = await this.prisma.idempotencyKey.findUnique({
+          where: { ownerId_key: { ownerId: user.id, key } },
+        });
+        if (winner) {
+          const replayed = await this.replayIdempotent(winner, fingerprint, sha256);
+          if (replayed) return replayed;
+        }
+      }
+      throw error;
+    }
+
+    await this.events.record(created.conversion.id, {
+      type: 'status',
+      status: 'queued',
+      stage: stageKeyForStatus('queued'),
+      progress: queuedProgress,
+      message: 'Conversão recebida e enfileirada.',
+      runId: created.runId,
+      payload: {
+        filename,
+        page_count: source.pageCount ?? null,
+        target_formats: options.target_formats,
+      },
+    });
+
+    // Fire and forget: the outbox row is durable, the drainer retries it.
+    // dispatch() already persists failures, but it can still reject if the
+    // failure write itself fails. Guard the process against an unhandled
+    // rejection: the durable outbox row remains for the drainer.
+    void this.outbox.dispatch(created.outboxId).catch((error: unknown) => {
+      this.logger.warn(`Outbox ${created.outboxId} não pôde ser despachado: ${String(error)}`);
+    });
+
+    return this.queuedResponse(created.conversion, 'Conversão recebida e enfileirada.');
+  }
+
+  /**
+   * Answers a request whose idempotency key already exists: the same payload
+   * replays the stored conversion, a different payload is a conflict.
+   * Returns null when the key points at a conversion that no longer exists.
+   */
+  private async replayIdempotent(
+    existing: { requestHash: string; conversionId: string },
+    fingerprint: string,
+    sha256: string,
+  ): Promise<CreateConversionResponse | null> {
+    const matches = existing.requestHash === fingerprint || existing.requestHash === sha256;
+    if (!matches) {
+      throw ApiError.conflict(ERROR_CODES.IDEMPOTENT_REPLAY, { reason: 'payload_mismatch' });
+    }
+    const replayed = await this.findRow(existing.conversionId);
+    return replayed ? this.queuedResponse(replayed, 'Conversão já recebida anteriormente.') : null;
+  }
+
+  /** Writes document, conversion, first run and outbox row atomically. */
+  private async insertQueuedConversion(
+    user: AuthenticatedUser,
+    source: StoredSource,
+    options: ConversionOptionsV2 | ConversionOptionsV3,
+    meta: { key?: string; fingerprint: string; queuedProgress: number },
+  ): Promise<QueuedInsert> {
+    const { storageKey, sha256, sizeBytes, filename, mimeType } = source;
+    const { key, fingerprint, queuedProgress } = meta;
+
+    return this.prisma.$transaction(async (tx) => {
       const document = await tx.document.create({
         data: {
           filename,
@@ -243,30 +327,6 @@ export class ConversionsService {
 
       return { conversion: queued, runId: run.id, outboxId: outbox.id };
     });
-
-    await this.events.record(created.conversion.id, {
-      type: 'status',
-      status: 'queued',
-      stage: stageKeyForStatus('queued'),
-      progress: queuedProgress,
-      message: 'Conversão recebida e enfileirada.',
-      runId: created.runId,
-      payload: {
-        filename,
-        page_count: source.pageCount ?? null,
-        target_formats: options.target_formats,
-      },
-    });
-
-    // Fire and forget: the outbox row is durable, the drainer retries it.
-    // dispatch() already persists failures, but it can still reject if the
-    // failure write itself fails. Guard the process against an unhandled
-    // rejection: the durable outbox row remains for the drainer.
-    void this.outbox.dispatch(created.outboxId).catch((error: unknown) => {
-      this.logger.warn(`Outbox ${created.outboxId} não pôde ser despachado: ${String(error)}`);
-    });
-
-    return this.queuedResponse(created.conversion, 'Conversão recebida e enfileirada.');
   }
 
   /* --------------------------------- read -------------------------------- */
@@ -393,74 +453,110 @@ export class ConversionsService {
       throw ApiError.conflict(ERROR_CODES.CONVERSION_BUSY, { status });
     }
 
-    const attempt = (row.runs[0]?.attempt ?? 0) + 1;
     const progress = progressFloorForStatus('queued');
     const options = this.optionsForRow(row);
 
-    const run = await this.prisma.conversionRun.create({
-      data: {
-        conversionId: row.id,
-        attempt,
-        status: 'queued',
-        stage: stageKeyForStatus('queued'),
-        progress,
-        startedAt: new Date(),
-      },
-    });
+    // The attempt number is derived inside the transaction, so two retries
+    // cannot both claim the same attempt. The unique (conversionId, attempt)
+    // index is the final guard (A-22).
+    let inserted: { run: { id: string; attempt: number }; updated: Conversion; outboxId: string };
+    try {
+      inserted = await this.prisma.$transaction(async (tx) => {
+        const latest = await tx.conversionRun.findMany({
+          where: { conversionId: row.id },
+          orderBy: { attempt: 'desc' },
+          take: 1,
+          select: { attempt: true },
+        });
+        const attempt = (latest[0]?.attempt ?? 0) + 1;
 
-    const updated = await this.prisma.conversion.update({
-      where: { id: row.id },
-      data: {
-        status: 'queued',
-        stage: stageKeyForStatus('queued'),
-        progress,
-        quality: 'pending',
-        activeRunId: run.id,
-        errorCode: null,
-        errorMessage: null,
-      },
-    });
+        const run = await tx.conversionRun.create({
+          data: {
+            conversionId: row.id,
+            attempt,
+            status: 'queued',
+            stage: stageKeyForStatus('queued'),
+            progress,
+            startedAt: new Date(),
+          },
+        });
+
+        const updated = await tx.conversion.update({
+          where: { id: row.id },
+          data: {
+            status: 'queued',
+            stage: stageKeyForStatus('queued'),
+            progress,
+            quality: 'pending',
+            activeRunId: run.id,
+            errorCode: null,
+            errorMessage: null,
+          },
+        });
+
+        // Outbox row shares the transaction: no queued run without its job message.
+        const outbox = await this.outbox.record(
+          OUTBOX_ENQUEUE,
+          {
+            conversionId: row.id,
+            runId: run.id,
+            storageKey: row.document.storageKey,
+            filename: row.document.filename,
+            options: { conversionOptions: options },
+          },
+          tx,
+        );
+
+        return { run: { id: run.id, attempt }, updated, outboxId: outbox.id };
+      });
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throw ApiError.conflict(ERROR_CODES.CONVERSION_BUSY, { status });
+      }
+      throw error;
+    }
+
+    const { run, updated, outboxId } = inserted;
 
     await this.events.record(row.id, {
       type: 'status',
       status: 'queued',
       stage: stageKeyForStatus('queued'),
       progress,
-      message: `Nova tentativa iniciada (tentativa ${attempt}).`,
+      message: `Nova tentativa iniciada (tentativa ${run.attempt}).`,
       runId: run.id,
-      payload: { attempt },
+      payload: { attempt: run.attempt },
     });
 
-    const outbox = await this.outbox.record(OUTBOX_ENQUEUE, {
-      conversionId: row.id,
-      runId: run.id,
-      storageKey: row.document.storageKey,
-      filename: row.document.filename,
-      options: { conversionOptions: options },
-    });
     // dispatch() already persists failures, but it can still reject if the
     // failure write itself fails. Guard the process against an unhandled
     // rejection: the durable outbox row remains for the drainer.
-    void this.outbox.dispatch(outbox.id).catch((error: unknown) => {
-      this.logger.warn(`Outbox ${outbox.id} não pôde ser despachado: ${String(error)}`);
+    void this.outbox.dispatch(outboxId).catch((error: unknown) => {
+      this.logger.warn(`Outbox ${outboxId} não pôde ser despachado: ${String(error)}`);
     });
 
     return this.queuedResponse(updated, 'Nova tentativa iniciada.');
   }
 
+  /**
+   * Cancels the active run. The conversion is marked cancelled only when the
+   * engine confirms it (A-17). When the engine refuses (the run already
+   * published) or cannot be reached, its state is re-read and the local
+   * conversion is left as it is.
+   */
   async cancel(user: AuthenticatedUser, id: string): Promise<CancelConversionResponse> {
     const row = await this.findOwned(id, user);
     assertNotTerminal(row);
 
     if (row.activeRunId) {
-      try {
-        await this.converter.cancel(row.activeRunId);
-      } catch (error) {
-        // Cancelling is best effort on the engine side; the local state below
-        // is authoritative for the user regardless.
-        this.logger.warn(
-          `Falha ao solicitar cancelamento de ${row.activeRunId}: ${String(error)}`,
-        );
+      const confirmed = await this.confirmEngineCancel(row.activeRunId);
+      if (!confirmed) {
+        return {
+          conversion_id: row.id,
+          status: statusOf(row),
+          message: 'O motor não confirmou o cancelamento; a conversão segue seu curso.',
+          links: linksFor(row.id),
+        };
       }
       await this.prisma.conversionRun.updateMany({
         where: { id: row.activeRunId },
@@ -482,12 +578,41 @@ export class ConversionsService {
       runId: row.activeRunId,
     });
 
+    // No-op unless the conversion is linked to a batch item.
+    try {
+      await this.batches.onConversionTerminal(row.id);
+    } catch (error) {
+      this.logger.warn(`Falha ao atualizar o lote após cancelar ${row.id}: ${String(error)}`);
+    }
+
     return {
       conversion_id: row.id,
       status: 'cancelled',
       message: 'Cancelamento solicitado.',
       links: linksFor(row.id),
     };
+  }
+
+  /**
+   * True only when the engine says it cancelled the run. Any other outcome
+   * (refused, unknown run, unreachable engine) is logged together with the
+   * engine's current status, which is what the caller keeps as the truth.
+   */
+  private async confirmEngineCancel(runId: string): Promise<boolean> {
+    try {
+      const outcome = await this.converter.cancel(runId);
+      if (outcome?.cancelled === true) return true;
+    } catch (error) {
+      this.logger.warn(`Falha ao solicitar cancelamento de ${runId}: ${String(error)}`);
+    }
+
+    try {
+      const state = await this.converter.status(runId);
+      this.logger.warn(`Cancelamento de ${runId} não confirmado; motor reporta ${state.status}`);
+    } catch (error) {
+      this.logger.warn(`Estado de ${runId} indisponível após cancelamento: ${String(error)}`);
+    }
+    return false;
   }
 
   async remove(user: AuthenticatedUser, id: string): Promise<void> {

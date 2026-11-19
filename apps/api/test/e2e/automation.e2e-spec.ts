@@ -75,12 +75,22 @@ describe('Automation parity (upgrade T6)', () => {
 
   it('resolves a Prisma-only conversion into authorized RAG references', async () => {
     const owner = await ownerIdFor('device-auto-1');
+    // The filename lives on the Document row (Conversion has no filename column).
+    prisma.documents.push({
+      id: 'doc_prisma_only',
+      ownerId: owner,
+      filename: 'planilha.xlsx',
+      mimeType: 'application/pdf',
+      sizeBytes: 10,
+      sha256: 'sha-prisma-only',
+      storageKey: 'aa/sha-prisma-only.pdf',
+      createdAt: new Date(),
+    });
     prisma.conversions.push({
       id: 'conv_prisma_only',
       ownerId: owner,
       documentId: 'doc_prisma_only',
       activeRunId: 'run_prisma_only',
-      filename: 'planilha.xlsx',
       deletedAt: null,
       status: 'completed',
     });
@@ -103,6 +113,62 @@ describe('Automation parity (upgrade T6)', () => {
     expect(body.document_id).toBe('doc_prisma_only');
     expect(body.run_id).toBe('run_prisma_only');
     expect(body.owner_id).toBe(owner);
+    expect(body.filename).toBe('planilha.xlsx');
+  });
+
+  it('accepts PATCH as well as PUT for source and schedule updates', async () => {
+    const owner = await ownerIdFor('device-auto-patch');
+    proxyJson.mockClear();
+    proxyJson.mockResolvedValue({ id: 'src-1', updated: true });
+
+    await request(app.getHttpServer())
+      .patch('/api/v1/sources/src-1')
+      .set('x-device-id', 'device-auto-patch')
+      .send({ name: 'nova' })
+      .expect(200);
+    await request(app.getHttpServer())
+      .patch('/api/v1/schedules/sch-1')
+      .set('x-device-id', 'device-auto-patch')
+      .send({ enabled: false })
+      .expect(200);
+
+    expect(proxyJson).toHaveBeenCalledWith(
+      '/internal/v1/sources/src-1',
+      expect.objectContaining({ method: 'PATCH', ownerId: owner }),
+    );
+    expect(proxyJson).toHaveBeenCalledWith(
+      '/internal/v1/schedules/sch-1',
+      expect.objectContaining({ method: 'PATCH', ownerId: owner }),
+    );
+    proxyJson.mockResolvedValue({ status: 'indexed', chunks: 3 });
+  });
+
+  it('forwards the run-events cursor to the engine instead of dropping it', async () => {
+    proxyJson.mockClear();
+    proxyJson.mockResolvedValue({ items: [] });
+
+    await request(app.getHttpServer())
+      .get('/api/v1/schedule-runs/run-cursor/events?after=7')
+      .set('x-device-id', 'device-auto-cursor')
+      .expect(200);
+
+    expect(proxyJson).toHaveBeenCalledWith(
+      '/internal/v1/schedule-runs/run-cursor/events?after=7',
+      expect.objectContaining({ headers: { 'Last-Event-ID': '7' } }),
+    );
+
+    proxyJson.mockClear();
+    await request(app.getHttpServer())
+      .get('/api/v1/schedule-runs/run-cursor/events')
+      .set('x-device-id', 'device-auto-cursor')
+      .set('Last-Event-ID', '3')
+      .expect(200);
+
+    expect(proxyJson).toHaveBeenCalledWith(
+      '/internal/v1/schedule-runs/run-cursor/events?after=3',
+      expect.objectContaining({ headers: { 'Last-Event-ID': '3' } }),
+    );
+    proxyJson.mockResolvedValue({ status: 'indexed', chunks: 3 });
   });
 
   it('treats a foreign conversion as not found without leaking data', async () => {

@@ -17,6 +17,7 @@ import {
 } from '../../common/status';
 import { stringifyJson } from '../../database/json.util';
 import { PrismaService } from '../../database/prisma.service';
+import { BatchesService } from '../batches/batches.service';
 import { AppConfigService } from '../../config/app-config.service';
 import {
   ConverterClient,
@@ -69,6 +70,7 @@ export class ConversionTrackerService implements OnModuleInit, OnModuleDestroy {
     private readonly converter: ConverterClient,
     private readonly events: ConversionEventsService,
     private readonly config: AppConfigService,
+    private readonly batches: BatchesService,
   ) {}
 
   onModuleInit(): void {
@@ -244,6 +246,10 @@ export class ConversionTrackerService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
+    if (terminal && statusChanged) {
+      await this.notifyBatchTerminal(conversionId);
+    }
+
     if (statusChanged || progressDelta >= PROGRESS_EVENT_THRESHOLD) {
       await this.events.record(conversionId, {
         type: this.eventTypeFor(status, statusChanged),
@@ -258,6 +264,18 @@ export class ConversionTrackerService implements OnModuleInit, OnModuleDestroy {
           ...(state.error ? { error: state.error } : {}),
         },
       });
+    }
+  }
+
+  /**
+   * The conversion is already persisted at this point, so a failure to update
+   * the batch roll-up is logged and never fails the engine push or poll.
+   */
+  private async notifyBatchTerminal(conversionId: string): Promise<void> {
+    try {
+      await this.batches.onConversionTerminal(conversionId);
+    } catch (error) {
+      this.logger.warn(`Falha ao atualizar o lote da conversão ${conversionId}: ${String(error)}`);
     }
   }
 

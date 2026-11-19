@@ -109,16 +109,16 @@ O `PDF2X_API_BASE_URL` do MCP **não** vai nesse arquivo, porque o MCP não lê 
 
 ## Motor de conversão (converter)
 
-Caminhos relativos a `services/converter/`. Os nomes de variável são os aliases do `Settings`. O total é de 74 campos.
+Caminhos relativos a `services/converter/`. Os nomes de variável são os aliases do `Settings`.
 
 ### Runtime
 
 | Variável | Padrão | Lido em | Status | O que faz | Observações |
 |---|---|---|---|---|---|
-| `RUNTIME_MODE` | `standalone` | `config.py`; `api/public_routes.py` | só informativo | Declara o modo do motor: `standalone` ou `full`. Outro valor impede a inicialização. | Nenhum comportamento depende dele. O padrão do NestJS é `full`. |
+| `RUNTIME_MODE` | `standalone` | `config.py`; `api/main.py`; `automation/executor.py`; `api/capabilities.py` | ativo | Declara o modo do motor: `standalone` ou `full`. Outro valor impede a inicialização. | No `standalone`, `AUTOMATION_EXECUTOR_ENABLED=true` liga o calendário no processo (`api/main.py`). No `full`, o executor só roda pelo processo `python -m automation.cli`. Também é reportado em `/capabilities`. O padrão do NestJS é `full`. |
 | `LOG_LEVEL` | `INFO` | `config.py`; `api/main.py`; `worker/cli.py` (via `configure_logging`) | ativo | Nível do log: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Valor inválido cai para `INFO`. | Funciona no `.env`. |
 | `LOG_JSON` | vazio (texto) | `logging_setup.py` (`os.getenv`) | ativo, só variável de processo | Logs em JSON quando `1`, `true` ou `yes`. | Não lida do `.env`. |
-| `CONVERTER_PORT` | `8000` | `config.py` | só informativo | Porta do motor. | Nenhum código a usa. `starter-server.cmd` fixa `127.0.0.1:8000`, e o uvicorn recebe `--port` na linha de comando. |
+| `CONVERTER_PORT` | `8000` | `config.py`; `starter-local-server.cmd`; `desktop_entry.py` | ativo no starter e no entry point do desktop | Porta do motor. | O `starter-local-server.cmd` lê `CONVERTER_PORT` do ambiente do processo (não do `.env`), usa `8000` se ela não estiver definida, e passa a porta ao uvicorn com `--port`. O `desktop_entry.py` usa a mesma variável como padrão de `--port` (`0` = porta livre do SO). O uvicorn manual não lê a variável: use `--port`. |
 | `WEB_ORIGIN` | `http://localhost:5173` | `config.py` | lido mas sem efeito | Origem do SPA. | Sem leitor. A origem liberada no CORS é `ALLOWED_ORIGINS`. |
 | `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3000` | `config.py` (campo `allow_origins`); `api/main.py` (CORS) | ativo | Origens liberadas no CORS, separadas por vírgula. | Se for definida como vazia, o CORS passa a aceitar `*`. Não deixe vazia. |
 
@@ -145,6 +145,22 @@ Caminhos relativos a `services/converter/`. Os nomes de variável são os aliase
 | `CONVERTER_TASK_TIMEOUT_SECONDS` | `0` | `jobqueue/inline.py`; `engine/ocr/engines.py`; `worker/celery_app.py` | ativo | Prazo global por documento. `0` desativa o prazo. | O mesmo valor é passado como timeout ao Tesseract. |
 | `REDIS_URL` | `redis://localhost:6379/0` | `jobqueue/celery_queue.py`; `worker/celery_app.py` | ativo só com `celery` | Broker e backend do Celery. | Sem efeito no modo `inline`. |
 
+### Fontes e automação
+
+| Variável | Padrão | Lido em | Status | O que faz | Observações |
+|---|---|---|---|---|---|
+| `SOURCE_IMPORTS_ENABLED` | `true` | `sources/importer.py`; `api/capabilities.py` | ativo | Habilita importações por caminho. Com `false`, `POST /sources/{id}/imports` responde `409 FEATURE_DISABLED`. | Histórico e definições permanecem; só o trabalho novo é recusado. |
+| `SPREADSHEET_INPUT_ENABLED` | `true` | `ingestion/registry.py`; `api/capabilities.py` | ativo | Habilita admissão de XLSX/CSV. Com `false`, o arquivo não é reconhecido como planilha. | PDFs e imagens não são afetados. |
+| `AUTOMATION_EXECUTOR_ENABLED` | `false` | `api/main.py` (lifespan); `api/capabilities.py`; `automation/run_service.py` | ativo | Liga o loop de calendário no processo standalone. | No modo `full` use `python -m automation.cli`; o desktop liga a flag no perfil gerenciado. O `starter-local-server.cmd` define `true` quando a variável não está definida no ambiente. |
+| `AUTOMATION_POLL_SECONDS` | `5` | `automation/loop.py`; `automation/cli.py` | ativo | Intervalo de varredura do calendário. | Valores menores que 1 são elevados para 1. |
+| `AUTOMATION_HISTORY_RETENTION_DAYS` | `90` | `automation/cleanup.py` | ativo | Retenção do histórico detalhado de automação. | Nunca apaga originais nem artefatos de conversão. |
+| `AUTOMATION_FAILURE_RETENTION_DAYS` | `7` | `automation/cleanup.py` | ativo | Retenção de ocorrências com falha. | Limpeza roda no máximo uma vez por dia pelo loop. |
+| `DESKTOP_HOST_ENABLED` | `false` | `api/capabilities.py` | anunciado | Sinaliza a capacidade de host desktop. | O desktop passa `true`; não altera rotas por si só. |
+| `APP_DATA_DIR` | derivado | `config.py` (`data_dir`); `runtime/paths.py` | ativo | Diretório mutável do runtime (banco, storage, work, logs, backups, identidade). | Obrigatório no pacote; o desktop aponta para o `userData` |
+| `WORK_DIR` | `APP_DATA_DIR/work` | `worker/tasks.py`; `runtime/paths.py` | ativo | Temporários e snapshots controlados. | Fora de `Program Files`/ASAR |
+| `LOG_DIR` | `APP_DATA_DIR/logs` | `runtime/paths.py` | ativo | Logs rotativos do runtime empacotado. | |
+| `WEB_DIST_DIR` | `apps/web/dist` | `api/main.py` | ativo | SPA servida pelo backend empacotado. | Recurso somente leitura |
+
 ### Limites
 
 | Variável | Padrão | Lido em | Status | O que faz | Observações |
@@ -154,7 +170,7 @@ Caminhos relativos a `services/converter/`. Os nomes de variável são os aliase
 | `CONVERTER_MAX_IMAGE_FRAMES` | `500` | `ingestion/image_input.py`; `api/capabilities.py` | ativo | Guarda de recurso: quadros máximos de uma imagem multiquadro (TIFF, GIF). | Não é teto de páginas de PDF. |
 | `CONVERTER_MAX_IMAGE_MEGAPIXELS` | `40.0` | `ingestion/image_input.py`; `api/capabilities.py` | ativo | Megapixels máximos por imagem. | Guarda de recurso. |
 | `CONVERTER_MAX_JOB_MEGAPIXELS` | `200.0` | `ingestion/image_input.py`; `api/capabilities.py` | ativo | Megapixels somados de um trabalho. | Guarda de recurso. |
-| `UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | `config.py` (`max_bytes()`); `api/batch_service.py` | ativo | Limite por arquivo: envio simples (`min` com `CONVERTER_MAX_PDF_BYTES`) e registro de item de lote (`FILE_TOO_LARGE`). | No NestJS, o mesmo nome limita o envio legado de arquivo único; o registro de item de lote usa `UPLOAD_MAX_FILE_BYTES`, sem teto por padrão. Veja [API pública](#api-pública-nestjs). |
+| `UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | `config.py` (`max_bytes()`); `api/service.py` (`POST /conversions`) | ativo | Limite do envio simples de arquivo único no motor. O efetivo é o menor entre este valor e `CONVERTER_MAX_PDF_BYTES` (`FILE_TOO_LARGE`, HTTP 400). | Lotes e envio por partes **não** têm teto de tamanho de documento no motor (`api/batch_service.py`). No NestJS, o mesmo nome limita o corpo da requisição e o envio legado de arquivo único; o teto por item de lote é `UPLOAD_MAX_FILE_BYTES`, sem teto por padrão. Veja [API pública](#api-pública-nestjs). |
 | `UPLOAD_MAX_PAGES` | nenhum | `config.py` (`max_pages()`) | obsoleto | Teto de páginas legado no motor. | Mesma regra de `CONVERTER_MAX_PAGES`. No NestJS, a regra é outra: ver [API pública](#api-pública-nestjs). |
 | `CONVERTER_TARGET_FORMATS` | `xlsx,txt,csv` | `config.py` (`target_formats()`); `worker/tasks.py`; `api/service.py` | ativo | Formatos gerados quando a conversão não pede nenhum. | Valores fora de `xlsx`, `txt` e `csv` são ignorados. Se nada sobrar, usa `xlsx`. Imagens geram só `txt`. |
 
@@ -223,6 +239,23 @@ O assistente é opcional. Desligado por padrão, ele não afeta as conversões.
 | `JWT_EXPIRES_IN_SECONDS` | `604800` (7 dias) | `api/deps.py`; `api/public_routes.py` | ativo | Validade do token local, em segundos. | Não confundir com `JWT_EXPIRES_IN=7d` do NestJS. |
 | `AUTH_MODE` | `optional` | `api/deps.py`; `api/public_routes.py` | ativo | `optional` ou `required`. | Não há validação do valor. Só `required` é checado explicitamente; qualquer outro valor se comporta como `optional`. |
 
+### Desktop e inicializador Windows
+
+Variáveis usadas pelo aplicativo Windows (`apps/desktop`, que as passa ao backend) e pelo `starter-local-server.cmd`. Não são necessárias no uso standalone comum.
+
+| Variável | Padrão | Lido em | Status | O que faz | Observações |
+|---|---|---|---|---|---|
+| `APP_DATA_DIR` | nenhum | `config.py`; `runtime/paths.py` | ativo | Raiz de todo estado mutável do pacote (banco, storage, work, logs, backups, identidade). | Definida pelo supervisor Electron com o `userData`. |
+| `DESKTOP_BOOTSTRAP_SECRET` | nenhum | `config.py`; `api/main.py`; `api/desktop_guard.py` | ativo com `DESKTOP_HOST_ENABLED=true` | Segredo por início que o host envia em `x-desktop-host`. | Gerado pelo supervisor a cada spawn; nunca gravado em `.env` nem exposto à página. |
+| `DESKTOP_HOST_ENABLED` | `false` | `config.py`; `api/main.py`; `api/capabilities.py` | ativo | Liga o guard HTTP do host: exige `x-desktop-host`, `Host` em loopback e `Origin` igual à própria origem. Único caminho sem guard: `GET /health`. | O `desktop_entry.py` força `true`. |
+| `CONVERTER_HOST` | `127.0.0.1` | `desktop_entry.py` | ativo no entry point do desktop | Interface de bind do backend empacotado. | |
+| `CONVERTER_READINESS_FILE` | nenhum | `desktop_entry.py` (`--readiness-file`) | ativo | Arquivo em que o backend publica `{port, boot_id, version}`. | Gravado de forma atômica (arquivo temporário e renomeação). |
+| `WORK_DIR`, `LOG_DIR`, `WEB_DIST_DIR` | derivados de `APP_DATA_DIR` (`work/`, `logs/`) | `runtime/paths.py` | ativo | Pastas de trabalho e de logs do runtime; `WEB_DIST_DIR` aponta para a SPA do pacote. | Quando ausentes, valem os derivados. Os caminhos são aplicados ao ambiente do processo na inicialização. |
+| `CG_VENV_DIR` | `services\converter\.venv` | `starter-local-server.cmd` | ativo no starter | Pasta do venv criado pelo inicializador. | Lida do ambiente do processo. |
+| `CG_NOPAUSE` | nenhum | `starter-local-server.cmd` | ativo no starter | Com `1`, não aguarda tecla em caso de erro. | Uso automatizado. |
+
+Detalhes de operação do aplicativo estão em [DESKTOP](DESKTOP.md).
+
 ### Retenção
 
 A retenção está **anunciada, mas não aplicada**. Nenhum job apaga arquivos por prazo. Os valores aparecem em `/settings` e são gravados como metadado nos artefatos.
@@ -238,7 +271,7 @@ A retenção está **anunciada, mas não aplicada**. Nenhum job apaga arquivos p
 
 | Variável | Padrão | Lido em | Status | O que faz | Observações |
 |---|---|---|---|---|---|
-| `CONVERTER_PUBLIC_URL` | `http://localhost:8000` | nenhum | lido mas sem efeito | URL pública do motor. | Sem leitor. |
+| `CONVERTER_PUBLIC_URL` | `http://localhost:8000` | `automation/executor.py` | ativo no modo `full` | Endereço do gateway NestJS que o executor de automação usa para enviar efeitos. | No compose, o serviço `automation` define `http://api:3000`. Sem efeito no modo `standalone`. |
 | `PUBLIC_API_URL` | `http://localhost:3000` | nenhum | lido mas sem efeito | URL pública da API. | Sem leitor no motor. No NestJS também não há consumidor. |
 | `CONVERTER_CALLBACK_URL` | vazio | `worker/tasks.py` (`_notify_node`) | ativo quando definida | Endereço que recebe o andamento da conversão. No Compose: `http://api:3000/api/v1/internal/hooks/converter`. | Sem ela, o motor não envia essas notificações. |
 
@@ -246,7 +279,7 @@ A retenção está **anunciada, mas não aplicada**. Nenhum job apaga arquivos p
 
 ## API pública (NestJS)
 
-Caminho de origem: `apps/api/src/config/configuration.ts`. Os padrões abaixo são os do código. O total é de 41 variáveis.
+Caminho de origem: `apps/api/src/config/configuration.ts`. Os padrões abaixo são os do código.
 
 ### Runtime e API
 
@@ -274,7 +307,7 @@ Caminho de origem: `apps/api/src/config/configuration.ts`. Os padrões abaixo s�
 | `UPLOAD_PART_MAX_BYTES` | `33554432` | anunciado mas não aplicado | Maior parte aceita, anunciada em `/settings`. | Nenhum código recusa parte acima dele. Nunca fica abaixo de `UPLOAD_PART_BYTES`. |
 | `UPLOAD_CONCURRENCY` | `3` | lido mas sem efeito | Paralelismo de envio. | Lida, mas nem anunciada. A web usa 3 fixo. |
 | `MAX_FILES_PER_BATCH` | nenhum | anunciado mas não aplicado | Máximo de arquivos por lote. | Anunciado em `/settings`. Nada recusa um lote pelo número de arquivos. |
-| `UPLOAD_MAX_FILE_BYTES` | nenhum (sem teto) | ativo quando definida | Tamanho máximo de um arquivo do lote. | Aplicada em `batches.service.ts`, com `FILE_TOO_LARGE`. Não está no `.env.example`. |
+| `UPLOAD_MAX_FILE_BYTES` | nenhum (sem teto) | ativo quando definida | Tamanho máximo de um arquivo do lote. | Aplicada em `batches.service.ts`, com `FILE_TOO_LARGE`. Consta comentada no `.env.example`. |
 | `UPLOAD_SESSION_TTL_HOURS` | `24` | ativo | Validade de uma sessão incompleta. | |
 | `UPLOAD_MAX_DOCUMENT_BYTES` | nenhum | lido mas sem efeito | Teto de bytes por documento. | Sem consumidor. |
 
@@ -308,7 +341,7 @@ Caminho de origem: `apps/api/src/config/configuration.ts`. Os padrões abaixo s�
 | `S3_ACCESS_KEY` | nenhum | ativo com `s3` | Chave de acesso. | |
 | `S3_SECRET_KEY` | nenhum | ativo com `s3` | Segredo de acesso. | |
 | `S3_BUCKET` | `pdf2x` | ativo com `s3` | Bucket. | |
-| `S3_FORCE_PATH_STYLE` | `true` | ativo com `s3` | Estilo de caminho para o endpoint. | Não está no `.env.example`. |
+| `S3_FORCE_PATH_STYLE` | `true` | ativo com `s3` | Estilo de caminho para o endpoint (necessário para MinIO). | Consta no `.env.example` com o padrão. |
 | `S3_SECURE` | `false` | ativo com `s3` | Usa TLS. | |
 
 ### Retenção
@@ -376,6 +409,8 @@ Variáveis de interpolação usadas pelo Compose:
 | `CONVERTER_OCR_ENABLED` | `true` | não | OCR ligado por padrão. | |
 | `CONVERTER_OCR_MIN_CONFIDENCE` | `0.45` | não | Confiança mínima de palavra. | |
 
+O serviço `automation` do Compose (executor de calendário, `python -m automation.cli`) usa a mesma imagem do motor, com `RUNTIME_MODE=full`, `AUTOMATION_EXECUTOR_ENABLED=true`, `AUTOMATION_POLL_SECONDS` (padrão `5`), `CONVERTER_PUBLIC_URL=http://api:3000` e a pasta `${SOURCE_ROOTS_DIR:-./sources}` montada como `/sources` somente leitura.
+
 Valores **fixos** no Compose, que não podem ser trocados pelo `.env`: `RUNTIME_MODE=full` e `STORAGE_BACKEND=s3` no motor e na API, `CONVERTER_QUEUE=celery`, `CONVERTER_WORKERS=1` no motor, `API_HOST=0.0.0.0` e `API_PORT=3000` na API, `CONVERTER_CALLBACK_URL` apontando para `http://api:3000/api/v1/internal/hooks/converter`, `CONVERTER_TIMEOUT_MS=30000`, `S3_FORCE_PATH_STYLE=true`, `VITE_API_BASE=/api/v1` no build da web. O Compose também **não** define `CONVERTER_MAX_PAGES` nem `UPLOAD_MAX_PAGES`. O motor e o worker não publicam portas; só a web é exposta, em `127.0.0.1`.
 
 ---
@@ -389,7 +424,7 @@ Há quatro segredos. Dois deles têm padrões de desenvolvimento diferentes entr
 | `CONVERTER_INTERNAL_TOKEN` | `dev-internal-token-change-me` | `dev-internal-token-change-me` | **Sim**. A API envia o token e o motor o confere. |
 | `JWT_SECRET` | `dev-jwt-secret-change-me` | `dev-only-insecure-secret-change-me` | Os padrões **são diferentes**. No modo full, defina o mesmo valor nos dois. |
 
-Os padrões existem para o modo standalone funcionar sem configuração. O motor avisa no início (`segredos com valor padrão de desenvolvimento em uso`) quando um deles fica no padrão. O aviso não impede a inicialização. Antes de expor o serviço em qualquer rede, troque os dois.
+Os padrões existem para o modo standalone funcionar sem configuração. O motor avisa no início (`segredos com valor padrão de desenvolvimento em uso`) quando um deles fica no padrão. O aviso não impede a inicialização. O NestJS também avisa, mas com `NODE_ENV=production` ele **recusa iniciar** se `JWT_SECRET` ou `CONVERTER_INTERNAL_TOKEN` estiverem com o padrão (`apps/api/src/config/configuration.ts`). Antes de expor o serviço em qualquer rede, troque os dois.
 
 No modo full com um único `.env` na raiz, os dois serviços leem o mesmo valor. Se você separar os arquivos, repita o mesmo valor em ambos.
 
@@ -460,7 +495,7 @@ Estas opções vêm no corpo da requisição de conversão e seguem `ConversionO
    npm --prefix apps/web run build
    ```
 
-4. Suba o motor em `http://127.0.0.1:8000`, ou use `starter-server.cmd` na raiz:
+4. Suba o motor em `http://127.0.0.1:8000`, ou use `starter-local-server.cmd` na raiz (ele cria o venv e instala as dependências na primeira execução):
 
    ```
    cd services\converter
@@ -533,7 +568,7 @@ A interface fica em `http://localhost:8080`. Para mudar a porta, defina `WEB_POR
 
 | O que mudar | Onde |
 |---|---|
-| Porta do motor | Não há variável que funcione. Mude o comando do uvicorn, e também `CONVERTER_INTERNAL_URL` da API e `VITE_API_PROXY_TARGET` da web, se necessário. |
+| Porta do motor | `CONVERTER_PORT` no `starter-local-server.cmd`; no uvicorn manual, mude `--port`. Mude também `CONVERTER_INTERNAL_URL` da API e `VITE_API_PROXY_TARGET` da web, se necessário. |
 | Porta da API | `API_PORT`, e `VITE_API_PROXY_TARGET` da web para acompanhar. |
 | Porta da web no Compose | `WEB_PORT`. |
 | Porta do MCP HTTP | `PDF2X_MCP_PORT`. |
@@ -563,7 +598,7 @@ Itens que o código contradiz ou que podem surpreender quem lê a configuração
 3. **Retenção não é aplicada.** Os três prazos aparecem em `/settings`, e os de XLSX e auditoria são gravados como metadado, mas nada apaga arquivos. Trate-os como informação.
 4. **Limites de envio anunciados.** `MAX_FILES_PER_BATCH` e `UPLOAD_PART_MAX_BYTES` aparecem em `/settings`, mas nada os impõe. `UPLOAD_CONCURRENCY` nem chega a ser anunciada: a web usa 3 fixo.
 5. **Dois nomes para o mesmo conceito de validade do token.** `JWT_EXPIRES_IN=7d` no NestJS e `JWT_EXPIRES_IN_SECONDS=604800` no motor. Ajuste os dois se mudar um deles.
-6. **Padrões de modo diferentes.** `RUNTIME_MODE` é `standalone` no motor e `full` no NestJS. Como é só informativo, o impacto é apenas no que aparece em `/settings`.
+6. **Padrões de modo diferentes.** `RUNTIME_MODE` é `standalone` no motor e `full` no NestJS. No motor, o valor decide se o executor de automação roda no processo standalone e aparece em `/capabilities`.
 7. **MCP aponta para o motor por padrão.** `PDF2X_API_BASE_URL` padrão é `http://localhost:8000`. Em modo full, defina `http://localhost:3000`.
 8. **Vite não lê o `.env` da raiz.** `VITE_API_BASE` e `VITE_API_PROXY_TARGET` precisam estar em `apps/web/.env`, ou no ambiente do shell.
 9. **Caminhos relativos ao diretório de execução.** O NestJS resolve `.env` e `STORAGE_LOCAL_ROOT` em relação a onde o processo roda. O motor resolve os seus caminhos em relação a `services/converter/`.

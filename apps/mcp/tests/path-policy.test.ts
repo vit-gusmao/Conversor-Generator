@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 
+import { expandHome } from '../src/config.js';
 import {
   PathPolicyError,
   isInsideRoot,
@@ -160,4 +161,42 @@ test('isInsideRoot respects path boundaries and case on Windows', () => {
   if (process.platform === 'win32') {
     assert.equal(isInsideRoot(root.toUpperCase(), root), true);
   }
+});
+
+test('tool paths must be absolute: a relative path is refused, never anchored to the working directory', async () => {
+  // The file exists relative to the working directory; it must still be refused.
+  const cwd = process.cwd();
+  await fs.writeFile(path.join(root, 'relative-doc.pdf'), 'content');
+  process.chdir(root);
+  try {
+    await expectPolicyError(resolveLocalPath('relative-doc.pdf', [root]), 'INVALID_PATH');
+    await expectPolicyError(resolveLocalPath('./relative-doc.pdf', [root]), 'INVALID_PATH');
+  } finally {
+    process.chdir(cwd);
+  }
+  await expectPolicyError(resolveLocalPath(path.join('sub', 'document.pdf'), [root]), 'INVALID_PATH');
+  await expectPolicyError(resolveLocalPath('\folder\document.pdf', [root]), 'INVALID_PATH');
+  await expectPolicyError(resolveAllowedDirectory('relative-dir', [root]), 'INVALID_PATH');
+});
+
+test('expandHome expands ~ without resolving, and leaves ~user forms untouched', () => {
+  assert.equal(expandHome('~'), os.homedir());
+  assert.equal(expandHome('~/report.pdf'), path.join(os.homedir(), 'report.pdf'));
+  assert.equal(expandHome('~bob/report.pdf'), '~bob/report.pdf');
+  assert.equal(expandHome(path.join(root, 'a.pdf')), path.join(root, 'a.pdf'));
+});
+
+test('a home-relative input is expanded before the root check, so it is not reported as invalid', async () => {
+  await expectPolicyError(
+    resolveLocalPath(`~${path.sep}pdf2x-definitely-missing-${process.pid}.pdf`, [root]),
+    'SOURCE_NOT_FOUND',
+  );
+});
+
+test('reserved Windows names are detected before the first dot', () => {
+  assert.equal(sanitizeFilename('CON.tar.gz'), '_CON.tar.gz');
+  assert.equal(sanitizeFilename('aux.txt'), '_aux.txt');
+  assert.equal(sanitizeFilename('com1.tar.gz'), '_com1.tar.gz');
+  assert.equal(sanitizeFilename('nul'), '_nul');
+  assert.equal(sanitizeFilename('console.tar.gz'), 'console.tar.gz');
 });

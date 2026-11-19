@@ -125,3 +125,12 @@ def test_no_images_api_guard():
     result = write_workbook(plan)
     assert result.sheets == 1
     assert result.cells == 2
+
+
+def test_header_replacements_are_counted_in_sanitized_chars():
+    # AU2-19: _write_header must report replaced characters so the audit counts them.
+    sheet = SheetPlan(name="Dados", kind="records", headers=["Na\x01me", "Sal\x02\x03ário"])
+    plan = WorkbookPlan(sheets=[sheet])
+    result = write_workbook(plan, run_id="run_header")
+    assert result.sanitized_chars == 3
+    assert result.sanitized_refs == ["Dados"]

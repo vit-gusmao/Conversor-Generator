@@ -7,6 +7,7 @@ them; the desktop adds grants through its own authenticated channel (T12).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -51,11 +52,19 @@ class SourceService:
                 "A pasta da raiz não existe ou não é um diretório.",
                 details={"root": canonical_path},
             )
+        # Store the real location: later containment checks compare resolved
+        # file paths, so a junction/subst/8.3 alias would never match. The
+        # resolved target is validated again: a link may lead to a UNC share.
+        real_root = os.path.realpath(str(root_path))
+        try:
+            validate_root_path(real_root)
+        except PathPolicyError as exc:
+            raise self._api_error(exc) from exc
         root = self.repository.create_root(
             session,
             owner_id=owner_id,
             runtime_id=runtime_id,
-            canonical_path=str(root_path),
+            canonical_path=real_root,
             granted_by=granted_by,
             label=label,
             grant_channel=grant_channel,

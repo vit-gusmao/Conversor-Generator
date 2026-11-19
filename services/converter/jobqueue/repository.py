@@ -47,6 +47,16 @@ class JobReceipt:
     created: bool
 
 
+@dataclass(slots=True, frozen=True)
+class JobSnapshot:
+    """What a claimer observed on a row; a claim must still match it to win."""
+
+    job_id: int
+    state: str
+    fence: int
+    lease_until: datetime | None
+
+
 def _aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -128,7 +138,12 @@ class JobRepository:
         session = get_session_factory()()
         try:
             candidates = session.execute(
-                select(EngineJobRow.id)
+                select(
+                    EngineJobRow.id,
+                    EngineJobRow.state,
+                    EngineJobRow.fence,
+                    EngineJobRow.lease_until,
+                )
                 .where(
                     (
                         (EngineJobRow.state == "queued")
@@ -143,30 +158,23 @@ class JobRepository:
                 )
                 .order_by(EngineJobRow.available_at, EngineJobRow.id)
                 .limit(10)
-            ).scalars().all()
+            ).all()
+        finally:
+            session.close()
 
-            for job_id in candidates:
-                claimed = session.execute(
-                    update(EngineJobRow)
-                    .where(
-                        EngineJobRow.id == job_id,
-                        EngineJobRow.state.in_(("queued", "leased", "running")),
-                    )
-                    .values(
-                        state="leased",
-                        lease_owner=worker_id[:128],
-                        lease_until=deadline,
-                        fence=EngineJobRow.fence + 1,
-                        attempt=EngineJobRow.attempt + 1,
-                        updated_at=moment,
-                    )
-                )
-                if claimed.rowcount != 1:
-                    # Another worker won this row; try the next candidate.
-                    session.rollback()
-                    continue
-                session.commit()
-                row = session.get(EngineJobRow, job_id)
+        for job_id, state, fence, lease_until in candidates:
+            observed = JobSnapshot(
+                job_id=int(job_id),
+                state=str(state),
+                fence=int(fence),
+                lease_until=lease_until,
+            )
+            if not self.compare_and_claim(observed, worker_id, moment, deadline):
+                # Another worker moved this row after we looked; try the next one.
+                continue
+            session = get_session_factory()()
+            try:
+                row = session.get(EngineJobRow, observed.job_id)
                 if row is None:  # pragma: no cover - defensive
                     continue
                 return JobLease(
@@ -177,8 +185,72 @@ class JobRepository:
                     attempt=int(row.attempt),
                     payload_ref=row.payload_ref,
                 )
-            session.rollback()
-            return None
+            finally:
+                session.close()
+        return None
+
+    def snapshot(self, job_id: int) -> JobSnapshot | None:
+        session = get_session_factory()()
+        try:
+            row = session.execute(
+                select(
+                    EngineJobRow.id,
+                    EngineJobRow.state,
+                    EngineJobRow.fence,
+                    EngineJobRow.lease_until,
+                ).where(EngineJobRow.id == job_id)
+            ).first()
+            if row is None:
+                return None
+            return JobSnapshot(
+                job_id=int(row[0]), state=str(row[1]), fence=int(row[2]), lease_until=row[3]
+            )
+        finally:
+            session.close()
+
+    def compare_and_claim(
+        self,
+        observed: JobSnapshot,
+        worker_id: str,
+        moment: datetime,
+        deadline: datetime,
+    ) -> bool:
+        """Leases the row only if it still matches what the claimer observed.
+
+        The UPDATE repeats every field of the observation (state, fence and
+        lease deadline), so two claimers that read the same row cannot both
+        win, and a claimer holding a view from before a heartbeat or another
+        claim loses instead of bumping the fence again.
+        """
+        session = get_session_factory()()
+        try:
+            lease_match = (
+                EngineJobRow.lease_until.is_(None)
+                if observed.lease_until is None
+                else EngineJobRow.lease_until == observed.lease_until
+            )
+            result = session.execute(
+                update(EngineJobRow)
+                .where(
+                    EngineJobRow.id == observed.job_id,
+                    EngineJobRow.state == observed.state,
+                    EngineJobRow.fence == observed.fence,
+                    lease_match,
+                )
+                .values(
+                    state="leased",
+                    lease_owner=worker_id[:128],
+                    lease_until=deadline,
+                    fence=EngineJobRow.fence + 1,
+                    attempt=EngineJobRow.attempt + 1,
+                    updated_at=moment,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                return False
+            session.commit()
+            return True
         finally:
             session.close()
 
@@ -189,7 +261,12 @@ class JobRepository:
             moment = utcnow()
             result = session.execute(
                 update(EngineJobRow)
-                .where(EngineJobRow.id == job_id, EngineJobRow.fence == fence)
+                .where(
+                    EngineJobRow.id == job_id,
+                    EngineJobRow.fence == fence,
+                    # A finished unit is never resurrected by a late heartbeat.
+                    EngineJobRow.state.in_(("leased", "running")),
+                )
                 .values(
                     state="running",
                     lease_until=moment + timedelta(seconds=lease_seconds),
@@ -260,11 +337,25 @@ class JobRepository:
             changed = run.cancel_requested_at is None
             if changed:
                 run.cancel_requested_at = moment
+            # A unit that never started ends now: it must not stay in the
+            # queued backlog waiting for a claim that the cancel mark forbids.
+            session.execute(
+                update(EngineJobRow)
+                .where(EngineJobRow.run_id == run_id, EngineJobRow.state == "queued")
+                .values(
+                    state="cancelled",
+                    cancel_requested_at=func.coalesce(EngineJobRow.cancel_requested_at, moment),
+                    lease_owner=None,
+                    lease_until=None,
+                    updated_at=moment,
+                )
+            )
+            # A unit already leased or running observes the mark between pages.
             session.execute(
                 update(EngineJobRow)
                 .where(
                     EngineJobRow.run_id == run_id,
-                    EngineJobRow.state.in_(("queued", "leased", "running")),
+                    EngineJobRow.state.in_(("leased", "running")),
                     EngineJobRow.cancel_requested_at.is_(None),
                 )
                 .values(cancel_requested_at=moment, updated_at=moment)
@@ -316,13 +407,26 @@ class JobRepository:
         moment = now or utcnow()
         session = get_session_factory()()
         try:
+            expired = (
+                EngineJobRow.state.in_(("leased", "running")),
+                EngineJobRow.lease_until.is_not(None),
+                EngineJobRow.lease_until < moment,
+            )
+            # A cancelled unit whose worker died ends as cancelled; re-queuing it
+            # would leave a row that claims refuse forever.
+            cancelled = session.execute(
+                update(EngineJobRow)
+                .where(*expired, EngineJobRow.cancel_requested_at.is_not(None))
+                .values(
+                    state="cancelled",
+                    lease_owner=None,
+                    lease_until=None,
+                    updated_at=moment,
+                )
+            )
             result = session.execute(
                 update(EngineJobRow)
-                .where(
-                    EngineJobRow.state.in_(("leased", "running")),
-                    EngineJobRow.lease_until.is_not(None),
-                    EngineJobRow.lease_until < moment,
-                )
+                .where(*expired, EngineJobRow.cancel_requested_at.is_(None))
                 .values(
                     state="queued",
                     lease_owner=None,
@@ -332,7 +436,7 @@ class JobRepository:
                 )
             )
             session.commit()
-            return int(result.rowcount or 0)
+            return int(result.rowcount or 0) + int(cancelled.rowcount or 0)
         finally:
             session.close()
 

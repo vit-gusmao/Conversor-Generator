@@ -32,8 +32,11 @@ onde os arquivos vão, ver [STORAGE.md](STORAGE.md).
   `{ items, total, page, page_size }`.
 - Idempotência: o cabeçalho `Idempotency-Key` em `POST /conversions`, e
   `client_batch_key` e `client_item_id` nos lotes.
-- Eventos em tempo real: SSE. Para retomar, envie `Last-Event-ID`. Nos lotes, o
-  gateway também aceita `?last_event_id=`.
+- Eventos em tempo real: SSE. Para retomar, envie `Last-Event-ID`. Nas rotas de
+  conversão e de lote, o cursor também pode vir em `?last_event_id=` (o
+  gateway aceita essa forma; o motor standalone também).
+- Nome de arquivo nos downloads: `Content-Disposition` com `filename` ASCII de
+  reserva e `filename*=UTF-8''...` com o nome exato (RFC 6266/5987).
 
 ## Identidade local
 
@@ -79,7 +82,7 @@ PDF→XLSX legadas (exports, texto, capacidades e assistente).
 | POST | `/conversions` | `multipart/form-data` com o campo `file`, e opcionalmente `options` (JSON). Cabeçalho opcional `Idempotency-Key`. Retorna **202** `{conversion_id, status:"queued", message, links}`. Grava o PDF original no storage antes de criar a conversão ([STORAGE.md](STORAGE.md)) |
 | GET | `/conversions` | Histórico do dono. Filtros: `status`, `q`, `page`, `page_size` |
 | GET | `/conversions/:id` | Status detalhado, estatísticas e validação |
-| GET | `/conversions/:id/events` | SSE de progresso. Aceita `Last-Event-ID` e `?access_token=` |
+| GET | `/conversions/:id/events` | SSE de progresso. Aceita `Last-Event-ID`, `?last_event_id=` e `?access_token=`. `?run_id=` acompanha só uma execução nos dois modos (ver [Eventos de conversão](#eventos-de-conversão)) |
 | GET | `/conversions/:id/result` | Metadados do resultado (`ResultSummary`) |
 | GET | `/conversions/:id/result-summary` | Resumo compacto do resultado, ver [Resultado compacto](#resultado-compacto) |
 | GET | `/conversions/:id/sheets` | Abas do resultado, paginadas, ver [Resultado compacto](#resultado-compacto) |
@@ -182,6 +185,72 @@ para onde ela é gravada.
 disponível. A interface atual não usa essa rota. Ela existe para clientes
 externos e para diagnóstico. No gateway a rota não existe e responde `404`.
 
+No modo desktop (`DESKTOP_HOST_ENABLED=true`), `GET /health` (na raiz, sem
+`/api/v1`) é a única rota sem o cabeçalho `x-desktop-host`; as demais respondem
+`403 DESKTOP_HOST_FORBIDDEN`. Por isso, `/api/v1/health` não é isento.
+
+### Rotas internas (`/internal/v1`)
+
+Rotas do motor chamadas pelo gateway, com `x-internal-token`. Não são contrato
+para clientes do navegador. Incluem, entre outras, `GET /internal/v1/health`,
+`GET /internal/v1/automation/status`, `GET /internal/v1/runtime/activity` (atividade
+do runtime) e `POST /internal/v1/automation/pause`.
+Token ausente ou inválido responde `401 UNAUTHORIZED_INTERNAL`.
+
+### Fontes, importações e agendamentos
+
+Rotas do upgrade de importação por caminho. Existem nos dois modos: no `full`
+o gateway autentica a sessão e encaminha ao motor pelo canal interno, sempre
+com o dono verificado (o cliente nunca envia `owner_id`).
+
+**Raízes concedidas.** A concessão é uma ação administrativa local, não uma
+rota pública: no desktop ela usa a credencial do host; no site local, a rota
+interna `POST /internal/v1/source-roots` com `x-internal-token`.
+
+| Método | Endpoint | Descrição |
+| --- | --- | --- |
+| GET | `/source-roots` | Raízes visíveis ao dono (`id`, `label`, `runtime_id`, `runtime_available`, `display_path`). O caminho absoluto aparece só para o próprio dono |
+| GET | `/sources` | Fontes do dono |
+| POST | `/sources` | Cria fonte: `{root_id, relative_path, kind: file\|directory, name, recursive?, include_patterns?, exclude_patterns?}`. `400 UNKNOWN_FIELD` para campos desconhecidos (inclusive `owner_id`), `400 INVALID_SOURCE` para caminho inválido/travessia, `400 SOURCE_UNAVAILABLE` quando o caminho não existe, `404 ROOT_NOT_FOUND` para raiz alheia |
+| GET | `/sources/{id}` | Fonte do dono (`404` para alheia) |
+| PATCH | `/sources/{id}` | Edição otimista: exige `version`; conflito retorna `409 VERSION_CONFLICT`. `relative_path`/`kind` passam pela mesma política da criação. No gateway (`full`), `PUT` é aceito com o mesmo corpo e as mesmas regras; no standalone, `PUT` existe só nas rotas internas |
+| DELETE | `/sources/{id}` | Arquiva a fonte (histórico preservado) |
+| POST | `/sources/{id}/validate` | Amostra de até 100 arquivos, contagem e bytes estimados. Não inicia conversão. Fonte inacessível responde `ok:false` com código (`SOURCE_NOT_FOUND`, `ROOT_REVOKED`) |
+| POST | `/sources/{id}/imports` | **202** com cabeçalho `Idempotency-Key` obrigatório. Mesma chave + mesmo corpo devolve a mesma importação; corpo diferente → `409 IDEMPOTENCY_KEY_REUSED`. Importação ativa da fonte → `409 SOURCE_IMPORT_BUSY` |
+| GET | `/imports/{id}` | Progresso e contadores (`imported`, `skipped`, `failed`) |
+| GET | `/imports/{id}/items` | Itens por arquivo, com `conversion_id` e erro individual |
+| POST | `/imports/{id}/cancel` | Pedido durável; itens já publicados permanecem no histórico |
+| GET | `/schedules` | Agendas do dono |
+| POST | `/schedules` | Regra diária (`{kind:"daily", local_time:"HH:MM"}`) ou intervalo (`{kind:"interval", every_seconds, anchor_at?}`), `timezone` IANA, políticas `misfire_policy`/`overlap_policy`. `400 INVALID_SCHEDULE_RULE` para regra/intervalo inválido e `INVALID_TIMEZONE` para fuso desconhecido |
+| POST | `/schedules/preview` | Próximas cinco ocorrências, sem executar (mesma função do disparo real) |
+| GET/PATCH/PUT/DELETE | `/schedules/{id}` | PATCH e PUT aceitos nos dois modos e com o mesmo corpo: exigem `revision` (conflito → `409 REVISION_CONFLICT`); DELETE arquiva |
+| POST | `/schedules/{id}/pause` \| `/resume` \| `/run-now` | Transições idempotentes. `run-now` exige `Idempotency-Key`, não desloca o calendário e responde 202 com `executor_active` (ver [Agendamentos](SOURCES_AND_AUTOMATION.md#4-agendamentos)) |
+| GET | `/schedules/{id}/runs` | Histórico de ocorrências |
+| GET | `/schedule-runs/{id}` | Estado, fase, importação, indexação e erro |
+| GET | `/schedule-runs/{id}/events` | Eventos. Com `Accept: text/event-stream` devolve SSE, retomado por `Last-Event-ID` ou `?after=` (o cabeçalho tem precedência); caso contrário devolve `{items}` para polling. O SSE envia `event: done` quando a ocorrência termina sem eventos novos |
+| POST | `/schedule-runs/{id}/cancel` | Cancelamento durável e idempotente |
+
+### Eventos de conversão
+
+`GET /conversions/:id/events` (SSE). Cada evento traz `id` (sequência) e `event`
+(tipo). O `data` é JSON com `status`; no gateway ele traz também `run_id`, no
+standalone não (o filtro por execução é feito no servidor nos dois modos).
+
+Os dois modos seguem o mesmo contrato de `run_id`:
+
+- Sem `run_id`, o stream acompanha a conversão como um todo e termina no evento
+  terminal da execução atual. Um `retry` reutiliza o id da conversão; a falha de
+  uma execução antiga não fecha o stream.
+- Com `?run_id=`, o stream repassa só os eventos daquela execução e termina no
+  evento terminal dela. Uma execução anterior que falhou não fecha o stream de
+  uma execução nova.
+- `run_id` inexistente para a conversão responde `404 NOT_FOUND`; formato
+  inválido (fora de `^[A-Za-z0-9_-]{1,64}$`) responde `400 INVALID_OPTION` no
+  standalone e `400` no gateway. Essas respostas saem antes do início do stream.
+- O standalone guarda a execução de cada evento pelo evento de enfileiramento
+  da execução (`payload.attempt`), por isso não precisa de coluna `run_id` nos
+  eventos.
+
 ## Regras de estado
 
 ```
@@ -200,6 +269,20 @@ received → validating → queued → inspecting → extracting → structuring
 Erros usam o envelope `{ "error": { "code", "message", "details" } }`. Os
 códigos abaixo são os que o código emite, com o status HTTP e o modo.
 
+Códigos adicionados pelo upgrade de fontes/planilhas/agendador:
+`UNKNOWN_FIELD` (400), `INVALID_PAYLOAD` (400), `INVALID_SOURCE` (400),
+`SOURCE_UNAVAILABLE` (400), `ROOT_NOT_FOUND` (404), `ROOT_REVOKED` (409),
+`SOURCE_DISABLED` (409), `FEATURE_DISABLED` (409, só em `POST /sources/{id}/imports`
+com `SOURCE_IMPORTS_ENABLED=false`; `run-now` não o devolve), `VERSION_CONFLICT` (409),
+`IDEMPOTENCY_KEY_REUSED` (409), `SOURCE_IMPORT_BUSY` (409),
+`INVALID_SCHEDULE_RULE` (400), `INVALID_TIMEZONE` (400),
+`REVISION_CONFLICT` (409), `SCHEDULE_NOT_FOUND` (404), `RUN_NOT_FOUND` (404),
+`UNSUPPORTED_SPREADSHEET_FORMAT` (400), `NOT_SPREADSHEET` (400),
+`SPREADSHEET_CORRUPT` (400), `SPREADSHEET_BUDGET_EXCEEDED` (400),
+`SPREADSHEET_SHEET_NOT_FOUND` (400), `CSV_ENCODING_REQUIRED` (400),
+`CSV_DIALECT_REQUIRED` (400), `SOURCE_CHANGED` / `SOURCE_BUSY` /
+`SOURCE_MISSING` (erro por item), `FILE_TOO_LARGE` (400 por item).
+
 Quando a coluna **Modo** diz `ambos`, o código e o status são iguais nos dois
 processos. Quando diz `standalone` ou `gateway`, o outro modo usa outro código
 ou outro status, descrito na própria linha.
@@ -213,6 +296,21 @@ ou outro status, descrito na própria linha.
 | 400 | `TOO_MANY_PAGES` | PDF com mais páginas que `UPLOAD_MAX_PAGES`. Só existe quando a variável é definida explicitamente | gateway |
 | 400 | `INVALID_OPTION` | Opção desconhecida, limite de páginas (`max_pages` etc.), JSON de `options` malformado, `target_formats` vazio, valor fora do enum, `scope` inválido em `retry` | ambos |
 | 400 | `UNSUPPORTED_FORMAT` | `target_formats` com formato fora de `xlsx`, `txt` e `csv`, ou formato de exportação diferente de `txt` e `csv` | standalone. No gateway, o mesmo caso é `INVALID_OPTION` |
+| 400 | `CSV_ENCODING_REQUIRED` | CSV com bytes que não decodificam como UTF-8 (com ou sem BOM) e sem `csv_encoding` declarado | standalone, no `complete` do envio por partes |
+| 400 | `CSV_DIALECT_REQUIRED` | CSV com delimitador ambíguo (ou sem delimitador) sem `csv_delimiter` declarado | standalone, no `complete` |
+| 400 | `CSV_PARSE_FAILED` | CSV que não pôde ser lido com o dialeto escolhido | standalone, no `complete` |
+| 400 | `NOT_SPREADSHEET` | Arquivo com extensão de planilha cujo conteúdo não é XLSX/CSV (por exemplo, ZIP renomeado) | standalone, no `complete` |
+| 400 | `SPREADSHEET_CORRUPT` | Pacote XLSX corrompido ou incompleto | standalone, no `complete` |
+| 400 | `UNSUPPORTED_SPREADSHEET_FORMAT` | `.xls`, `.xlsm`, `.xlsb` ou `.ods`, recusados com mensagem explícita | standalone, no `complete` |
+| 400 | `SPREADSHEET_BUDGET_EXCEEDED` | Orçamento de expansão, células ou tamanho estourado (nunca há truncamento) | standalone, no `complete` |
+| 400 | `SPREADSHEET_SHEET_NOT_FOUND` | Aba pedida em `spreadsheet.sheet_names` que não existe | standalone, no `complete` |
+
+Os códigos de planilha acima vêm da sondagem do motor no `complete` do envio
+por partes e são devolvidos como estão, com `400`, e o item vira `upload_failed`.
+No gateway (`full`), `complete` admite XLSX e CSV declarados pelo nome, sem
+sondagem de planilha; a validação de conteúdo fica com o motor na execução da
+conversão. Esses códigos específicos não são devolvidos pelo `complete` do
+gateway.
 | 400 | `UNSUPPORTED_TARGET` | Imagem com `target_formats` diferente de `["txt"]` | standalone |
 | 400 | `INCOMPATIBLE_OUTPUT_FORMAT` | Imagem com `xlsx` ou `csv`. Produzido pelo normalizador do contrato no gateway | gateway |
 | 400 | `INVALID_CELL_ID` | Célula fora do formato `Aba!C2` ou `C2` | standalone. O gateway repassa o código do motor |
@@ -225,8 +323,9 @@ ou outro status, descrito na própria linha.
 | HTTP | code | Quando | Modo |
 | --- | --- | --- | --- |
 | 401 | `UNAUTHENTICATED` | JWT inválido ou expirado, ou rota que exige identidade sem ela | ambos |
-| 401 | `UNAUTHORIZED_INTERNAL` | `x-internal-token` inválido nas rotas `/internal/v1` do motor | standalone e motor |
+| 401 | `UNAUTHORIZED_INTERNAL` | `x-internal-token` ausente ou inválido nas rotas `/internal/v1` do motor, e nos callbacks internos do motor para o gateway (guard `InternalTokenGuard`) | standalone, motor e gateway (callbacks) |
 | 403 | `FORBIDDEN` | Recurso de outro dono | ambos |
+| 403 | `DESKTOP_HOST_FORBIDDEN` | Requisição sem o cabeçalho `x-desktop-host` correto, com `Host` ou `Origin` de outra origem. Só existe com `DESKTOP_HOST_ENABLED=true` (aplicativo desktop). `GET /health` é a única exceção | standalone (desktop) |
 | 404 | `NOT_FOUND` | Recurso inexistente, rota inexistente ou rota que o gateway não encaminha | ambos |
 | 404 | `UPLOAD_NOT_FOUND` | Sessão de upload inexistente em `GET`, `PUT` ou `complete` | standalone. O gateway responde `NOT_FOUND` |
 
@@ -234,9 +333,10 @@ ou outro status, descrito na própria linha.
 
 | HTTP | code | Quando | Modo |
 | --- | --- | --- | --- |
-| 409 | `ALREADY_TERMINAL` | `retry` ou `cancel` numa conversão já terminal | ambos |
+| 409 | `ALREADY_TERMINAL` | `cancel` numa conversão já terminal. O `retry` de conversão terminal é permitido e cria nova execução | ambos |
 | 409 | `ALREADY_ACTIVE` | `retry` numa conversão ainda em andamento | standalone. O gateway responde `CONVERSION_BUSY` |
-| 409 | `CONVERSION_BUSY` | Operação que exige conversão parada, com a conversão em andamento (retry no gateway; repetir item de lote) | ambos |
+| 409 | `CONVERSION_BUSY` | Operação que exige conversão parada, com a conversão em andamento (`retry` no gateway; repetir item de lote). No gateway, também numa corrida de `retry` | ambos |
+| 409 | `ALREADY_CONVERTED` | Repetir o **envio** (`scope: "upload"`) de um item que já virou conversão. Use `scope: "conversion"` | standalone. O gateway responde `UPLOAD_STATE_CONFLICT` com `reason: upload_not_resumable` |
 | 409 | `NOT_READY` | Resultado, XLSX ou prévia ainda não disponíveis, ou repetir item de lote sem conversão | ambos |
 | 409 | `IDEMPOTENT_REPLAY` | Ver [Idempotência](#idempotência) | ambos |
 | 409 | `IDEMPOTENCY_KEY_REUSED` | `Idempotency-Key` repetida com outro arquivo ou outras opções. Nunca devolve a conversão anterior | standalone |
@@ -245,12 +345,13 @@ ou outro status, descrito na própria linha.
 | 409 | `BATCH_HAS_PENDING_UPLOADS` | Selar um lote com uploads em `pending_upload` ou `uploading`. Com a contagem em `details`. `upload_failed` não bloqueia | ambos |
 | 409 | `UPLOAD_STATE_CONFLICT` | Sessão já concluída ou abortada, ou ação inválida para o estado | ambos |
 | 409 | `UPLOAD_INCOMPLETE` | `complete` com partes faltando, total de partes diferente ou bytes divergentes | ambos |
+| 409 | `UPLOAD_EXPIRED` | Sessão de upload expirada no `PUT` de parte e no `complete` (gateway). O standalone usa o mesmo código com `410`, ver abaixo | gateway |
 | 409 | `UPLOAD_PART_MISMATCH` | Mesma parte reenviada com conteúdo diferente | ambos |
-| 409 | `UPLOAD_NOT_FOUND` | `retry` de item de lote sem sessão de upload para retomar | ambos |
+| 409 | `UPLOAD_NOT_FOUND` | `retry` de item de lote sem sessão de upload para retomar. (Em `GET`/`PUT`/`complete` de sessão inexistente, ver a tabela de autenticação, linha 404) | ambos |
 | 409 | `ARTIFACT_QUARANTINED` | Export reprovado na auditoria. O download é bloqueado | ambos |
 | 409 | `ARTIFACT_HASH_MISMATCH` | O artefato no storage não confere com o hash registrado | ambos |
 | 409 | `TEXT_PLAN_MISSING` | Exportação TXT de um run sem plano textual | standalone |
-| 410 | `UPLOAD_EXPIRED` | Sessão de upload expirada | standalone. O gateway responde `409` com o mesmo código |
+| 410 | `UPLOAD_EXPIRED` | Sessão de upload expirada no `PUT` de parte e no `complete`. Nenhuma conversão é criada a partir de uma sessão expirada | standalone. O gateway responde `409` com o mesmo código, no `PUT` e no `complete` (só o status HTTP difere) |
 
 ### Envio por partes e checksums
 
@@ -285,6 +386,12 @@ Estes códigos aparecem dentro de outros payloads, não como status de erro.
   é um aviso, não um erro.
 - **`QUEUE_DELIVERY_FAILED`**: a tarefa não chegou ao motor. Aparece no evento de
   outbox e no status da conversão (gateway).
+- **Importações por caminho** (`error.code` da importação, e `error` do item):
+  `IMPORT_INCOMPLETE` (ainda há itens em andamento; retomável),
+  `IMPORT_GATEWAY_UNAVAILABLE` (falha transitória ao submeter; retomável),
+  `IMPORT_FAILED`, `IMPORT_INTERNAL_ERROR`, `IMPORT_INVALID`. Erros de item:
+  `SOURCE_CHANGED`, `SOURCE_BUSY`, `SOURCE_MISSING`, `FILE_TOO_LARGE`,
+  `SNAPSHOT_MISSING` e `CONVERSION_FAILED`.
 - **Eventos `error` do assistente**: `MODEL_DISABLED`, `MODEL_UNAVAILABLE`,
   `MODEL_TIMEOUT`, `MODEL_ERROR`, `EMBEDDING_UNAVAILABLE`, `NOT_FOUND`.
 - **Jobs de indexação** (`/knowledge/index-jobs/:id`): `INDEX_FAILED` e
@@ -328,6 +435,9 @@ base de tratamento de erro:
 | Parte acima do tamanho | `413 FILE_TOO_LARGE` | `400 FILE_TOO_LARGE` |
 | Checksum divergente | `422 UPLOAD_CHECKSUM_MISMATCH` | `422 VALIDATION_ERROR` com `details.code` |
 | Conversão em andamento no `retry` | `409 ALREADY_ACTIVE` | `409 CONVERSION_BUSY` |
+| Repetir envio de item já convertido (`scope: upload`) | `409 ALREADY_CONVERTED` | `409 UPLOAD_STATE_CONFLICT` (`reason: upload_not_resumable`) |
+| Sessão de upload expirada no `complete` | `410 UPLOAD_EXPIRED` (sem criar conversão) | `409 UPLOAD_EXPIRED` (sem criar conversão) |
+| Desktop: requisição sem host válido | `403 DESKTOP_HOST_FORBIDDEN` (só com `DESKTOP_HOST_ENABLED`) | não se aplica |
 | `Idempotency-Key` com payload diferente | `409 IDEMPOTENCY_KEY_REUSED` | `409 IDEMPOTENT_REPLAY` |
 | Lotes desativados | `503 BATCH_DISABLED` | `400 INVALID_OPTION` (`reason: batch_disabled`) |
 | Motor indisponível | não se aplica (mesmo processo) | `503 CONVERTER_UNAVAILABLE` |
@@ -371,7 +481,27 @@ Regras:
 - `limit` tem padrão 50 e máximo 200. É paginação, não um teto de lote.
 - Selar com uploads em `pending_upload` ou `uploading` retorna `409 BATCH_HAS_PENDING_UPLOADS`
   com a contagem. `upload_failed` é definitivo e não bloqueia a selagem.
-- Um lote selado vazio conclui com `completed` e zero itens.
+- `upload_failed` é estado terminal e conta como falha no lote. No gateway, entra
+  em `counts.failed`. No motor standalone, aparece como chave própria
+  `upload_failed` em `counts`, mas também conta como problema para o status do
+  lote.
+- Um lote selado vazio conclui com `completed` e zero itens. Com problemas, o
+  status é `completed_with_errors`.
+- Repetir item (`POST /batches/:id/items/:itemId/retry`, body `{scope}`):
+  - `scope: "upload"` retoma o envio na mesma sessão. No gateway só vale para
+    itens em `pending_upload`, `uploading` ou `upload_failed`; outro estado
+    responde `409 UPLOAD_STATE_CONFLICT`. Item que já virou conversão não é
+    reenviado (`409`, ver [Estado e concorrência](#estado-e-concorrência)).
+    O standalone aplica a mesma regra de estado: outro estado responde
+    `409 UPLOAD_STATE_CONFLICT` com `details.reason: upload_not_resumable`. Item
+    com conversão responde `409 ALREADY_CONVERTED` (o gateway responde
+    `UPLOAD_STATE_CONFLICT` nesse caso). Um item abortado (`upload_failed`)
+    passa pela regra; como o aborto remove a sessão do item, a repetição então
+    responde `409 UPLOAD_NOT_FOUND` nos dois modos.
+  - `scope: "conversion"` cria nova execução da conversão do item. Vale para
+    item já finalizado. Item em andamento responde `409 CONVERSION_BUSY`; item
+    sem conversão responde `409 NOT_READY`.
+  - Outro `scope` responde `400 INVALID_OPTION`.
 
 ### Upload por partes
 
@@ -386,6 +516,9 @@ Regras:
 - `part_size` é decidido pelo servidor (8 MiB por padrão, em `UPLOAD_PART_BYTES`)
   e devolvido no registro do item. É um parâmetro de transporte e não limita o
   tamanho total.
+- O caminho por partes não tem teto de tamanho do produto. `UPLOAD_MAX_BYTES`
+  vale só para `POST /conversions` (envio único). No gateway, `UPLOAD_MAX_FILE_BYTES`
+  é um teto opcional, desligado por padrão, aplicado ao registrar o item.
 - As partes são numeradas a partir de **0**. Reenviar a mesma parte é uma
   operação sem efeito. Reenviar conteúdo diferente retorna `409 UPLOAD_PART_MISMATCH`.
 - `complete` confere contiguidade, tamanho total e SHA-256 do documento antes de
@@ -435,3 +568,40 @@ páginas de origem não vem embutida: use a rota paginada.
 - Formatos de saída válidos: `xlsx`, `txt`, `csv`.
 - Aceitas também as chaves planas antigas (`ocr`, `text` e `csv` no nível raiz),
   só para compatibilidade com a rota de envio único.
+
+### Opções v3 (`ConversionOptionsV3`) — entrada de planilha
+
+Um payload vira v3 quando `kind` é planilha **ou** existe a seção
+`spreadsheet`; `schema_version: 3` sozinho não promove um PDF (o formato v2
+continua byte a byte igual, preservando o hash de idempotência).
+
+```json
+{
+  "schema_version": 3,
+  "target_formats": ["xlsx", "txt", "csv"],
+  "spreadsheet": {
+    "sheet_names": ["Faturas"],
+    "header_row": true,
+    "csv_encoding": "utf-8-sig",
+    "csv_delimiter": ";",
+    "formula_mode": "cached_or_text",
+    "reader_version": "spreadsheet-reader-v1"
+  }
+}
+```
+
+- `sheet_names`: `null` lê todas as abas (ocultas incluídas, com aviso);
+  nomes inexistentes falham com `SPREADSHEET_SHEET_NOT_FOUND`.
+- `header_row`: `true`/`false` explícitos ou `null` (decisão determinística
+  registrada na auditoria da aba).
+- `csv_encoding`/`csv_delimiter`: obrigatórios para arquivos não-UTF-8 ou com
+  dialeto ambíguo (`CSV_ENCODING_REQUIRED`, `CSV_DIALECT_REQUIRED`).
+- `formula_mode` aceita apenas `cached_or_text`: fórmulas sem valor em cache
+  entram como texto, com aviso `FORMULA_WITHOUT_CACHE`.
+- `reader_version` é **estampado pelo servidor** e participa do fingerprint;
+  enviá-lo em entrada de cliente é `INVALID_OPTION`.
+- XLSX é reconhecido pelo conteúdo (OOXML); ZIP renomeado é `NOT_SPREADSHEET`.
+  Orçamentos de expansão/células/grade produzem `SPREADSHEET_BUDGET_EXCEEDED`
+  em vez de truncar. `.xls`, `.xlsm`, `.xlsb` e `.ods` são recusados nesta
+  versão com mensagem explícita.
+

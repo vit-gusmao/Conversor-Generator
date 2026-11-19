@@ -22,6 +22,38 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('apiFetch', () => {
+  it('passes the abort signal to fetch', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true }));
+    const controller = new AbortController();
+
+    await apiFetch('/batches/b1/items', { method: 'POST', json: {}, signal: controller.signal });
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init?.signal).toBe(controller.signal);
+  });
+
+  it('rethrows an aborted request as the AbortError, not as an ApiError', async () => {
+    fetchMock.mockImplementation(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          );
+        }),
+    );
+    const controller = new AbortController();
+
+    const pending = apiFetch('/conversions', { signal: controller.signal }).catch(
+      (cause: unknown) => cause,
+    );
+    controller.abort();
+    const error = await pending;
+
+    expect(error).toBeInstanceOf(DOMException);
+    expect((error as DOMException).name).toBe('AbortError');
+    expect(error).not.toBeInstanceOf(ApiError);
+  });
+
   it('parses the documented error envelope into ApiError', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ error: { code: 'FILE_TOO_LARGE', message: 'Arquivo grande', details: { max: 10 } } }, 400),

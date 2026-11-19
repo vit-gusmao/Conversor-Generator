@@ -108,6 +108,10 @@ def test_desktop_entry_prepares_runtime_from_a_clean_cwd(tmp_path: Path):
             "SERVICE_DIR": str(SERVICE_DIR),
             "CONVERTER_OCR_ENABLED": "false",
             "CONVERTER_QUEUE": "inline",
+            # The supervisor always supplies these; the entry refuses without them.
+            "CONVERTER_INTERNAL_TOKEN": "i" * 43,
+            "DESKTOP_BOOTSTRAP_SECRET": "b" * 43,
+            "JWT_SECRET": "j" * 96,
         }
     )
     script = textwrap.dedent(
@@ -170,3 +174,61 @@ def test_settings_uses_explicit_app_data_dir_after_apply(tmp_path: Path):
             os.environ["APP_DATA_DIR"] = previous_data
         if previous_storage is not None:
             os.environ["STORAGE_LOCAL_ROOT"] = previous_storage
+
+
+def _stub_entry(monkeypatch, events: list):
+    """Replace runtime setup, readiness and the server run with recorders."""
+    import types
+
+    import desktop_entry
+    import uvicorn
+
+    monkeypatch.setenv("CONVERTER_INTERNAL_TOKEN", "t" * 40)
+    monkeypatch.setenv("DESKTOP_BOOTSTRAP_SECRET", "t" * 40)
+    monkeypatch.setenv("JWT_SECRET", "j" * 96)
+    # main() flips this on for the real process; restored after the test.
+    monkeypatch.setenv("DESKTOP_HOST_ENABLED", "false")
+    monkeypatch.setattr(
+        desktop_entry,
+        "prepare_runtime",
+        lambda: {"boot_id": "boot-order", "version": "9.9.9", "web_dist_available": False},
+    )
+    monkeypatch.setattr(
+        desktop_entry,
+        "publish_readiness",
+        lambda port, boot_id, version, target: events.append(("ready", port)),
+    )
+    monkeypatch.setattr(
+        uvicorn.Server,
+        "run",
+        lambda self, sockets=None: events.append(("run", sockets[0].getsockname()[1])),
+    )
+    return types, desktop_entry
+
+
+def test_readiness_is_published_after_the_app_imports_and_before_serving(monkeypatch):
+    """Readiness must follow `api.main` import and precede the server run."""
+    import sys
+
+    events: list = []
+    types, desktop_entry = _stub_entry(monkeypatch, events)
+    monkeypatch.setitem(sys.modules, "api.main", types.SimpleNamespace(app=object()))
+
+    assert desktop_entry.main(["--port", "0"]) == 0
+    assert [name for name, _ in events] == ["ready", "run"]
+    ready_port = events[0][1]
+    assert ready_port == events[1][1] > 0  # the port announced is the one bound
+
+
+def test_broken_app_import_never_reports_ready(monkeypatch):
+    """A failing `api.main` import (e.g. a missing DLL) must not announce READY."""
+    import sys
+
+    events: list = []
+    _types, desktop_entry = _stub_entry(monkeypatch, events)
+    # `None` in sys.modules makes `from api.main import app` raise ImportError.
+    monkeypatch.setitem(sys.modules, "api.main", None)
+
+    with pytest.raises(ImportError):
+        desktop_entry.main(["--port", "0"])
+    assert events == []

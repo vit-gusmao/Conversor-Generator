@@ -103,6 +103,9 @@ class DurableScheduler:
 
     def _run_lease(self, lease: JobLease) -> None:
         stop_heartbeat = threading.Event()
+        #: Set by the heartbeat when another owner holds the fence. The running
+        #: unit reads it through its cancel check and stops before publishing.
+        lease_lost = threading.Event()
 
         def _heartbeat() -> None:
             while not stop_heartbeat.wait(HEARTBEAT_SECONDS):
@@ -113,6 +116,7 @@ class DurableScheduler:
                             lease.run_id,
                             lease.fence,
                         )
+                        lease_lost.set()
                         return
                 except Exception:  # noqa: BLE001
                     logger.debug("heartbeat failed for job %s", lease.job_id)
@@ -123,7 +127,7 @@ class DurableScheduler:
         beat.start()
         try:
             runner = self._runner or _default_runner
-            runner(lease=lease, repo=self.repo)
+            runner(lease=lease, repo=self.repo, lease_lost=lease_lost)
         except Exception:  # noqa: BLE001
             logger.exception("job %s crashed outside the worker error handling", lease.job_id)
             try:
@@ -137,7 +141,12 @@ class DurableScheduler:
             self.wake()
 
 
-def _default_runner(*, lease: JobLease, repo: JobRepository) -> None:
+def _default_runner(
+    *,
+    lease: JobLease,
+    repo: JobRepository,
+    lease_lost: threading.Event | None = None,
+) -> None:
     """Runs the document unit through the shared worker entry point."""
     from worker.tasks import execute_run
 
@@ -165,11 +174,15 @@ def _default_runner(*, lease: JobLease, repo: JobRepository) -> None:
         storage_key=str(payload.get("storage_key") or ""),
         filename=str(payload.get("filename") or "documento.pdf"),
         options=payload.get("options") or {},
-        cancel_check=lambda: repo.cancel_requested(lease.run_id),
+        cancel_check=lambda: _lease_is_lost(lease_lost) or repo.cancel_requested(lease.run_id),
         job_id=lease.job_id,
         fence=lease.fence,
         resume=int(lease.attempt) > 1,
     )
+
+
+def _lease_is_lost(event: threading.Event | None) -> bool:
+    return event is not None and event.is_set()
 
 
 __all__ = ["DurableScheduler"]

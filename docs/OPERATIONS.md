@@ -14,26 +14,20 @@ Os comandos assumem a raiz do repositório como diretório atual, salvo indicaç
 
 Existem quatro formas de subir o sistema. Escolha uma, e não rode duas ao mesmo tempo na porta 8000.
 
-### 1.1 `starter-server.cmd` (recomendado no Windows)
+### 1.1 `starter-local-server.cmd` (recomendado no Windows)
 
-[starter-server.cmd](../starter-server.cmd) é o inicializador. Ele:
+[starter-local-server.cmd](../starter-local-server.cmd) é o inicializador. Em um clone novo ele prepara tudo sozinho. Ele:
 
-1. Verifica se o ambiente virtual existe em `services/converter/.venv`.
+1. Usa `CONVERTER_PORT` (padrão `8000`). Se o servidor já responde em `http://127.0.0.1:<porta>/health`, apenas abre o navegador e sai. Se a porta estiver ocupada por outro processo, mostra erro e para.
 2. Consulta o GLM-OCR no Ollama. Esse passo é informativo e nunca bloqueia o start.
-3. Se o servidor já responde em `http://127.0.0.1:8000/health`, apenas abre o navegador e sai.
-4. Se a porta 8000 estiver ocupada por outro processo, mostra erro e para.
-5. Se `apps/web/dist/index.html` não existir, tenta compilar a interface com `npm run build`.
-6. Inicia `uvicorn` em uma janela minimizada chamada **"Conversor Generator - servidor"**, aguarda até 90 segundos e abre o navegador.
+3. Garante o ambiente virtual em `services/converter/.venv` (ou em `CG_VENV_DIR`). Localiza Python 3.11+; se não houver, tenta `winget` para instalar o Python 3.12 no usuário. Recria o venv se ele estiver quebrado ou com Python antigo.
+4. Instala `pip install -e "services/converter[ocr,migrate]"`. Reinstala só quando `pyproject.toml` muda ou quando os imports básicos falham. O log da instalação fica em `services/converter/.venv/install.log`; em caso de falha, as últimas linhas aparecem na tela.
+5. Se `apps/web/dist/index.html` não existir (ou com `--rebuild-web`), compila `packages/contracts` e `apps/web` com `npm ci` e `npm run build`. Exige Node.js 20.19+ ou 22+; se não houver, tenta `winget` com o Node.js LTS. Sem Node, a API sobe sem a interface.
+6. Inicia `uvicorn` em uma janela minimizada chamada **"Conversor Generator - servidor"**, aguarda até 90 segundos e abre o navegador. Com `--no-browser`, não abre o navegador.
+
+Opções de linha de comando: `--no-browser` (não abre o navegador) e `--rebuild-web` (recompila `apps\web` mesmo que `dist` exista). Variáveis lidas do ambiente do processo (não do `.env`): `CONVERTER_PORT`, `CG_VENV_DIR` (pasta do venv) e `CG_NOPAUSE=1` (não aguarda tecla em caso de erro). O starter define `AUTOMATION_EXECUTOR_ENABLED=true` quando a variável não está definida, porque os agendamentos precisam do executor ligado nesse processo. Python: prefere 3.12 e aceita 3.11 ou superior; se não houver, tenta `winget` com o Python 3.12.
 
 Para parar: feche a janela "Conversor Generator - servidor" ou pressione `Ctrl+C` nela.
-
-Se faltar o ambiente virtual, o script orienta a criá-lo. A mensagem atual sugere `pip install -e ".[test]"`, que não instala as dependências de OCR. Para uso real, prefira:
-
-```powershell
-cd services\converter
-python -m venv .venv
-.\.venv\Scripts\pip install -e ".[full]"
-```
 
 ### 1.2 Uvicorn manual
 
@@ -101,7 +95,7 @@ O compose exige as variáveis `CONVERTER_INTERNAL_TOKEN` e `JWT_SECRET`. Sem ela
 
 | Serviço | Endpoint | O que verifica |
 |---|---|---|
-| Converter | `GET /health` | resposta simples com `status` e `version` (usado pelo `starter-server.cmd`) |
+| Converter | `GET /health` | resposta simples com `status` e `version` (usado pelo `starter-local-server.cmd`) |
 | Converter | `GET /api/v1/health` | banco (`SELECT 1`), fila e armazenamento. `status` é `ok` ou `degraded`. |
 | Converter | `GET /internal/v1/health` | motor, fila, OCR e capacidades. Usado pelo healthcheck do container. Não exige token. |
 | Converter | `GET /api/v1/health/ready` | `accepting_uploads`, `ocr_available` e `queue_pending`. Não expõe hosts nem caminhos. |
@@ -168,7 +162,7 @@ cd services\converter
 
 ### 3.3 Guardando o log em arquivo (Windows)
 
-O `starter-server.cmd` esconde a saída numa janela minimizada. Para gravar em arquivo, rode o uvicorn manualmente:
+O `starter-local-server.cmd` esconde a saída numa janela minimizada. Para gravar em arquivo, rode o uvicorn manualmente:
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\pdf2x-logs" | Out-Null
@@ -272,13 +266,13 @@ cmd /c "docker compose exec -T postgres pg_dump -U pdf2x -d pdf2x_conv > pdf2x_c
 
 ```bash
 cd infra
-docker compose stop api converter worker web postgres minio redis
+docker compose stop api automation converter worker web postgres minio redis
 
 docker run --rm -v pdf2x_pgdata:/v -v "$PWD":/b alpine tar czf /b/pgdata.tgz -C /v .
 docker run --rm -v pdf2x_miniodata:/v -v "$PWD":/b alpine tar czf /b/miniodata.tgz -C /v .
 docker run --rm -v pdf2x_redisdata:/v -v "$PWD":/b alpine tar czf /b/redisdata.tgz -C /v .
 
-docker compose start postgres minio redis converter worker api web
+docker compose start postgres minio redis converter worker automation api web
 ```
 
 No PowerShell, troque `"$PWD"` por `"${PWD}"`.
@@ -482,6 +476,7 @@ Faça backup antes de atualizar. Se a versão nova alterar o schema, a migraçã
 
 - **Segredos padrão**: `CONVERTER_INTERNAL_TOKEN` e `JWT_SECRET` têm valores de desenvolvimento públicos no código (`dev-internal-token-change-me` e `dev-jwt-secret-change-me` no converter; `dev-only-insecure-secret-change-me` no NestJS para o JWT). O converter registra um aviso no log de startup quando eles estão em uso. Troque antes de usar a máquina com outras pessoas.
 - **Binds**: mantenha `--host 127.0.0.1`. A API NestJS usa `API_HOST` com padrão `127.0.0.1`. O MCP em HTTP escuta em `127.0.0.1` por padrão. O compose publica apenas `web` em `127.0.0.1:${WEB_PORT:-8080}`, e os demais containers não publicam portas para o host.
+- **Recusa de inicialização da API**: com `NODE_ENV=production`, a API NestJS não sobe se `JWT_SECRET` ou `CONVERTER_INTERNAL_TOKEN` tiverem o valor padrão de desenvolvimento (`apps/api/src/config/configuration.ts`). Fora de produção, apenas emite aviso.
 - **Não exponha portas**: não publique `0.0.0.0` nem faça redirecionamento de porta no roteador ou em túneis. O projeto não tem autenticação forte para uso público.
 - **Token em URL**: rotas SSE aceitam `access_token` na query string. Ele pode aparecer nos logs do uvicorn (seção 3.5). Não compartilhe logs brutos.
 - **Credenciais do MinIO e do Postgres** no compose usam valores padrão (`minioadmin`, `pdf2x`). Altere `POSTGRES_PASSWORD`, `S3_ACCESS_KEY` e `S3_SECRET_KEY` no `.env` se outras pessoas tiverem acesso à máquina.

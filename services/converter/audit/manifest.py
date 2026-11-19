@@ -69,6 +69,8 @@ def build_summary(
         for usage in sorted(ir.engines.values(), key=lambda u: (-u.regions, u.engine))
     ]
 
+    event_times = _event_times(recorder)
+    now = datetime.now(UTC).isoformat()
     decisions = [
         {
             "decision_id": d.decision_id,
@@ -79,7 +81,7 @@ def build_summary(
             "reason_codes": d.reason_codes,
             "alternatives": d.alternatives,
             "page_number": d.page_number,
-            "at": _event_time_for(recorder, d.decision_id),
+            "at": event_times.get(d.decision_id, now),
         }
         for d in recorder.decisions
     ]
@@ -142,11 +144,17 @@ def build_summary(
     }
 
 
-def _event_time_for(recorder: AuditRecorder, decision_id: str) -> str:
-    for event in reversed(recorder.events):
-        if event.payload.get("decision_id") == decision_id:
-            return event.created_at.isoformat()
-    return datetime.now(UTC).isoformat()
+def _event_times(recorder: AuditRecorder) -> dict[str, str]:
+    """Map decision_id -> timestamp of its last event, in one pass.
+
+    The last event carrying a decision_id wins, matching a reverse scan.
+    """
+    times: dict[str, str] = {}
+    for event in recorder.events:
+        decision_id = event.payload.get("decision_id")
+        if decision_id is not None:
+            times[decision_id] = event.created_at.isoformat()
+    return times
 
 
 def build_export_json(summary: dict[str, Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:

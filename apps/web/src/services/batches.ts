@@ -47,10 +47,12 @@ export async function getBatch(batchId: string): Promise<BatchSummary> {
 export async function registerItem(
   batchId: string,
   input: RegisterBatchItemRequest,
+  options: { signal?: AbortSignal } = {},
 ): Promise<RegisterBatchItemResponse> {
   return apiFetch<RegisterBatchItemResponse>(`${batchPath(batchId)}/items`, {
     method: 'POST',
     json: input,
+    signal: options.signal,
   });
 }
 

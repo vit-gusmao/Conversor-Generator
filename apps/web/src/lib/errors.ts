@@ -17,6 +17,12 @@ const CODE_MESSAGES: Record<string, string> = {
   CONVERTER_UNAVAILABLE: 'O motor de conversão está indisponível no momento.',
   NETWORK_ERROR: 'Não foi possível contatar a API. Verifique sua conexão e tente novamente.',
   INVALID_RESPONSE: 'A API respondeu com um formato inesperado.',
+  REVISION_CONFLICT:
+    'Esta agenda foi alterada em outra aba ou sessão. Recarregue a versão mais recente e reaplique suas mudanças.',
+  SCHEDULE_NOT_FOUND: 'Esta agenda não existe mais ou pertence a outra sessão.',
+  RUN_NOT_FOUND: 'Esta execução não existe mais ou pertence a outra sessão.',
+  SOURCE_NOT_FOUND: 'A fonte desta agenda não existe mais. Escolha outra fonte.',
+  SOURCE_DISABLED: 'A fonte desta agenda está desativada. Reative-a para executar.',
 };
 
 /** A user-facing pt-BR message for any thrown value. */

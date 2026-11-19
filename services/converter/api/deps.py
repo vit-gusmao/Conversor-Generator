@@ -12,6 +12,7 @@ import jwt
 from fastapi import Depends, Header, HTTPException, Request, Response
 from sqlalchemy import select
 
+from api.serialization import iso_utc
 from config import settings
 from models.db import PublicUserRow, get_session_factory
 
@@ -66,7 +67,7 @@ def user_dict(user: PublicUserRow) -> dict[str, Any]:
         "name": user.name,
         "role": user.role,
         "is_anonymous": bool(user.is_anonymous),
-        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "created_at": iso_utc(user.created_at),
     }
 
 

@@ -3,15 +3,19 @@ import { Transform, type Readable } from 'node:stream';
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import {
+  ConversionOptionsError,
   DEFAULT_UPLOAD_PART_BYTES,
+  normalizeConversionOptions,
   type CompleteUploadResponse,
+  type ConversionOptionsV2,
+  type ConversionOptionsV3,
   type UploadPartReceipt,
   type UploadSessionDetail,
 } from '@pdf2x/contracts';
 import type { Prisma } from '@prisma/client';
 
 import { ApiError } from '../../common/errors/api-error';
-import { ERROR_CODES } from '../../common/errors/error-codes';
+import { ERROR_CODES, ERROR_MESSAGES, type ErrorCode } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/request-context';
 import { AppConfigService } from '../../config/app-config.service';
 import { PrismaService } from '../../database/prisma.service';
@@ -26,7 +30,6 @@ import {
 import { FileValidationService } from '../../upload/file-validation.service';
 import { BatchesService } from '../batches/batches.service';
 import { ConversionsService } from '../conversions/conversions.service';
-import { normalizeConversionOptions } from '@pdf2x/contracts';
 
 const EXTENSION_FOR_IMAGE: Record<string, string> = {
   JPEG: 'jpg',
@@ -62,6 +65,7 @@ interface ItemRow {
   batchId: string;
   filename: string;
   kind: string;
+  status: string;
   optionsJson: string;
   conversionId: string | null;
 }
@@ -112,6 +116,30 @@ export class UploadsService {
 
   private async partsCount(uploadId: string): Promise<number> {
     return this.prisma.uploadPart.count({ where: { uploadId } });
+  }
+
+  /**
+   * A cancelled batch or a cancelled item accepts no more bytes and no
+   * completion. Returns the item so callers can reuse the read.
+   */
+  private async assertItemOpen(itemId: string): Promise<ItemRow> {
+    const item = (await this.prisma.batchItem.findUnique({
+      where: { id: itemId },
+    })) as ItemRow | null;
+    if (!item) throw ApiError.notFound({ resource: 'batch_item' });
+    const batch = (await this.prisma.batch.findUnique({
+      where: { id: item.batchId },
+    })) as { cancelRequestedAt: Date | null } | null;
+    if (batch?.cancelRequestedAt) {
+      throw ApiError.conflict(ERROR_CODES.BATCH_CANCELLED, { batch_id: item.batchId });
+    }
+    if (item.status === 'cancelled') {
+      throw ApiError.conflict(ERROR_CODES.UPLOAD_STATE_CONFLICT, {
+        state: 'cancelled',
+        reason: 'item_cancelled',
+      });
+    }
+    return item;
   }
 
   /* --------------------------------- read ----------------------------- */
@@ -181,6 +209,7 @@ export class UploadsService {
         expires_at: upload.expiresAt.toISOString(),
       });
     }
+    await this.assertItemOpen(upload.itemId);
 
     const partSize = upload.partSize || this.config.uploadPartBytes || DEFAULT_UPLOAD_PART_BYTES;
     const maxParts = expectedParts(upload.expectedBytes, partSize);
@@ -201,37 +230,13 @@ export class UploadsService {
       where: { uploadId_partNumber: { uploadId, partNumber } },
     })) as PartRow | null;
 
-    // Write under a unique key first: a divergent retransmission must never
+    // Bytes go to a unique key first: a divergent retransmission must never
     // overwrite an already-confirmed part.
     const incomingKey = uploadIncomingKey(uploadId, partNumber, randomUUID());
-    const hash = createHash('sha256');
-    let size = 0;
-    const counter = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        hash.update(chunk);
-        size += chunk.length;
-        callback(null, chunk);
-      },
-    });
+    const { size, digest } = await this.receivePart(stream, incomingKey, partSize);
 
-    try {
-      await this.storage.putStream(incomingKey, stream.pipe(counter), 'application/octet-stream');
-    } catch (error) {
-      this.logger.warn(`Falha ao receber a parte ${partNumber}: ${String(error)}`);
-      await this.storage.delete(incomingKey).catch(() => undefined);
-      throw ApiError.storageUnavailable({ reason: 'part_write_failed' });
-    }
-    const digest = hash.digest('hex');
-
-    if (size > partSize) {
-      await this.storage.delete(incomingKey);
-      throw ApiError.badRequest(ERROR_CODES.FILE_TOO_LARGE, {
-        part_size: partSize,
-        received: size,
-      });
-    }
     if (declaredSha256 && declaredSha256.toLowerCase() !== digest) {
-      await this.storage.delete(incomingKey);
+      await this.storage.delete(incomingKey).catch(() => undefined);
       throw ApiError.validation({
         code: ERROR_CODES.UPLOAD_CHECKSUM_MISMATCH,
         part_number: partNumber,
@@ -241,8 +246,8 @@ export class UploadsService {
     }
 
     if (existing) {
+      await this.storage.delete(incomingKey).catch(() => undefined);
       if (existing.sha256 === digest && existing.size === size) {
-        await this.storage.delete(incomingKey);
         return {
           upload_id: uploadId,
           part_number: partNumber,
@@ -254,17 +259,16 @@ export class UploadsService {
           replayed: true,
         };
       }
-      await this.storage.delete(incomingKey);
       throw ApiError.conflict(ERROR_CODES.UPLOAD_PART_MISMATCH, { part_number: partNumber });
     }
 
-    const partKey = uploadPartKey(uploadId, partNumber);
-    await this.storage.move(incomingKey, partKey);
-
+    // The database row is the commit point. It is written before the object
+    // moves to its canonical key, so two racing writers can never overwrite
+    // each other's bytes: the loser only ever removes its own incoming object.
     try {
       await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         await tx.uploadPart.create({
-          data: { uploadId, partNumber, size, sha256: digest, storageKey: partKey },
+          data: { uploadId, partNumber, size, sha256: digest, storageKey: incomingKey },
         });
         await tx.uploadSession.update({
           where: { id: uploadId },
@@ -272,28 +276,39 @@ export class UploadsService {
         });
       });
     } catch (error) {
+      await this.storage.delete(incomingKey).catch(() => undefined);
       // Lost a race for the same part number: the winner's row is authoritative.
       const winner = (await this.prisma.uploadPart.findUnique({
         where: { uploadId_partNumber: { uploadId, partNumber } },
       })) as PartRow | null;
-      if (winner) {
-        await this.storage.delete(partKey).catch(() => undefined);
-        if (winner.sha256 !== digest || winner.size !== size) {
-          throw ApiError.conflict(ERROR_CODES.UPLOAD_PART_MISMATCH, { part_number: partNumber });
-        }
-        const fresh = await this.load(user, uploadId);
-        return {
-          upload_id: uploadId,
-          part_number: partNumber,
-          size,
-          sha256: digest,
-          received_bytes: fresh.receivedBytes,
-          parts_received: await this.partsCount(uploadId),
-          next_part: await this.nextPart(uploadId),
-          replayed: true,
-        };
+      if (!winner) throw error;
+      if (winner.sha256 !== digest || winner.size !== size) {
+        throw ApiError.conflict(ERROR_CODES.UPLOAD_PART_MISMATCH, { part_number: partNumber });
       }
-      throw error;
+      const fresh = await this.load(user, uploadId);
+      return {
+        upload_id: uploadId,
+        part_number: partNumber,
+        size,
+        sha256: digest,
+        received_bytes: fresh.receivedBytes,
+        parts_received: await this.partsCount(uploadId),
+        next_part: await this.nextPart(uploadId),
+        replayed: true,
+      };
+    }
+
+    // Tidy-up to the canonical key. The row already references the object, so
+    // a failure here leaves the part readable where it is.
+    const partKey = uploadPartKey(uploadId, partNumber);
+    try {
+      await this.storage.move(incomingKey, partKey);
+      await this.prisma.uploadPart.update({
+        where: { uploadId_partNumber: { uploadId, partNumber } },
+        data: { storageKey: partKey },
+      });
+    } catch (error) {
+      this.logger.warn(`Parte ${partNumber} confirmada sem chave final: ${String(error)}`);
     }
 
     const fresh = await this.load(user, uploadId);
@@ -307,6 +322,64 @@ export class UploadsService {
       next_part: await this.nextPart(uploadId),
       replayed: false,
     };
+  }
+
+  /**
+   * Writes one part to storage while counting it. The cap sits between the
+   * socket and the storage write, so a part is refused as soon as it exceeds
+   * the negotiated size: nothing past the cap is stored. A client that
+   * disconnects mid-part fails the write instead of leaving it waiting.
+   */
+  private async receivePart(
+    stream: Readable,
+    incomingKey: string,
+    partSize: number,
+  ): Promise<{ size: number; digest: string }> {
+    const hash = createHash('sha256');
+    let size = 0;
+    let oversize = false;
+    const cap = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        size += chunk.length;
+        if (size > partSize) {
+          oversize = true;
+          callback(new Error('part_exceeds_negotiated_size'));
+          return;
+        }
+        hash.update(chunk);
+        callback(null, chunk);
+      },
+    });
+
+    // The storage write attaches its own listener only after its first await.
+    // Until then a cap error must not escape as an unhandled error; the write
+    // still observes the failure when it attaches to the errored stream.
+    cap.on('error', () => undefined);
+
+    const sourceGone = (): void => {
+      if (!stream.readableEnded && !cap.destroyed) {
+        cap.destroy(new Error('client_disconnected'));
+      }
+    };
+    stream.once('aborted', sourceGone);
+    stream.once('close', sourceGone);
+    stream.once('error', sourceGone);
+    stream.pipe(cap);
+
+    try {
+      await this.storage.putStream(incomingKey, cap, 'application/octet-stream');
+    } catch (error) {
+      await this.storage.delete(incomingKey).catch(() => undefined);
+      if (oversize) {
+        throw ApiError.badRequest(ERROR_CODES.FILE_TOO_LARGE, {
+          part_size: partSize,
+          reason: 'part_exceeds_negotiated_size',
+        });
+      }
+      this.logger.warn(`Falha ao receber a parte: ${String(error)}`);
+      throw ApiError.storageUnavailable({ reason: 'part_write_failed' });
+    }
+    return { size, digest: hash.digest('hex') };
   }
 
   /* -------------------------------- complete -------------------------- */
@@ -331,19 +404,16 @@ export class UploadsService {
     // The item is the authority on "already converted": a crash between
     // creating the conversion and marking the session complete must not let a
     // retry create a second one.
-    if (item.conversionId) {
-      return {
-        upload_id: upload.id,
-        item_id: item.id,
-        conversion_id: item.conversionId,
-        status: 'queued',
-        message: 'Upload já concluído anteriormente.',
-        replayed: true,
-      };
-    }
+    if (item.conversionId) return this.replay(upload.id, item.id, item.conversionId);
     if (upload.state === 'aborted') {
       throw ApiError.conflict(ERROR_CODES.UPLOAD_STATE_CONFLICT, { state: upload.state });
     }
+    if (upload.expiresAt.getTime() < Date.now()) {
+      throw ApiError.conflict(ERROR_CODES.UPLOAD_EXPIRED, {
+        expires_at: upload.expiresAt.toISOString(),
+      });
+    }
+    await this.assertItemOpen(item.id);
 
     const partSize = upload.partSize || this.config.uploadPartBytes;
     const expectedCount = expectedParts(upload.expectedBytes, partSize);
@@ -382,7 +452,7 @@ export class UploadsService {
     }
 
     const stagingKey = uploadStagingKey(uploadId);
-    const assembled = await this.storage.compose(
+    await this.storage.compose(
       parts.map((part) => part.storageKey),
       stagingKey,
       'application/octet-stream',
@@ -401,6 +471,10 @@ export class UploadsService {
 
     if (assembledSha !== expected) {
       await this.storage.delete(stagingKey).catch(() => undefined);
+      await this.batches.markItemUploadFailed(item.batchId, item.id, {
+        code: ERROR_CODES.UPLOAD_CHECKSUM_MISMATCH,
+        message: ERROR_MESSAGES.UPLOAD_CHECKSUM_MISMATCH,
+      });
       throw ApiError.validation({
         code: ERROR_CODES.UPLOAD_CHECKSUM_MISMATCH,
         expected,
@@ -416,7 +490,40 @@ export class UploadsService {
     const inspection = this.validation.inspectHeader(head, item.kind);
     if (inspection.kind === 'unknown') {
       await this.storage.delete(stagingKey).catch(() => undefined);
+      await this.batches.markItemUploadFailed(item.batchId, item.id, {
+        code: ERROR_CODES.INVALID_FILE,
+        message: ERROR_MESSAGES.INVALID_FILE,
+      });
       throw ApiError.badRequest(ERROR_CODES.INVALID_FILE, { reason: 'invalid_magic_bytes' });
+    }
+
+    // Options are checked against the content before anything is moved, so a
+    // rejected upload leaves no document behind and its item is marked failed.
+    let options: ConversionOptionsV2 | ConversionOptionsV3;
+    try {
+      options = normalizeConversionOptions(JSON.parse(item.optionsJson) as unknown, {
+        kind:
+          inspection.kind === 'image'
+            ? 'image'
+            : inspection.kind === 'spreadsheet'
+              ? 'spreadsheet'
+              : 'pdf',
+        allowLegacy: false,
+        allowStamped: true,
+      });
+    } catch (error) {
+      await this.storage.delete(stagingKey).catch(() => undefined);
+      if (error instanceof ConversionOptionsError) {
+        await this.batches.markItemUploadFailed(item.batchId, item.id, {
+          code: error.code,
+          message: error.message,
+        });
+        throw ApiError.badRequest(error.code as ErrorCode, {
+          ...error.details,
+          reason: error.code,
+        });
+      }
+      throw error;
     }
 
     const pageCount =
@@ -431,22 +538,31 @@ export class UploadsService {
             : 'xlsx'
           : (EXTENSION_FOR_IMAGE[inspection.image_format ?? ''] ?? 'img');
     const finalKey = storageKeyForSha256(expected, extension, user.id);
-    if (await this.storage.exists(finalKey)) {
+    try {
+      if (await this.storage.exists(finalKey)) {
+        await this.storage.delete(stagingKey).catch(() => undefined);
+      } else {
+        await this.storage.move(stagingKey, finalKey);
+      }
+    } catch (error) {
+      // A concurrent complete may have moved the staging object first. Re-read
+      // the item: if the conversion exists, replay it; if the document is in
+      // place, carry on; otherwise the other request is still working.
+      const current = (await this.prisma.batchItem.findUnique({
+        where: { id: item.id },
+      })) as ItemRow | null;
+      if (current?.conversionId) return this.replay(upload.id, item.id, current.conversionId);
+      if (!(await this.storage.exists(finalKey))) {
+        if (!(await this.storage.exists(stagingKey))) {
+          throw ApiError.conflict(ERROR_CODES.UPLOAD_STATE_CONFLICT, {
+            reason: 'complete_in_progress',
+          });
+        }
+        this.logger.warn(`Falha ao mover o documento final: ${String(error)}`);
+        throw ApiError.storageUnavailable({ reason: 'document_move_failed' });
+      }
       await this.storage.delete(stagingKey).catch(() => undefined);
-    } else {
-      await this.storage.move(stagingKey, finalKey);
     }
-
-    const options = normalizeConversionOptions(JSON.parse(item.optionsJson) as unknown, {
-      kind:
-        inspection.kind === 'image'
-          ? 'image'
-          : inspection.kind === 'spreadsheet'
-            ? 'spreadsheet'
-            : 'pdf',
-      allowLegacy: false,
-      allowStamped: true,
-    });
 
     const accepted = await this.conversions.createStoredConversion(
       user,
@@ -488,7 +604,19 @@ export class UploadsService {
       },
     });
 
-    await this.batches.markItemQueued(item.batchId, item.id, accepted.conversion_id, pageCount);
+    const queued = await this.batches.markItemQueued(
+      item.batchId,
+      item.id,
+      accepted.conversion_id,
+      pageCount,
+    );
+    if (!queued) {
+      // The item was cancelled while the conversion was being created: stop it.
+      await this.conversions
+        .cancel(user, accepted.conversion_id)
+        .catch((error: unknown) => this.logger.warn(`Cancelamento de ${accepted.conversion_id} falhou: ${String(error)}`));
+      throw ApiError.conflict(ERROR_CODES.UPLOAD_STATE_CONFLICT, { reason: 'item_cancelled' });
+    }
 
     return {
       upload_id: upload.id,
@@ -497,6 +625,17 @@ export class UploadsService {
       status: 'queued',
       message: 'Upload concluído e conversão enfileirada.',
       replayed: false,
+    };
+  }
+
+  private replay(uploadId: string, itemId: string, conversionId: string): CompleteUploadResponse {
+    return {
+      upload_id: uploadId,
+      item_id: itemId,
+      conversion_id: conversionId,
+      status: 'queued',
+      message: 'Upload já concluído anteriormente.',
+      replayed: true,
     };
   }
 

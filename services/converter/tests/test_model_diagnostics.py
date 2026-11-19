@@ -151,3 +151,16 @@ def test_automation_status_and_pause_routes(api_client):
     assert status.status_code == 200
     body = status.json()
     assert set(body) >= {"executor_enabled", "runtime_mode"}
+
+
+def test_untagged_configured_model_matches_latest_tag(fake_ollama):
+    # S13 / AU2-16: "glm-ocr" is the same model as "glm-ocr:latest".
+    result = diagnostics.test_model_profile(_draft(ocr_model="glm-ocr"))
+    assert result["ocr_model_available"] is True
+
+
+def test_same_family_different_size_is_not_available(fake_ollama):
+    # AU2-16: qwen3.5:9b installed must not satisfy a configured qwen3.5:4b.
+    fake_ollama["models"] = ["glm-ocr:latest", "qwen3.5:9b"]
+    result = diagnostics.test_model_profile(_draft(llm_model="qwen3.5:4b", llm_enabled=False))
+    assert result["assistant_model_available"] is False

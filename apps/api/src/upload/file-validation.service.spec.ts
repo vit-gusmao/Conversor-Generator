@@ -87,6 +87,40 @@ describe('FileValidationService', () => {
     expect(result.warnings).toContain('encrypted_pdf');
   });
 
+  it('classifies a PNG that carries %PDF- text in its metadata as an image (A-18)', () => {
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('tEXt comment %PDF-1.7 embedded'),
+      Buffer.alloc(64, 0),
+    ]);
+
+    const inspection = service.inspect(png);
+    expect(inspection.is_pdf).toBe(false);
+    expect(inspection.image_format).toBe('PNG');
+
+    const header = service.inspectHeader(png, 'pdf');
+    expect(header.kind).toBe('image');
+    expect(header.image_format).toBe('PNG');
+  });
+
+  it('tolerates junk before the PDF header up to the engine limit (documented in CONVERSION.md)', () => {
+    const junk = Buffer.alloc(100, 0x20);
+    const inspection = service.inspect(Buffer.concat([junk, makePdf(1)]));
+
+    expect(inspection.is_pdf).toBe(true);
+    expect(inspection.pdf_version).toBe('1.7');
+  });
+
+  it('rejects a %PDF- header beyond the engine tolerance as an invalid file (A-18)', () => {
+    const buried = Buffer.concat([Buffer.alloc(600, 0x20), Buffer.from('%PDF-1.7\n')]);
+
+    expect(service.inspect(buried).is_pdf).toBe(false);
+    expect(service.inspect(buried).errors).toContain('invalid_header');
+    expect(service.inspectHeader(buried, 'pdf').kind).toBe('unknown');
+    const error = captureApiError(() => service.validate(buried, { filename: 'enterrado.pdf' }));
+    expect(error.code).toBe('INVALID_FILE');
+  });
+
   it('reports when the page count cannot be estimated', () => {
     const objectStream = Buffer.from('%PDF-1.7\n1 0 obj\n<< /Type /ObjStm >>\nendobj\n%%EOF\n');
     const result = service.validate(objectStream);
@@ -127,6 +161,13 @@ describe('FileValidationService — spreadsheet admission (upgrade T3)', () => {
     ]);
     const inspection = service.inspectHeader(zip, 'pdf');
     expect(inspection.kind).toBe('unknown');
+  });
+
+  it('keeps a declared CSV that starts with "BM" a CSV, not a bitmap (A-18)', () => {
+    const csv = Buffer.from('BM;Valor\nAna;10\n', 'utf8');
+    const inspection = service.inspectHeader(csv, 'spreadsheet');
+    expect(inspection.kind).toBe('spreadsheet');
+    expect(inspection.spreadsheet_format).toBe('csv');
   });
 
   it('keeps rejecting text files without a spreadsheet declaration', () => {

@@ -92,6 +92,16 @@ interface LedgerLine {
   record: SubmissionRecord;
 }
 
+export interface SubmissionStoreOptions {
+  /** Receives recovery diagnostics (for example dropped partial bytes). */
+  log?: (message: string) => void;
+}
+
+/** Set when replay dropped an unterminated final entry left by a crash. */
+export interface LedgerRecovery {
+  droppedBytes: number;
+}
+
 export class SubmissionStoreError extends Error {
   readonly code: string;
   readonly details: Record<string, unknown>;
@@ -116,6 +126,17 @@ function newSubmissionId(): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCompleteJson(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -150,31 +171,41 @@ export function requestKeyFingerprint(input: {
 export class SubmissionStore {
   readonly directory: string;
   readonly file: string;
+  /** Set when replay dropped a torn final entry; null when the ledger was clean. */
+  recovery: LedgerRecovery | null = null;
   private readonly records = new Map<string, SubmissionRecord>();
+  private readonly log: (message: string) => void;
   private writeQueue: Promise<unknown> = Promise.resolve();
   private closed = false;
+  /** True when the file ends without a newline; the next append must start a line. */
+  private needsSeparator = false;
 
-  private constructor(directory: string) {
+  private constructor(directory: string, log: (message: string) => void) {
     this.directory = directory;
     this.file = path.join(directory, LEDGER_FILE);
+    this.log = log;
   }
 
   /** Opens (and replays) the ledger in `${configDir}`. */
-  static async open(configDir: string): Promise<SubmissionStore> {
-    const store = new SubmissionStore(configDir);
+  static async open(
+    configDir: string,
+    options: SubmissionStoreOptions = {},
+  ): Promise<SubmissionStore> {
+    const store = new SubmissionStore(configDir, options.log ?? (() => {}));
     await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
     await store.replay();
     return store;
   }
 
   private async replay(): Promise<void> {
-    let raw: string;
+    let buffer: Buffer;
     try {
-      raw = await fs.readFile(this.file, 'utf8');
+      buffer = await fs.readFile(this.file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw error;
     }
+    const raw = await this.recoverUnterminatedTail(buffer);
     const lines = raw.split('\n');
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index]?.trim();
@@ -207,6 +238,39 @@ export class SubmissionStore {
       }
       this.records.set(record.submission_id, record);
     }
+  }
+
+  /**
+   * A crash during an append can leave the final entry without its newline.
+   * A tail that is not a complete JSON entry is a torn write: it was never
+   * acknowledged, so it is truncated on disk and reported. A complete entry
+   * that only lacks its newline is kept, and the next append starts a new line.
+   * Returns the text that replay should read.
+   */
+  private async recoverUnterminatedTail(buffer: Buffer): Promise<string> {
+    if (buffer.length === 0 || buffer[buffer.length - 1] === 0x0a) {
+      return buffer.toString('utf8');
+    }
+    const cut = buffer.lastIndexOf(0x0a) + 1;
+    const tail = buffer.subarray(cut).toString('utf8');
+    if (isCompleteJson(tail)) {
+      this.needsSeparator = true;
+      return buffer.toString('utf8');
+    }
+
+    const dropped = buffer.length - cut;
+    const handle = await fs.open(this.file, 'r+');
+    try {
+      await handle.truncate(cut);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    this.recovery = { droppedBytes: dropped };
+    this.log(
+      `submission ledger: dropped ${dropped} bytes of an unterminated final entry left by an interrupted write: ${this.file}`,
+    );
+    return buffer.subarray(0, cut).toString('utf8');
   }
 
   private assertOpen(): void {
@@ -277,14 +341,25 @@ export class SubmissionStore {
 
   private async appendUnlocked(record: SubmissionRecord): Promise<void> {
     const line: LedgerLine = { v: 1, kind: 'submission', record };
-    const payload = `${JSON.stringify(line)}\n`;
+    const separator = this.needsSeparator ? '\n' : '';
+    const payload = `${separator}${JSON.stringify(line)}\n`;
     const handle = await fs.open(this.file, 'a', 0o600);
     try {
-      await handle.writeFile(payload, 'utf8');
-      await handle.sync();
+      const { size } = await handle.stat();
+      try {
+        await handle.writeFile(payload, 'utf8');
+        await handle.sync();
+      } catch (error) {
+        // Remove any partial bytes so a later append cannot be glued to them.
+        // A blank line is skipped on replay, so a separator is always safe.
+        this.needsSeparator = true;
+        await fs.truncate(this.file, size).catch(() => undefined);
+        throw error;
+      }
     } finally {
       await handle.close();
     }
+    this.needsSeparator = false;
     this.records.set(record.submission_id, structuredClone(record));
   }
 
@@ -333,6 +408,7 @@ export class SubmissionStore {
         await fs.rm(temporary, { force: true });
         throw error;
       }
+      this.needsSeparator = false;
       // Directory fsync keeps the rename durable where the platform allows it.
       try {
         const dirHandle = await fs.open(this.directory, 'r');

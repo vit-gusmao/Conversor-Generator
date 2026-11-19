@@ -162,3 +162,71 @@ def test_phase_cursor_roundtrip():
     assert row is not None
     assert row.cursor == "page:25"
     assert row.last_event_sequence == 7
+
+
+def test_losing_writer_does_not_overwrite_the_winning_artifact():
+    # AU2-27: artifact keys are content-addressed, so a second writer for the
+    # same page cannot replace the bytes the winning row points to.
+    import hashlib
+
+    repo = CheckpointRepository()
+    run_id = "run_ckpt_artifact_race"
+    key = CheckpointKey(
+        source_sha256="c" * 64,
+        engine_version=ENGINE_VERSION,
+        options_hash=options_hash({}),
+    )
+    from models.document import PageResult
+
+    winner = PageResult(page_number=4, width=10, height=10, native_chars=5)
+    loser = PageResult(page_number=4, width=10, height=10, native_chars=99)
+    winner_ref = repo.save_page(run_id=run_id, page=winner, key=key)
+    repo.save_page(run_id=run_id, page=loser, key=key)
+
+    stored = get_storage().get_bytes(winner_ref.artifact_key)
+    assert hashlib.sha256(stored).hexdigest() == winner_ref.artifact_sha256
+
+
+def test_phase_cursor_insert_race_updates_the_winning_row(monkeypatch):
+    # AU2-28: when another writer inserts the same (run, phase) first, the
+    # cursor write must update that row instead of failing with IntegrityError.
+    import repositories.checkpoint_repository as module
+    from models.db import RunCheckpointRow, get_session_factory
+
+    repo = CheckpointRepository()
+    run_id = "run_ckpt_cursor_race"
+    repo.set_phase_cursor(run_id=run_id, phase="structure", cursor="page:1", event_sequence=1)
+
+    pending = {"blind": True}
+
+    class _BlindFirstLookup:
+        """Session whose first RunCheckpointRow lookup misses (simulated race)."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, statement, *args, **kwargs):
+            descriptions = getattr(statement, "column_descriptions", None) or [{}]
+            if pending["blind"] and descriptions[0].get("entity") is RunCheckpointRow:
+                pending["blind"] = False
+
+                class _Miss:
+                    def scalar_one_or_none(self):
+                        return None
+
+                return _Miss()
+            return self._inner.execute(statement, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(
+        module, "get_session_factory", lambda: (lambda: _BlindFirstLookup(get_session_factory()()))
+    )
+    repo.set_phase_cursor(run_id=run_id, phase="structure", cursor="page:9", event_sequence=4)
+    monkeypatch.undo()
+
+    row = repo.get_phase_cursor(run_id=run_id, phase="structure")
+    assert row is not None
+    assert row.cursor == "page:9"
+    assert row.last_event_sequence == 4

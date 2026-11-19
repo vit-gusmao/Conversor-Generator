@@ -6,8 +6,10 @@ import { AppConfigService } from '../config/app-config.service';
 /**
  * Prisma client with Nest lifecycle hooks.
  *
- * The datasource URL comes from `API_DATABASE_URL` (Prisma resolves relative
- * SQLite paths against the schema directory, i.e. `prisma/data/api.db`).
+ * The datasource URL is `AppConfigService.databaseUrl`: `API_DATABASE_URL`, or
+ * `API_POSTGRES_URL` when the first is unset (see `configuration.ts`). Prisma
+ * resolves relative SQLite paths against the schema directory, i.e.
+ * `prisma/data/api.db`.
  */
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {

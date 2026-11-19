@@ -30,6 +30,7 @@ import {
 import { explainError } from '@/lib/errors';
 import { formatBytes, formatDateTime, formatNumber } from '@/lib/format';
 import { isDesktopRuntime, pickSource } from '@/lib/platform';
+import { createIntentKeys } from '@/lib/intent-keys';
 import { toast } from '@/stores/ui';
 
 const IMPORT_STATE_LABELS: Record<string, string> = {
@@ -67,6 +68,7 @@ export function SourcesPage() {
   const [exclude, setExclude] = useState('~$*,*.tmp');
   const [pendingArchive, setPendingArchive] = useState<SourceRecord | null>(null);
   const [activeImportId, setActiveImportId] = useState<string | null>(null);
+  const [importKeys] = useState(() => createIntentKeys());
   const desktop = isDesktopRuntime();
   const importState = useImport(activeImportId);
   const importItems = useImportItems(activeImportId);
@@ -109,11 +111,12 @@ export function SourcesPage() {
   };
 
   const runImport = (source: SourceRecord) => {
-    const key = `${source.id}:${Date.now()}`;
+    const key = importKeys.keyFor(source.id);
     startImport.mutate(
       { sourceId: source.id, body: { options: { schema_version: 3 } }, idempotencyKey: key },
       {
         onSuccess: (record) => {
+          importKeys.settle(source.id);
           setActiveImportId(record.id);
           // Detail page reads the last import for this source on demand.
           window.localStorage.setItem(`pdf2x.lastImport.${source.id}`, record.id);

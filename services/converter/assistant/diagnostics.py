@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from models.model_tags import model_tag_matches
+
 
 def _base(host: str, port: int) -> str:
     return f"http://{host}:{int(port)}".rstrip("/")
@@ -37,6 +39,10 @@ def _tags(base_url: str, timeout: float = 5.0) -> list[str]:
             return [str(item.get("name")) for item in response.json().get("models") or []]
     except Exception:  # noqa: BLE001
         return []
+
+
+def _is_installed(wanted: str, installed: list[str]) -> bool:
+    return bool(wanted) and any(model_tag_matches(name, wanted) for name in installed)
 
 
 #: 1x1 PNG used to prove the OCR model accepts images.
@@ -136,8 +142,8 @@ def test_model_profile(draft: dict[str, Any]) -> dict[str, Any]:
     return {
         "runtime_detected": runtime_ok,
         "runtime_version": version,
-        "ocr_model_available": ocr_name in installed if ocr_name else False,
-        "assistant_model_available": llm_name in installed if llm_name else False,
+        "ocr_model_available": _is_installed(ocr_name, installed),
+        "assistant_model_available": _is_installed(llm_name, installed),
         "ocr_latency_ms": ocr_result.get("latency_ms"),
         "assistant_latency_ms": llm_result.get("latency_ms"),
         "ocr_error": ocr_result.get("error"),

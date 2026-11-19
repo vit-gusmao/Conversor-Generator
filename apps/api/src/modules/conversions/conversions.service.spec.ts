@@ -7,6 +7,8 @@ import { ConversionEventsService } from '../realtime/conversion-events.service';
 import { FakePrisma } from '../../../test/helpers/fake-prisma';
 import { captureApiErrorAsync, makePdf, uuidPattern } from '../../../test/helpers/test-utils';
 
+import { BatchesService } from '../batches/batches.service';
+
 import { ConverterClient } from './converter.client';
 import { ConversionsController } from './conversions.controller';
 import { ConversionsService } from './conversions.service';
@@ -21,10 +23,12 @@ describe('ConversionsService', () => {
     preview: jest.Mock;
     download: jest.Mock;
     cancel: jest.Mock;
+    status: jest.Mock;
   };
   let storage: StorageService;
   let events: { record: jest.Mock };
   let outbox: { record: jest.Mock; dispatch: jest.Mock };
+  let batches: { onConversionTerminal: jest.Mock };
 
   const user: AuthenticatedUser = {
     id: 'user-owner-1',
@@ -52,7 +56,9 @@ describe('ConversionsService', () => {
       result: jest.fn(),
       preview: jest.fn(),
       download: jest.fn(),
-      cancel: jest.fn().mockResolvedValue(undefined),
+      // The engine confirms cancellations with `cancelled: true` (A-17).
+      cancel: jest.fn().mockResolvedValue({ cancelled: true }),
+      status: jest.fn(),
     };
     storage = {
       backend: 'local',
@@ -66,6 +72,7 @@ describe('ConversionsService', () => {
       record: jest.fn().mockResolvedValue({ id: 'outbox-1' }),
       dispatch: jest.fn().mockResolvedValue(undefined),
     };
+    batches = { onConversionTerminal: jest.fn().mockResolvedValue(undefined) };
 
     service = new ConversionsService(
       prisma as unknown as PrismaService,
@@ -75,6 +82,7 @@ describe('ConversionsService', () => {
       { uploadMaxPages: 500 } as unknown as AppConfigService,
       events as unknown as ConversionEventsService,
       outbox as unknown as OutboxService,
+      batches as unknown as BatchesService,
     );
   });
 
@@ -220,6 +228,98 @@ describe('ConversionsService', () => {
     expect(converter.cancel).toHaveBeenCalledWith(prisma.runs[0]['id']);
     expect(prisma.conversions[0]['status']).toBe('cancelled');
     expect(prisma.runs[0]['finishedAt']).toBeInstanceOf(Date);
+  });
+
+  it('notifies the batch once a cancel is confirmed by the engine', async () => {
+    const created = await service.create(user, makeFile());
+
+    await service.cancel(user, created.conversion_id);
+
+    expect(batches.onConversionTerminal).toHaveBeenCalledWith(created.conversion_id);
+  });
+
+  it('does not notify the batch when the engine does not confirm the cancel', async () => {
+    const created = await service.create(user, makeFile());
+    converter.cancel.mockResolvedValue({ cancelled: false });
+
+    await service.cancel(user, created.conversion_id);
+
+    expect(batches.onConversionTerminal).not.toHaveBeenCalled();
+  });
+
+  it('keeps the real state when the engine does not confirm the cancel (A-17)', async () => {
+    const created = await service.create(user, makeFile());
+    converter.cancel.mockResolvedValue({ cancelled: false });
+    converter.status.mockResolvedValue({ run_id: prisma.runs[0]['id'], status: 'generating' });
+
+    const response = await service.cancel(user, created.conversion_id);
+
+    expect(response.status).toBe('queued');
+    expect(response.message).toContain('não confirmou');
+    expect(converter.status).toHaveBeenCalledWith(prisma.runs[0]['id']);
+    expect(prisma.conversions[0]['status']).toBe('queued');
+    expect(prisma.runs[0]['finishedAt']).toBeUndefined();
+    expect(events.record).not.toHaveBeenCalledWith(
+      created.conversion_id,
+      expect.objectContaining({ type: 'failed' }),
+    );
+  });
+
+  it('keeps the real state when the engine cannot be reached during cancel (A-17)', async () => {
+    const created = await service.create(user, makeFile());
+    converter.cancel.mockRejectedValue(new Error('ECONNREFUSED'));
+    converter.status.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    const response = await service.cancel(user, created.conversion_id);
+
+    expect(response.status).toBe('queued');
+    expect(prisma.conversions[0]['status']).toBe('queued');
+    expect(prisma.runs[0]['finishedAt']).toBeUndefined();
+  });
+
+  it('maps a racing retry that claims the same attempt to CONVERSION_BUSY (A-22)', async () => {
+    const created = await service.create(user, makeFile());
+    prisma.conversions[0]['status'] = 'failed';
+    const duplicate = Object.assign(new Error('Unique constraint failed'), { code: 'P2002' });
+    jest.spyOn(prisma.conversionRun, 'create').mockRejectedValueOnce(duplicate);
+
+    const error = await captureApiErrorAsync(() => service.retry(user, created.conversion_id));
+
+    expect(error.status).toBe(409);
+    expect(error.code).toBe('CONVERSION_BUSY');
+    expect(outbox.record).toHaveBeenCalledTimes(1);
+  });
+
+  it('computes the retry attempt inside the transaction from the latest run (A-22)', async () => {
+    const created = await service.create(user, makeFile());
+    prisma.conversions[0]['status'] = 'failed';
+    await service.retry(user, created.conversion_id);
+    prisma.conversions[0]['status'] = 'failed';
+
+    await service.retry(user, created.conversion_id);
+
+    expect(prisma.runs.map((run) => run['attempt'])).toEqual([1, 2, 3]);
+    expect(outbox.record).toHaveBeenLastCalledWith(
+      'conversion.enqueue',
+      expect.objectContaining({ runId: prisma.runs[2]['id'] }),
+      expect.anything(),
+    );
+  });
+
+  it('replays the winner when a concurrent request takes the idempotency key first (A-21)', async () => {
+    const winner = await service.create(user, makeFile(2), 'chave-corrida');
+    // The loser passed the lookup before the winner committed, then its insert hits P2002.
+    jest.spyOn(prisma.idempotencyKey, 'findUnique').mockResolvedValueOnce(null);
+    jest
+      .spyOn(prisma.idempotencyKey, 'create')
+      .mockRejectedValueOnce(Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }));
+    const outboxCallsBefore = outbox.record.mock.calls.length;
+
+    const loser = await service.create(user, makeFile(2), 'chave-corrida');
+
+    expect(loser.conversion_id).toBe(winner.conversion_id);
+    expect(loser.status).toBe('queued');
+    expect(outbox.record.mock.calls.length).toBe(outboxCallsBefore);
   });
 
   it('blocks download until the conversion is ready', async () => {

@@ -107,6 +107,10 @@ export function AssistantPage() {
   const [indexing, setIndexing] = useState(false);
   const [selectedConversion, setSelectedConversion] = useState<string>('');
   const abortRef = useRef<AbortController | null>(null);
+  /** Incremented per stream; a stream whose id is no longer current is ignored. */
+  const streamIdRef = useRef(0);
+  /** Conversation the live stream writes into. */
+  const streamConversationRef = useRef<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   const conversions = useConversions({ page: 1, page_size: 20 });
@@ -145,7 +149,21 @@ export function AssistantPage() {
 
   const available = Boolean(status?.enabled && status?.available);
 
+  /**
+   * Stops the stream that is currently writing into the chat, if any. Bumping
+   * the stream id first makes every late delta or final patch from it a no-op,
+   * so it cannot land in whichever conversation is shown next.
+   */
+  function abortActiveStream() {
+    streamIdRef.current += 1;
+    const controller = abortRef.current;
+    abortRef.current = null;
+    controller?.abort();
+    setStreaming(false);
+  }
+
   async function openConversation(conversation: Conversation) {
+    abortActiveStream();
     try {
       const full = await getConversation(conversation.conversation_id);
       setActive(full);
@@ -162,6 +180,7 @@ export function AssistantPage() {
   }
 
   async function startConversation() {
+    abortActiveStream();
     try {
       const conversation = await createConversation({
         collection_id: collectionId || null,
@@ -180,6 +199,8 @@ export function AssistantPage() {
   }
 
   async function handleDelete(conversation: Conversation) {
+    // Deleting the conversation that is streaming ends its stream first.
+    if (streamConversationRef.current === conversation.conversation_id) abortActiveStream();
     try {
       await deleteConversation(conversation.conversation_id);
       if (active?.conversation_id === conversation.conversation_id) {
@@ -207,13 +228,20 @@ export function AssistantPage() {
         : `req-${Date.now()}`;
     const userMessage: ChatMessage = { role: 'user', content, citations: [] };
     const assistantMessage: ChatMessage = { role: 'assistant', content: '', citations: [] };
+
+    const streamId = streamIdRef.current + 1;
+    streamIdRef.current = streamId;
+    streamConversationRef.current = conversation.conversation_id;
+    const isCurrent = () => streamIdRef.current === streamId;
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setMessages((current) => [...current, userMessage, assistantMessage]);
     setInput('');
     setError(null);
     setCitations([]);
     setStreaming(true);
     setPhase('recuperando fontes');
-    abortRef.current = new AbortController();
 
     let text = '';
     try {
@@ -227,6 +255,8 @@ export function AssistantPage() {
         },
         {
           onEvent: (event: ChatEvent) => {
+            // Events from a stream that was switched away from are dropped.
+            if (!isCurrent()) return;
             if (event.type === 'status') {
               setPhase(event.state);
             } else if (event.type === 'delta') {
@@ -270,9 +300,11 @@ export function AssistantPage() {
             }
           },
         },
-        abortRef.current.signal,
+        controller.signal,
       );
     } catch (cause) {
+      // A superseded stream has already been cleaned up by its replacement.
+      if (!isCurrent()) return;
       if (cause instanceof DOMException && cause.name === 'AbortError') {
         setMessages((current) => {
           const next = [...current];
@@ -289,8 +321,10 @@ export function AssistantPage() {
         setPhase('erro');
       }
     } finally {
-      setStreaming(false);
-      abortRef.current = null;
+      if (isCurrent()) {
+        setStreaming(false);
+        abortRef.current = null;
+      }
       await refreshConversations();
     }
   }

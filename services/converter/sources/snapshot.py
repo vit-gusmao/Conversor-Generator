@@ -43,6 +43,12 @@ def _identity(stat: os.stat_result) -> tuple:
     )
 
 
+def _recently_modified(stat: os.stat_result, window_seconds: float) -> bool:
+    """True when the mtime is inside the window (or in the future: unknown)."""
+    age_ns = time.time_ns() - stat.st_mtime_ns
+    return age_ns < window_seconds * 1_000_000_000
+
+
 def capture_snapshot(
     candidate: "SourceCandidate",
     root_canonical_path: str,
@@ -77,7 +83,9 @@ def capture_snapshot(
     except PermissionError as exc:
         raise SnapshotError("SOURCE_ACCESS_DENIED", "Acesso negado ao arquivo.", {"path": str(path)}) from exc
 
-    if stability_seconds > 0:
+    # A file last written longer ago than the window cannot be mid-write, so
+    # the per-file wait is skipped; fresh files still get the observation pair.
+    if stability_seconds > 0 and _recently_modified(before, stability_seconds):
         time.sleep(stability_seconds)
         try:
             after_wait = os.lstat(path)

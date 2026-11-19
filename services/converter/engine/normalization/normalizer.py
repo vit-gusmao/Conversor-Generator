@@ -460,6 +460,8 @@ def _has_decimal_part(text: str, locale: LocaleProfile) -> bool:
             return True
         if len(tail) == 3:
             return separator == locale.decimal_sep
+        # Any other tail length (4+ digits) cannot be a thousands group.
+        return True
     return False
 
 
@@ -517,6 +519,9 @@ def _parse_decimal(text: str, locale: LocaleProfile) -> Decimal | None:
         elif len(groups) == 2 and tail.isdigit() and len(tail) == 3:
             # "1,234" vs "1.234" is genuinely ambiguous: the locale decides.
             normalized = raw.replace(sep, ".") if sep == dec else raw.replace(sep, "")
+        elif len(groups) == 2 and tail.isdigit() and len(tail) > 3:
+            # A lone separator followed by 4+ digits is a decimal mark ("0,0125").
+            normalized = f"{groups[0]}.{tail}"
         else:
             normalized = raw.replace(sep, "")
     else:

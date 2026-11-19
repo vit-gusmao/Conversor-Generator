@@ -41,6 +41,11 @@ export class ApiError extends Error {
     return new ApiError(ERROR_CODES.UNAUTHENTICATED, 401, undefined, details);
   }
 
+  /** Engine -> API callbacks whose `x-internal-token` is missing or wrong. */
+  static unauthorizedInternal(details?: Record<string, unknown>): ApiError {
+    return new ApiError(ERROR_CODES.UNAUTHORIZED_INTERNAL, 401, undefined, details);
+  }
+
   static invalidCredentials(): ApiError {
     return new ApiError(ERROR_CODES.INVALID_CREDENTIALS, 401);
   }

@@ -78,6 +78,8 @@ class AutomationRunRow(Base):
     #: Durable cancellation request. The executor cooperates at phase
     #: boundaries; a published result stays in the history.
     cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
+    #: Not-before time for a transient retry (WP-C1-T8); NULL means claimable now.
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
     error_code = Column(String(64), nullable=True)
     error_message = Column(Text, nullable=True)
     started_at = Column(DateTime(timezone=True), nullable=True)

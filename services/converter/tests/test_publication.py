@@ -30,3 +30,18 @@ def test_integrity_failure_is_quarantined():
 
 def test_failed_quality_never_publishes():
     assert publication_status(checks=[], quality="failed") == "quarantined"
+
+
+def test_warning_count_includes_non_fatal_fail_checks():
+    # AU2-20: a non-fatal "fail" is classified as a warning and must be counted.
+    from engine.validation.publication import publication_report
+
+    checks = [
+        {"check": "text_coverage", "status": "warn", "details": "98%"},
+        {"check": "unrecognized_regions", "status": "fail", "details": "1 página"},
+        {"check": "xlsx_no_media", "status": "fail", "details": "imagem"},
+        {"check": "ok", "status": "pass", "details": ""},
+    ]
+    report = publication_report(checks, "ok")
+    assert report["fatal_count"] == 1
+    assert report["warning_count"] == 2

@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from config import settings
+from models.model_tags import model_tag_matches
 
 
 class OllamaError(Exception):
@@ -62,9 +63,8 @@ class OllamaClient:
             (
                 item
                 for item in models
-                if item.get("name") == target
-                or item.get("model") == target
-                or str(item.get("name", "")).split(":")[0] == target.split(":")[0]
+                if model_tag_matches(item.get("name"), target)
+                or model_tag_matches(item.get("model"), target)
             ),
             None,
         )
@@ -133,6 +133,13 @@ class OllamaClient:
             raise OllamaError(
                 "MODEL_UNAVAILABLE",
                 "O servidor local do modelo não está acessível.",
+                detail=str(exc),
+            ) from exc
+        except httpx.HTTPError as exc:
+            # Dropped or malformed connections (RemoteProtocolError, ReadError, ...).
+            raise OllamaError(
+                "MODEL_UNAVAILABLE",
+                "A conexão com o servidor local do modelo foi interrompida.",
                 detail=str(exc),
             ) from exc
 

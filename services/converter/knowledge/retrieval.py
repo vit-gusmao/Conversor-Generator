@@ -44,6 +44,9 @@ class Citation:
     offset_end: int
     score: float
     token_count: int
+    #: True when the logical source file no longer exists at its origin. The
+    #: chunks are still the active generation; the flag tells the reader.
+    source_missing: bool = False
 
     def to_dict(self, index: int | None = None) -> dict[str, Any]:
         payload = {
@@ -59,6 +62,7 @@ class Citation:
             "offset_end": self.offset_end,
             "score": round(self.score, 4),
             "token_count": self.token_count,
+            "source_missing": self.source_missing,
         }
         if index is not None:
             payload["index"] = index
@@ -84,13 +88,14 @@ def retrieve(
 ) -> list[Citation]:
     repo = repository or KnowledgeRepository()
     # ACL first: candidates only ever contain this owner's chunks.
-    candidates = repo.candidates(owner_id, collection_ids)
-    if not candidates:
+    visible = visible_chunks(repo, owner_id, collection_ids)
+    if not visible:
         return []
     terms = tokenize(query)
     if not terms:
         return []
 
+    candidates = [chunk for chunk, _missing in visible]
     tokenised: list[list[str]] = [tokenize(chunk["text"]) for chunk in candidates]
     total = len(candidates)
     average_length = sum(len(tokens) for tokens in tokenised) / max(1, total)
@@ -121,7 +126,7 @@ def retrieve(
     scored.sort(key=lambda item: item[0], reverse=True)
     results: list[Citation] = []
     for score, index in scored[: max(1, top_k)]:
-        chunk = candidates[index]
+        chunk, source_missing = visible[index]
         metadata = chunk.get("metadata") or {}
         results.append(
             Citation(
@@ -139,9 +144,39 @@ def retrieve(
                 offset_end=int(chunk.get("offset_end") or 0),
                 score=score,
                 token_count=int(chunk.get("token_count") or 0),
+                source_missing=source_missing,
             )
         )
     return results
+
+
+def visible_chunks(
+    repo: KnowledgeRepository, owner_id: str, collection_ids: list[str] | None
+) -> list[tuple[dict[str, Any], bool]]:
+    """Owner's chunks that may be searched, each with its ``source_missing`` flag.
+
+    A chunk that belongs to a source-backed logical file is searchable only as
+    the head's active generation. Superseded generations, and generations not
+    yet promoted, are excluded. Manual documents (no source key) are unaffected.
+    One heads query covers the whole candidate set.
+    """
+    candidates = repo.candidates(owner_id, collection_ids)
+    if not candidates:
+        return []
+    heads = repo.active_heads(owner_id, collection_ids)
+    visible: list[tuple[dict[str, Any], bool]] = []
+    for chunk in candidates:
+        metadata = chunk.get("metadata") or {}
+        source_id = metadata.get("source_id")
+        relative_path = metadata.get("relative_path")
+        if not source_id or not relative_path:
+            visible.append((chunk, False))
+            continue
+        head = heads.get((chunk["collection_id"], source_id, relative_path))
+        if head is None or head["active_document_id"] != chunk["document_id"]:
+            continue
+        visible.append((chunk, head["source_missing"]))
+    return visible
 
 
 def build_context(citations: list[Citation], *, max_chars: int = 12_000) -> str:
@@ -152,6 +187,7 @@ def build_context(citations: list[Citation], *, max_chars: int = 12_000) -> str:
         header = (
             f"[{index}] documento={citation.document_name or citation.document_id}"
             f" pagina={citation.page_number if citation.page_number is not None else 'n/d'}"
+            + (" origem=indisponivel" if citation.source_missing else "")
         )
         body = citation.excerpt
         block = f"{header}\n{body}"
@@ -185,4 +221,5 @@ __all__ = [
     "normalize",
     "retrieve",
     "tokenize",
+    "visible_chunks",
 ]

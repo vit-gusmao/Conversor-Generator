@@ -81,21 +81,22 @@ Neste modo um único processo `uvicorn` expõe `/api/v1` e serve a interface com
 
 #### Pelo launcher (Windows)
 
-O arquivo [starter-server.cmd](../starter-server.cmd) na raiz faz, em ordem:
+O arquivo [starter-local-server.cmd](../starter-local-server.cmd) na raiz faz, em ordem:
 
-1. Confere se `services\converter\api\main.py` existe.
-2. Confere se o ambiente virtual `services\converter\.venv\Scripts\python.exe` existe. Se não existir, mostra os comandos para criá-lo e para.
+1. Valida `CONVERTER_PORT` (padrão `8000`) e sonda `http://127.0.0.1:<porta>/health`. Se já responder, abre o navegador e encerra, sem subir outro processo.
+2. Se a porta estiver ocupada por outro processo, aborta com erro.
 3. Verifica o OCR: se o Ollama está instalado, respondendo e com o modelo `glm-ocr`. É apenas um aviso e nunca bloqueia a inicialização.
-4. Sonda `http://127.0.0.1:8000/health`. Se já responder, abre o navegador e encerra, sem subir outro processo.
-5. Se a porta 8000 estiver ocupada por outro processo, aborta com erro.
-6. Se `apps\web\dist\index.html` não existir, executa `npm run build` em `apps\web`. Se o build falhar, a API continua disponível, sem interface.
-7. Inicia, em uma janela minimizada, o comando `python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --log-level info` com diretório de trabalho em `services\converter`.
-8. Sonda `/health` por até 90 segundos, uma vez por segundo, e então abre `http://127.0.0.1:8000`.
+4. Garante o ambiente `services\converter\.venv` (ou `CG_VENV_DIR`). Se não existir, ou se não funcionar ou usar Python abaixo de 3.11, procura um Python 3.11+ (`py -3.12`, `py -3.13`, ..., `python`) e recria o venv. Se não houver Python, tenta `winget install Python.Python.3.12` no usuário.
+5. Instala `pip install -e "services\converter[ocr,migrate]"`. Guarda um carimbo com o SHA256 de `pyproject.toml`: só reinstala quando ele muda ou quando os imports básicos falham. O log fica em `.venv\install.log`.
+6. Se `apps\web\dist\index.html` não existir (ou com `--rebuild-web`), compila `packages\contracts` e `apps\web` com `npm ci` e `npm run build`. Exige Node.js 20.19+ ou 22+ (tenta `winget install OpenJS.NodeJS.LTS`). Se o build falhar, a API continua disponível, sem interface.
+7. Inicia, em uma janela minimizada, `python -m uvicorn api.main:app --host 127.0.0.1 --port <porta> --log-level info` com diretório de trabalho em `services\converter`.
+8. Sonda `/health` por até 90 segundos, uma vez por segundo, e então abre `http://127.0.0.1:<porta>`.
 
-Para executar, dê dois cliques em `starter-server.cmd` ou rode no PowerShell, na raiz do repositório:
+Para executar, dê dois cliques em `starter-local-server.cmd` ou rode no PowerShell, na raiz do repositório:
 
 ```powershell
-.\starter-server.cmd
+.\starter-local-server.cmd                 # abre o navegador ao final
+.\starter-local-server.cmd --no-browser    # não abre o navegador
 ```
 
 #### Manualmente
@@ -505,6 +506,7 @@ Enquanto a conversão roda, a interface recebe eventos por Server-Sent Events (S
 | Aspecto | Comportamento |
 |---|---|
 | Retomada | Aceita `Last-Event-ID` (cabeçalho) ou `last_event_id` (query). Entrega apenas eventos com sequência maior. |
+| Filtro por execução | `run_id` na query acompanha só uma execução. Existe no gateway (NestJS). No motor standalone o parâmetro é ignorado. Ver [API.md](API.md#eventos-de-conversão). |
 | Autenticação | Cabeçalho `Authorization`, ou `access_token` na query (o `EventSource` não envia cabeçalhos). |
 | Formato | Cada evento tem `id:` com a sequência, `event:` com o tipo e `data:` com o JSON. |
 | Consulta | Lê o banco a cada 0,5 s. |
@@ -537,7 +539,7 @@ sequenceDiagram
 
 ### Eventos de lote
 
-`GET /api/v1/batches/{id}/events` segue o mesmo padrão, com cursor `after` e prazo de 30 minutos. Se o stream falhar, a interface consulta o lote e os itens periodicamente ([use-batch-events.ts](../apps/web/src/hooks/use-batch-events.ts)).
+`GET /api/v1/batches/{id}/events` segue o mesmo padrão, com cursor `Last-Event-ID` (ou `last_event_id` na query) e prazo de 30 minutos. Se o stream falhar, a interface consulta o lote e os itens periodicamente ([use-batch-events.ts](../apps/web/src/hooks/use-batch-events.ts)).
 
 ## Lotes e envio por partes
 

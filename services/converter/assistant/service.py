@@ -164,14 +164,18 @@ class AssistantService:
             if conversation is None:
                 yield event("error", code="NOT_FOUND", message="Conversa não encontrada.")
                 return
+            # A request can have failed/cancelled attempts before a completed one.
             existing = session.execute(
-                select(ChatMessageRow).where(
+                select(ChatMessageRow)
+                .where(
                     ChatMessageRow.conversation_id == conversation_id,
                     ChatMessageRow.request_id == request_id,
                     ChatMessageRow.role == "assistant",
+                    ChatMessageRow.status == "completed",
                 )
-            ).scalar_one_or_none()
-            if existing is not None and existing.status == "completed":
+                .order_by(ChatMessageRow.created_at.desc())
+            ).scalars().first()
+            if existing is not None:
                 yield event(
                     "status", state="completed", message="Resposta já gerada para esta requisição."
                 )
@@ -260,6 +264,7 @@ class AssistantService:
 
         yield event("status", state="generating", message="Gerando resposta")
         parts: list[str] = []
+        finished = False  # True once the generation ended and its status is persisted
         try:
             async for chunk in self.client.chat_stream(messages):
                 message = chunk.get("message") or {}
@@ -269,6 +274,7 @@ class AssistantService:
                     yield event("delta", content=delta)
                 if chunk.get("error"):
                     raise OllamaError("MODEL_ERROR", str(chunk.get("error")))
+            finished = True
         except asyncio.CancelledError:
             self._save_assistant(
                 conversation_id,
@@ -278,13 +284,27 @@ class AssistantService:
                 status="cancelled",
                 error_code="CANCELLED",
             )
+            finished = True
             raise
         except OllamaError as exc:
             self._save_assistant(
                 conversation_id, request_id, "".join(parts), [], status="failed", error_code=exc.code
             )
+            finished = True
             yield event("error", code=exc.code, message=exc.message)
             return
+        finally:
+            if not finished:
+                # Client disconnected while suspended at a yield (GeneratorExit):
+                # keep the partial reply so the attempt is not left pending.
+                self._save_assistant(
+                    conversation_id,
+                    request_id,
+                    "".join(parts),
+                    [],
+                    status="cancelled",
+                    error_code="CANCELLED",
+                )
 
         content_out = "".join(parts).strip()
         used = self._cited(citations, content_out)

@@ -14,6 +14,7 @@ import {
 import type { Response } from 'express';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { contentDisposition } from '../../common/content-disposition';
 import { ApiError } from '../../common/errors/api-error';
 import type { AuthenticatedUser } from '../../common/request-context';
 import { OptionalJwtGuard } from '../../auth/guards/optional-jwt.guard';
@@ -85,10 +86,7 @@ export class EngineProxyController {
     res.status(200);
     res.setHeader('Content-Type', file.contentType);
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${file.filename ?? 'exportacao'}"`,
-    );
+    res.setHeader('Content-Disposition', contentDisposition(file.filename ?? 'exportacao'));
     res.send(file.body);
   }
 
@@ -174,9 +172,16 @@ export class EngineProxyController {
     let chunks = 0;
     let failed = 0;
     for (const conversionId of conversionIds) {
+      // The filename lives on the Document row; Conversion has no filename column.
       const conversion = (await this.prisma.conversion.findFirst({
         where: { id: conversionId, ownerId: owner.id, deletedAt: null },
-      })) as { id: string; documentId: string; activeRunId: string | null; filename: string } | null;
+        include: { document: true },
+      })) as {
+        id: string;
+        documentId: string;
+        activeRunId: string | null;
+        document: { filename: string } | null;
+      } | null;
       if (!conversion) {
         documents.push({ conversion_id: conversionId, status: 'not_found', chunks: 0 });
         failed += 1;
@@ -189,7 +194,7 @@ export class EngineProxyController {
           conversion_id: conversion.id,
           document_id: conversion.documentId,
           run_id: conversion.activeRunId,
-          filename: conversion.filename ?? null,
+          filename: conversion.document?.filename ?? null,
         },
         ownerId: owner.id,
       })) as { chunks?: number; status?: string };

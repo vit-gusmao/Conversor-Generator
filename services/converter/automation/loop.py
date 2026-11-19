@@ -14,8 +14,10 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import select
+
 from automation.executor import AutomationExecutor
-from automation.scheduler import LEASE_SECONDS, AutomationScheduler
+from automation.scheduler import HEARTBEAT_SECONDS, LEASE_SECONDS, AutomationScheduler
 from automation.repository import AutomationRepository
 from models.db import get_session_factory
 
@@ -31,6 +33,61 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+class _LeaseKeeper:
+    """Renews one fenced claim while a long advance runs.
+
+    The advance blocks the loop thread, so renewal happens on a side thread.
+    A renewal rejected by the fence (the claim was reclaimed) stops the keeper;
+    the stale attempt then cannot finalize anything because its fence no longer
+    matches.
+    """
+
+    def __init__(
+        self,
+        scheduler: AutomationScheduler,
+        run_id: str,
+        fence: int,
+        *,
+        interval: float | None = None,
+    ) -> None:
+        self.scheduler = scheduler
+        self.run_id = run_id
+        self.fence = fence
+        self.interval = float(interval if interval is not None else HEARTBEAT_SECONDS)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def renew(self, *, now: datetime | None = None) -> bool:
+        session = get_session_factory()()
+        try:
+            renewed = self.scheduler.heartbeat(session, self.run_id, self.fence, now=now)
+            session.commit()
+            return renewed
+        finally:
+            session.close()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                if not self.renew():
+                    return
+            except Exception:  # noqa: BLE001 - a missed renewal is retried next tick
+                logger.exception("lease renewal failed for %s", self.run_id)
+
+    def __enter__(self) -> "_LeaseKeeper":
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"lease-{self.run_id[-8:]}"
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        return False
+
+
 class AutomationLoop:
     """Daemon loop; `stop()` joins it gracefully."""
 
@@ -43,6 +100,7 @@ class AutomationLoop:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_cleanup = None
+        self._jobs = None
 
     # ------------------------------------------------------------------ life
     def start(self) -> None:
@@ -97,9 +155,24 @@ class AutomationLoop:
                 break
             claimed += 1
             # The fence travels with the claim: a reclaimed attempt bumps it
-            # and the old worker can no longer finalize the run.
-            self.executor.advance(lease.run_id, fence=lease.fence)
-        return {"created": created, "claimed": claimed}
+            # and the old worker can no longer finalize the run. The keeper
+            # renews the lease while a long advance blocks this thread.
+            with _LeaseKeeper(self.scheduler, lease.run_id, lease.fence):
+                self.executor.advance(lease.run_id, fence=lease.fence)
+        index_jobs = self._dispatch_index_jobs(now)
+        return {"created": created, "claimed": claimed, "index_jobs": index_jobs}
+
+    def _dispatch_index_jobs(self, now: datetime) -> int:
+        """Execute index jobs left queued, or leased by a dead worker, by a crash."""
+        from knowledge.job_runner import KnowledgeJobRunner
+
+        try:
+            if self._jobs is None:
+                self._jobs = KnowledgeJobRunner()
+            return self._jobs.run_pending(worker_id=self.worker_id, now=now)
+        except Exception:  # noqa: BLE001 - index dispatch must not stop the calendar
+            logger.exception("index job dispatch failed")
+            return 0
 
     def _maybe_cleanup(self, now: datetime) -> None:
         """Retention runs at most once a day; never touches artifacts."""
@@ -121,14 +194,16 @@ class AutomationLoop:
         session = get_session_factory()()
         recovered = 0
         try:
+            # Only non-terminal occurrences are read; the lease check stays in
+            # Python because it is applied to a handful of rows (S17).
+            now = datetime.now(UTC)
+            run_model = _run_model()
             rows = [
                 run
-                for run in session.query(_run_model()).all()
-                if run.state in RECOVERABLE_STATES
-                and (
-                    run.lease_until is None
-                    or _as_utc(run.lease_until) < datetime.now(UTC)
-                )
+                for run in session.execute(
+                    select(run_model).where(run_model.state.in_(RECOVERABLE_STATES))
+                ).scalars()
+                if run.lease_until is None or _as_utc(run.lease_until) < now
             ]
             for run in rows:
                 # A cancellation requested before the crash is honoured: the

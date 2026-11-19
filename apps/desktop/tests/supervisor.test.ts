@@ -41,6 +41,7 @@ function makeSupervisor(child: FakeChild, overrides: Partial<ConstructorParamete
     webDistDir: join(appData, 'web'),
     spawnImpl,
     startupTimeoutMs: 2000,
+    jwtSecret: 'j'.repeat(96),
     ...overrides,
   });
   return { supervisor, spawnImpl, appData };
@@ -141,12 +142,96 @@ describe('BackendSupervisor — internal token (review fix)', () => {
       env: Record<string, string>;
     };
     expect(options.env.CONVERTER_INTERNAL_TOKEN).toBe('token-abc-123');
-    expect(options.env.DESKTOP_BOOTSTRAP_SECRET).toBe('token-abc-123');
+    // The host guard secret is a separate, per-start value.
+    expect(options.env.DESKTOP_BOOTSTRAP_SECRET).toBeTruthy();
+    expect(options.env.DESKTOP_BOOTSTRAP_SECRET).not.toBe('token-abc-123');
+    expect(options.env.DESKTOP_BOOTSTRAP_SECRET).toBe(supervisor.bootstrapSecret);
   });
 
   it('generates a strong token when none is provided', () => {
     const { supervisor } = makeSupervisor(new FakeChild());
     expect(supervisor.internalToken.length).toBeGreaterThan(32);
     expect(supervisor.internalToken).not.toBe('dev-internal-token-change-me');
+  });
+});
+
+describe('BackendSupervisor — secrets and environment (WP-E)', () => {
+  it('refuses the documented JWT default or a short JWT secret before spawning', () => {
+    for (const jwtSecret of ['dev-jwt-secret-change-me', 'curto']) {
+      let error: unknown = null;
+      try {
+        makeSupervisor(new FakeChild(), { jwtSecret });
+      } catch (thrown) {
+        error = thrown;
+      }
+      expect(error).toMatchObject({ code: 'INSECURE_JWT_SECRET' });
+    }
+  });
+
+  it('passes the per-install JWT secret to the backend environment', async () => {
+    const child = new FakeChild();
+    const jwt = 'a'.repeat(96);
+    const { supervisor, spawnImpl } = makeSupervisor(child, { jwtSecret: jwt });
+    const pending = supervisor.start();
+    child.emitReady({ port: 40010, boot_id: 'b', version: '1' });
+    await pending;
+    const options = (spawnImpl as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][2] as {
+      env: Record<string, string>;
+    };
+    expect(options.env.JWT_SECRET).toBe(jwt);
+    expect(options.env.DESKTOP_HOST_ENABLED).toBe('true');
+  });
+
+  it('keeps security values even when the profile or a restart option tries to override them', async () => {
+    const child = new FakeChild();
+    const { supervisor, spawnImpl } = makeSupervisor(child, {
+      internalToken: 'token-real-0123456789',
+      env: { CONVERTER_INTERNAL_TOKEN: 'profile-token', JWT_SECRET: 'profile-jwt', DESKTOP_HOST_ENABLED: 'false' },
+    });
+    const pending = supervisor.start({ DESKTOP_BOOTSTRAP_SECRET: 'extra-secret' });
+    child.emitReady({ port: 40011, boot_id: 'b', version: '1' });
+    await pending;
+    const options = (spawnImpl as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][2] as {
+      env: Record<string, string>;
+    };
+    expect(options.env.CONVERTER_INTERNAL_TOKEN).toBe('token-real-0123456789');
+    expect(options.env.JWT_SECRET).toBe('j'.repeat(96));
+    expect(options.env.DESKTOP_HOST_ENABLED).toBe('true');
+    expect(options.env.DESKTOP_BOOTSTRAP_SECRET).not.toBe('extra-secret');
+    expect(options.env.DESKTOP_BOOTSTRAP_SECRET).toBe(supervisor.bootstrapSecret);
+  });
+
+  it('issues a new bootstrap secret on every spawn', async () => {
+    const children = [new FakeChild(), new FakeChild()];
+    let index = 0;
+    const spawnImpl = vi.fn(() => children[index++]) as unknown as typeof import('node:child_process').spawn;
+    const { supervisor } = makeSupervisor(children[0], { spawnImpl });
+
+    const first = supervisor.start();
+    children[0].emitReady({ port: 41100, boot_id: 'a', version: '1' });
+    await first;
+    const firstSecret = supervisor.bootstrapSecret;
+    expect(firstSecret).toBeTruthy();
+
+    const restarted = supervisor.restart();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    children[1].emitReady({ port: 41101, boot_id: 'b', version: '1' });
+    await restarted;
+    expect(supervisor.bootstrapSecret).not.toBe(firstSecret);
+  });
+
+  it('keeps only a bounded stderr tail in startup diagnostics', async () => {
+    const child = new FakeChild();
+    const { supervisor } = makeSupervisor(child);
+    const pending = supervisor.start();
+    // ~200 KB of noise, then a recognisable last line.
+    const noise = 'x'.repeat(1024);
+    for (let i = 0; i < 200; i += 1) child.stderr.emit('data', Buffer.from(noise));
+    child.stderr.emit('data', Buffer.from('ERRO-FINAL-LINHA'));
+    child.emit('exit', 3);
+    const error = (await pending.catch((thrown: unknown) => thrown)) as Error;
+    expect(error).toMatchObject({ code: 'BACKEND_EXITED' });
+    expect(error.message).toContain('ERRO-FINAL-LINHA');
+    expect(error.message.length).toBeLessThan(1500);
   });
 });

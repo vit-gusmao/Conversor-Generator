@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
+import { createReadStream, createWriteStream, mkdirSync, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -68,7 +68,10 @@ export class LocalStorageService implements StorageService, OnModuleInit {
 
   async putStream(key: string, stream: Readable, _contentType: string): Promise<StoredObject> {
     const target = this.resolve(key);
-    await fs.mkdir(path.dirname(target), { recursive: true });
+    // Synchronous on purpose: no await may run before pipeline() attaches its
+    // error handlers to the source. A client abort during an awaited mkdir
+    // emitted 'error' on the source with no listener and could crash the process.
+    mkdirSync(path.dirname(target), { recursive: true });
     const temporary = `${target}.${process.pid}.${Date.now()}.part`;
     const hash = createHash('sha256');
     let size = 0;
@@ -79,11 +82,16 @@ export class LocalStorageService implements StorageService, OnModuleInit {
         callback(null, chunk);
       },
     });
+    const writer = createWriteStream(temporary);
     try {
-      await pipeline(stream, counter, createWriteStream(temporary));
+      await pipeline(stream, counter, writer);
       // Only a fully written part becomes visible under its final key.
       await fs.rename(temporary, target);
     } catch (error) {
+      // An aborted or failed source leaves a half-written file: close the handle
+      // before removing it, or Windows refuses the delete and the temp file leaks.
+      writer.destroy();
+      if (!writer.closed) await new Promise<void>((resolve) => writer.once('close', () => resolve()));
       await fs.rm(temporary, { force: true }).catch(() => undefined);
       throw error;
     }

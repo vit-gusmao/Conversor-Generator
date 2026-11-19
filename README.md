@@ -122,7 +122,7 @@ principais:
 - Não há garantia de acerto de 100%. A auditoria mede **cobertura** (texto
   recuperado com destino) e não **precisão**, que só é medida contra um gabarito.
 - O estado `REVIEW_REQUIRED` e o endpoint de revisão humana **não existem**. Veja
-  [docs/API.md](docs/FLOW.md#limitações-e-divergências-conhecidas).
+  [docs/FLOW.md](docs/FLOW.md#limitações-e-divergências-conhecidas).
 - O GLM-OCR devolve texto, não coordenadas por palavra. A geometria é
   reconstruída de forma determinística e a confiança é constante; ambas ficam
   registradas na auditoria.
@@ -140,7 +140,7 @@ principais:
 
 **Limites e modos**
 
-- No modo `standalone`, cada item de lote e cada envio simples têm no máximo `UPLOAD_MAX_BYTES` (50 MiB por padrão). No NestJS, o teto por item de lote é `UPLOAD_MAX_FILE_BYTES`, que vem vazio (sem teto).
+- No modo `standalone`, o envio simples de arquivo único (`POST /api/v1/conversions`) tem teto do menor valor entre `UPLOAD_MAX_BYTES` e `CONVERTER_MAX_PDF_BYTES` (50 MiB por padrão). Lotes e envio por partes não têm teto de tamanho de documento. No NestJS, o teto por item de lote é `UPLOAD_MAX_FILE_BYTES`, que vem vazio (sem teto).
 - `MAX_FILES_PER_BATCH` existe na configuração, mas não é aplicada.
 - No modo Celery (Docker Compose), não há retomada por checkpoint.
 
@@ -162,9 +162,10 @@ detalhado, com estados e eventos, está em [docs/FLOW.md](docs/FLOW.md).
 1. **Abra a interface.** No modo `standalone`, use `http://127.0.0.1:8000`. No
    modo `full` ou no Docker Compose, use o endereço indicado na
    [seção de início rápido](#início-rápido).
-2. **Sessão anônima.** O navegador recebe um identificador de dispositivo
-   (cookie `pdf2x_device_id` e `localStorage`). Todas as conversões ficam
-   associadas a ele; outro navegador não vê essas conversões.
+2. **Sessão anônima.** O navegador recebe um identificador de dispositivo: o
+   cookie HttpOnly `pdf2x_device_id` (definido pela API) e o `localStorage`
+   `pdf2x.device_id` (usado pela interface). Todas as conversões ficam associadas a
+   ele; outro navegador não vê essas conversões.
 3. **Envio.** Você escolhe um arquivo ou um lote. O tipo e o tamanho são validados
    no navegador e no servidor. Arquivos enviados por partes de 8 MiB são
    retomáveis: cada parte tem seu hash, e o documento inteiro é verificado ao
@@ -288,8 +289,9 @@ a aplicação (usuários, conversões, eventos) e o motor Python escreve a evid�
 ├── infra/
 │   ├── docker-compose.yml    stack local: PostgreSQL, Redis, MinIO, motor, worker, API e interface
 │   └── postgres/init.sql     criação dos bancos usados pela stack
-├── docs/                     arquitetura, fluxo, armazenamento, operação, configuração, conversão, auditoria, API, testes, deploy
-├── starter-server.cmd        inicializador para Windows (modo standalone)
+├── docs/                     arquitetura, fluxo, armazenamento, operação, configuração, conversão, auditoria, API, testes, deploy, desktop, fontes e agendamentos
+├── scripts/                  build-desktop.ps1 (pacote Windows) e smoke-desktop.ps1 (verificação do pacote)
+├── starter-local-server.cmd  inicializador para Windows (modo standalone)
 ├── .env.example              modelo de variáveis de ambiente
 └── package.json              scripts de raiz (install:all, build, test, test:py, test:mcp)
 ```
@@ -333,7 +335,7 @@ Um único processo FastAPI serve a API pública em `/api/v1` e a interface
 compilada. Requer Python 3.11 ou superior (3.12 recomendado) e Node 22.
 
 ```bash
-# (a) motor Python
+# (a) motor Python (acrescente ,ocr ao extra para RapidOCR/Tesseract em Python; ,migrate para Alembic)
 cd services/converter
 python -m venv .venv
 .venv\Scripts\pip install -e ".[test]"        # Linux/macOS: .venv/bin/pip install -e ".[test]"
@@ -356,17 +358,25 @@ Abra <http://127.0.0.1:8000>. Endereços úteis:
 - `/internal/v1`: API interna do motor, protegida por `x-internal-token`
 - `/health`: verificação de saúde
 
-**No Windows**, o arquivo `starter-server.cmd` automatiza esses passos: confere
-o venv em `services\converter\.venv`, compila a interface se `apps\web\dist` não
-existir, sobe o servidor em `127.0.0.1:8000`, aguarda a resposta de `/health` e
-abre o navegador. Dê um duplo clique nele. Antes disso, crie o venv (passo a) e
-instale as dependências. Para parar o servidor, feche a janela
-"Conversor Generator - servidor" ou use `Ctrl+C` nela.
+**No Windows**, o arquivo `starter-local-server.cmd` automatiza esses passos em
+um clone novo: localiza Python 3.11+ (prefere 3.12; instala o 3.12 com `winget` se
+não houver), cria o venv em `services\converter\.venv`, instala as dependências
+(extras `ocr` e `migrate`) e só reinstala quando `pyproject.toml` muda; compila a
+interface se `apps\web\dist` não existir (exige Node.js 20.19+ ou 22+; instala o
+Node.js LTS com `winget` se necessário); sobe o servidor em `127.0.0.1:8000`,
+aguarda a resposta de `/health` (até 90 s) e abre o navegador. Dê um duplo clique
+nele, ou rode `starter-local-server.cmd --no-browser` para não abrir o navegador.
+`--rebuild-web` recompila a interface. A porta pode ser trocada pela variável de
+ambiente `CONVERTER_PORT`, e a pasta do venv pela `CG_VENV_DIR`. O starter define
+`AUTOMATION_EXECUTOR_ENABLED=true` quando a variável não está definida, para que os
+agendamentos funcionem. Para parar o servidor, feche a janela
+"Conversor Generator - servidor" ou use `Ctrl+C` nela. O RapidOCR não é instalado
+em Python 3.15 (o extra tem marcador `python_version < '3.15'`).
 
 Com o Ollama ativo e o modelo `glm-ocr:latest` instalado, o GLM-OCR é o motor
 preferencial. Caso contrário, o motor usa RapidOCR ou Tesseract, se instalados,
 ou falha de forma explícita nas páginas digitalizadas. A ausência do Ollama nunca
-impede a inicialização; o `starter-server.cmd` apenas informa o estado do GLM-OCR.
+impede a inicialização; o `starter-local-server.cmd` apenas informa o estado do GLM-OCR.
 
 ```bash
 ollama pull glm-ocr:latest    # opcional, recomendado para páginas digitalizadas
@@ -423,7 +433,9 @@ docker compose up --build
 ```
 
 Serviços: `postgres`, `redis`, `minio`, `minio-init`, `converter`, `worker`
-(Celery), `api` (NestJS) e `web` (nginx + SPA). Apenas `web` publica uma porta,
+(Celery), `automation` (executor de agendamentos, `python -m automation.cli`, com
+a pasta `SOURCE_ROOTS_DIR` montada como `/sources` somente leitura), `api` (NestJS)
+e `web` (nginx + SPA). Apenas `web` publica uma porta,
 e ela fica restrita a `127.0.0.1` (`WEB_PORT`, padrão `8080`). `CONVERTER_INTERNAL_TOKEN`
 e `JWT_SECRET` são obrigatórios: o Compose recusa iniciar sem eles. O Compose lê
 variáveis de `infra/.env`. Veja `infra/docker-compose.yml` e
@@ -463,7 +475,7 @@ completa está em [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 | `CONVERTER_PORT` | `8000` | porta do motor Python |
 | `PDF2X_MCP_HOST` | `127.0.0.1` | endereço do transporte HTTP do servidor MCP |
 | `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3000` | origens da interface liberadas no CORS, separadas por vírgula, sem barra final |
-| `AUTH_MODE` | `optional` | `optional` cria sessão por dispositivo; `required` exige JWT nas rotas protegidas. No motor standalone, `POST /auth/anonymous` devolve 401 nesse modo; no NestJS responde 201 em qualquer modo |
+| `AUTH_MODE` | `optional` | `optional` cria sessão por dispositivo; `required` exige JWT nas rotas protegidas. `POST /auth/anonymous` responde 201 em qualquer modo, nos dois serviços |
 | `JWT_SECRET` | valor de desenvolvimento público | segredo HMAC dos tokens; troque se a porta for exposta |
 | `CONVERTER_INTERNAL_TOKEN` | valor de desenvolvimento público | token de `x-internal-token` entre API e motor; precisa ser igual nos dois lados |
 | `CONVERTER_DATABASE_URL` | `sqlite:///./data/converter.db` | banco do motor (SQLite ou `postgresql+psycopg://...`) |
@@ -554,7 +566,12 @@ As imagens são construídas a partir da raiz do repositório, com
 ## Repositório e CI
 
 O código-fonte está no GitHub (`vit-gusmao/Conversor-Generator`). O workflow
-`.github/workflows/ci.yml` roda os testes a cada push e pull request na `main`.
+`.github/workflows/ci.yml` roda, a cada push e pull request na `main`, os jobs
+`web`, `api`, `converter`, `desktop` (shell Electron, testes e build em Linux) e
+`mcp`. O workflow `.github/workflows/desktop.yml` gera o pacote Windows
+(`windows-latest`, em `workflow_dispatch` e em tags `v*`): roda o PyInstaller, o
+smoke do backend e o electron-builder, e publica o artefato
+`conversor-generator-windows-x64`.
 
 O aplicativo não depende do GitHub para executar: a instalação e o uso são
 feitos inteiramente na sua máquina, como descrito neste documento.
@@ -576,6 +593,8 @@ feitos inteiramente na sua máquina, como descrito neste documento.
 | [docs/API.md](docs/API.md) | contrato REST e SSE, códigos de erro |
 | [docs/TESTING.md](docs/TESTING.md) | estratégia e corpus de testes |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | execução com containers na sua máquina (Docker Compose e standalone) |
+| [docs/DESKTOP.md](docs/DESKTOP.md) | aplicativo Windows (Electron): supervisor, perfil, segurança do host, build e smoke |
+| [docs/SOURCES_AND_AUTOMATION.md](docs/SOURCES_AND_AUTOMATION.md) | fontes por caminho, planilhas XLSX/CSV e agendamentos |
 | [apps/api/README.md](apps/api/README.md) | API NestJS: configuração, rotas, Docker |
 | [apps/web/README.md](apps/web/README.md) | interface: desenvolvimento, build, Docker |
 | [apps/mcp/README.md](apps/mcp/README.md) | servidor MCP: transportes, ferramentas, configuração |

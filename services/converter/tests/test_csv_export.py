@@ -102,3 +102,33 @@ def test_selected_table_only():
     assert result.filename.endswith(".csv")
     assert "B" in result.data.decode("utf-8")
     assert "A" not in result.data.decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("3.14", "3.14"),
+        ("0.5", "0.5"),
+        ("-1.5", "-1.5"),
+        ("1.234,56", "1234.56"),
+        ("12,5", "12.5"),
+        ("-1.234,56", "-1234.56"),
+        ("00123", "00123"),
+        ("Ana", "Ana"),
+    ],
+)
+def test_canonical_mode_does_not_strip_decimal_dot(raw, expected):
+    # AU2-10: a dot that is a decimal mark must survive canonicalisation.
+    ir = _ir(_table("t1", [[raw]], ["v"]))
+    result = export_csv(ir, ExportOptions(format="csv", value_mode="canonical"))
+    lines = result.data.decode("utf-8").split("\r\n")
+    assert lines[1] == expected
+
+
+def test_none_header_is_written_as_empty_cell():
+    # AU2-10 (S3): a missing header must not be serialised as the literal "None".
+    ir = _ir(_table("t1", [["Ana", "1"]], ["Nome", None]))
+    result = export_csv(ir, ExportOptions(format="csv"))
+    text = result.data.decode("utf-8")
+    assert text.split("\r\n")[0] == "Nome,"
+    assert "None" not in text

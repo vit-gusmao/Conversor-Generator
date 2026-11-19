@@ -127,6 +127,11 @@ class Settings(BaseSettings):
         default=False, alias="AUTOMATION_EXECUTOR_ENABLED"
     )
     desktop_host_enabled: bool = Field(default=False, alias="DESKTOP_HOST_ENABLED")
+    #: Per-start secret the Electron host presents as `x-desktop-host` on every
+    #: HTTP request (see api/desktop_guard.py). Never logged, never sent to a page.
+    desktop_bootstrap_secret: str | None = Field(
+        default=None, alias="DESKTOP_BOOTSTRAP_SECRET"
+    )
     automation_poll_seconds: float = Field(default=5.0, alias="AUTOMATION_POLL_SECONDS")
     automation_history_retention_days: int = Field(
         default=90, alias="AUTOMATION_HISTORY_RETENTION_DAYS"

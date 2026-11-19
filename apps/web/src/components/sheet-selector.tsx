@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { SheetDescriptor } from '@pdf2x/contracts';
 import { ChevronDown, Loader2, Search, Table2 } from 'lucide-react';
 
@@ -11,12 +11,30 @@ import { formatNumber } from '@/lib/format';
 import { SHEET_KIND_LABELS } from '@/lib/labels';
 import { listSheets } from '@/services/results';
 
+/** Sheet names loaded for the unfiltered list, and whether the server has no more. */
+export interface SheetCatalog {
+  names: string[];
+  exhausted: boolean;
+}
+
 export interface SheetSelectorProps {
   conversionId: string;
   value: string | null;
   onChange: (sheetName: string) => void;
+  /**
+   * Reports what has been loaded for the unfiltered list. A parent can then
+   * tell "this sheet does not exist" (catalog exhausted, name absent) apart
+   * from "not loaded yet" (name beyond the pages loaded so far).
+   */
+  onCatalogChange?: (catalog: SheetCatalog) => void;
   /** Rows per page of the selector; a transport parameter, not a limit. */
   pageSize?: number;
+}
+
+/** Paging state after the first page: where the next page starts, or that there is none. */
+interface TailPaging {
+  cursor: string | null;
+  exhausted: boolean;
 }
 
 /**
@@ -26,27 +44,49 @@ export interface SheetSelectorProps {
  * instead of being rendered as thousands of buttons. The native `<select>`
  * keeps keyboard and screen-reader behaviour for free.
  */
-export function SheetSelector({ conversionId, value, onChange, pageSize = 50 }: SheetSelectorProps) {
+export function SheetSelector({
+  conversionId,
+  value,
+  onChange,
+  onCatalogChange,
+  pageSize = 50,
+}: SheetSelectorProps) {
   const [search, setSearch] = useState('');
   const debounced = useDebouncedValue(search, 300);
   const query = useSheets(conversionId, { q: debounced, limit: pageSize });
 
   const [extra, setExtra] = useState<SheetDescriptor[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
+  // `null` until a page beyond the first is loaded; then the explicit tail state
+  // decides whether another page exists. An absent cursor here means "done",
+  // never "fall back to the first page's cursor".
+  const [tail, setTail] = useState<TailPaging | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreError, setMoreError] = useState<string | null>(null);
 
   // A new search (or a refetch of the first page) invalidates the appended pages.
   useEffect(() => {
     setExtra([]);
-    setCursor(null);
+    setTail(null);
     setMoreError(null);
   }, [debounced, conversionId]);
 
   const firstPage = query.data?.items ?? [];
   const items = [...firstPage, ...extra];
-  const nextCursor = cursor ?? query.data?.next_cursor ?? null;
+  const nextCursor = tail === null ? (query.data?.next_cursor ?? null) : tail.exhausted ? null : tail.cursor;
+  const exhausted = nextCursor === null;
   const total = query.data?.total ?? items.length;
+
+  // Report the unfiltered catalog only: a search result is a subset, not the
+  // workbook's sheet list.
+  const catalogRef = useRef(onCatalogChange);
+  catalogRef.current = onCatalogChange;
+  useEffect(() => {
+    if (!query.data || debounced !== '') return;
+    catalogRef.current?.({
+      names: [...query.data.items, ...extra].map((sheet) => sheet.name),
+      exhausted: query.data.next_cursor === null ? true : tail?.exhausted === true,
+    });
+  }, [query.data, extra, tail, debounced]);
 
   async function loadMore() {
     if (!nextCursor || loadingMore) return;
@@ -59,7 +99,7 @@ export function SheetSelector({ conversionId, value, onChange, pageSize = 50 }: 
         limit: pageSize,
       });
       setExtra((current) => [...current, ...page.items]);
-      setCursor(page.next_cursor);
+      setTail({ cursor: page.next_cursor, exhausted: page.next_cursor === null });
     } catch (cause) {
       setMoreError(explainError(cause));
     } finally {
@@ -113,7 +153,7 @@ export function SheetSelector({ conversionId, value, onChange, pageSize = 50 }: 
           />
         </div>
 
-        {nextCursor ? (
+        {!exhausted ? (
           <Button variant="ghost" size="sm" onClick={() => void loadMore()} disabled={loadingMore}>
             {loadingMore ? (
               <Loader2 className="animate-spin motion-reduce:animate-none" aria-hidden="true" />

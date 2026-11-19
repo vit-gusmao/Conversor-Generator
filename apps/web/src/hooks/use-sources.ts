@@ -15,6 +15,11 @@ import {
   type StartImportInput,
 } from '@/services/sources';
 
+/** Import statuses after which the import row and its items stop changing. */
+const IMPORT_TERMINAL_STATUSES: readonly string[] = ['completed', 'partial', 'failed', 'cancelled'];
+
+export const IMPORT_ITEMS_POLL_MS = 3_000;
+
 export const sourceKeys = {
   roots: ['sources', 'roots'] as const,
   list: ['sources', 'list'] as const,
@@ -52,7 +57,10 @@ export function useUpdateSource() {
   return useMutation({
     mutationFn: (input: { sourceId: string; version: number; changes: Partial<CreateSourceInput> }) =>
       updateSource(input.sourceId, input.version, input.changes),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: sourceKeys.list }),
+    onSuccess: (_data, input) => {
+      void queryClient.invalidateQueries({ queryKey: sourceKeys.detail(input.sourceId) });
+      void queryClient.invalidateQueries({ queryKey: sourceKeys.list });
+    },
   });
 }
 
@@ -86,17 +94,24 @@ export function useImport(importId: string | null) {
     refetchInterval: (query) => {
       const data = query.state.data;
       if (!data) return 2000;
-      return ['completed', 'partial', 'failed', 'cancelled'].includes(data.status) ? false : 2000;
+      return IMPORT_TERMINAL_STATUSES.includes(data.status) ? false : 2000;
     },
     staleTime: 0,
   });
 }
 
 export function useImportItems(importId: string | null) {
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: sourceKeys.importItems(importId ?? 'none'),
     queryFn: () => listImportItems(importId as string),
     enabled: Boolean(importId),
     staleTime: 2_000,
+    // Items change while the import runs. Poll until the import row is terminal;
+    // the import row itself is read from the cache the import query fills.
+    refetchInterval: () => {
+      const record = queryClient.getQueryData<{ status: string }>(sourceKeys.import(importId ?? 'none'));
+      return record && IMPORT_TERMINAL_STATUSES.includes(record.status) ? false : IMPORT_ITEMS_POLL_MS;
+    },
   });
 }

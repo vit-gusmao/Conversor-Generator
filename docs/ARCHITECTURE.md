@@ -232,6 +232,50 @@ transporte e não limita o tamanho do documento. O limite de tamanho é
 - `CONVERTER_TASK_TIMEOUT_SECONDS=0` (padrão) remove o prazo global do documento.
   O timeout passa a valer por unidade e por chamada de OCR.
 
+## Migrações na inicialização (desktop)
+
+O build empacotado do desktop não traz Alembic. O arranque usa os modelos
+diretamente (`runtime/db_migrate.py`), nesta ordem:
+
+1. Trava exclusiva em `<app_data>/.migrate.lock`. Um segundo processo espera e,
+   se o prazo acabar, falha em vez de competir.
+2. Lê a revisão gravada no banco. Revisão desconhecida (escrita por um build
+   mais novo) é recusada antes de qualquer alteração.
+3. Quando o schema vai mudar, copia o banco pela API de backup do SQLite para
+   `<app_data>/backups/converter-<UTC>.db`, mantendo as `BACKUP_KEEP` cópias mais
+   recentes.
+4. Executa `init_db` (cria tabelas ausentes e acrescenta colunas e índices
+   ausentes; não remove nada).
+5. Grava a revisão-cabeça em `alembic_version`, para que o Alembic e builds
+   posteriores vejam um histórico consistente.
+
+Nos ambientes de desenvolvimento e no compose, a cadeia de migrações Alembic
+(`services/converter/migrations/versions/`) é a referência. A revisão-cabeça
+atual é `d5e0a7c31b92` (ver [DATABASE.md](DATABASE.md)).
+
+## Automação, indexação e recuperação
+
+- O loop de automação (`automation/loop.py`) roda em um processo: no standalone,
+  quando `AUTOMATION_EXECUTOR_ENABLED=true`; no modo full, no serviço
+  `python -m automation.cli`. Cada ciclo cria ocorrências, reivindica as
+  pendentes, avança as que estão em execução e despacha os jobs de indexação.
+- Job de indexação é linha com lease de 120 s e `fence`. Cada reivindicação
+  incrementa o fence. `heartbeat` renova o lease. A gravação final exige o fence
+  atual, então um worker cujo lease foi retomado não sobrescreve a tentativa mais
+  nova. `recover` devolve à fila os jobs `running` com lease vencido ou sem lease.
+- Na inicialização, o loop reconcilia ocorrências abandonadas (evento
+  `LEASE_RECOVERED`) e recupera os jobs de indexação órfãos.
+
+## Recuperação da geração ativa (RAG)
+
+- Cada fonte tem uma cabeça (`source_knowledge_heads`) que aponta para a geração
+  de índice vigente (`index_generation`). A troca de geração é uma comparação e
+  troca: só avança se o número observado antes da indexação ainda for o atual.
+  Um escritor atrasado não sobrescreve uma geração mais nova.
+- A busca lê somente os trechos da geração ativa. Gerações substituídas ou não
+  confirmadas não aparecem nos resultados. Se uma indexação falha, a cabeça
+  continua apontando para a última geração boa.
+
 ## Checkpoints por página
 
 Cada página extraída é serializada (tokens, blocos, regiões, tabelas) em
@@ -288,6 +332,7 @@ na linha de `page_checkpoints`.
 | FastAPI standalone | `uvicorn api.main:app --port 8000` (host padrão do uvicorn: `127.0.0.1`) | navegador local | identidade de dispositivo ou JWT |
 | Motor (`/internal/v1/*`) | sem porta publicada no compose | apenas a API | header `x-internal-token` |
 | Hook do motor (`/api/v1/internal/hooks/converter`) | mesmo bind da API | apenas o motor | header `x-internal-token` |
+| Motor no desktop (`DESKTOP_HOST_ENABLED=true`) | loopback, porta escolhida pelo host | só o processo Electron | guarda de host (`x-desktop-host`, `Host`, `Origin`) |
 
 Notas:
 
@@ -304,7 +349,21 @@ Notas:
   autenticação forte: quem tem o identificador do dispositivo acessa os dados
   daquele dispositivo. O modelo assume uso local por uma pessoa. Não existe
   limitação de taxa (rate limit) no gateway.
-- CORS: `ALLOWED_ORIGINS` (padrão `http://localhost:8080` no compose).
+- **Modo desktop.** Loopback não é autenticação: qualquer processo local ou aba
+  do navegador alcança `127.0.0.1`. Com `DESKTOP_HOST_ENABLED=true`, o motor
+  (`api/desktop_guard.py`) é um middleware ASGI que exige, em toda requisição
+  HTTP, um cabeçalho `x-desktop-host` igual ao segredo de inicialização do
+  processo (comparação em tempo constante); `Host` igual a `127.0.0.1:<porta>`
+  ou `localhost:<porta>`; e, se houver `Origin`, exatamente a origem do próprio
+  servidor. Falha responde `403 DESKTOP_HOST_FORBIDDEN`. `GET /health` é a única
+  exceção. WebSocket é recusado. Sem o segredo, o middleware não é montado.
+- **Modo desktop, injeção do cabeçalho.** O processo Electron injeta
+  `x-desktop-host` por `webRequest`, só para a origem do motor. A página nunca
+  recebe o segredo. O mesmo processo aplica a política de conteúdo (CSP) no
+  renderer: `default-src 'self'`, `connect-src 'self'`, `object-src 'none'`,
+  `frame-ancestors 'none'` e `form-action 'self'`, entre outras diretivas.
+- CORS: `ALLOWED_ORIGINS` (padrão `http://localhost:8080` no compose). No modo
+  desktop não há CORS: a interface é servida pelo próprio processo.
 - Chamadas de saída, todas locais por padrão:
   - Ollama, para o assistente (`ASSISTANT_HOST`, padrão `127.0.0.1`) e para o
     GLM-OCR (`GLMOCR_HOST`:`GLMOCR_PORT`, padrão `127.0.0.1:11434`). Se apontado

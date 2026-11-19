@@ -165,6 +165,38 @@ export function readEnum<T extends string>(name: string, allowed: readonly T[], 
   return fallback;
 }
 
+/** Development fallbacks. They must never serve traffic in production (A-02). */
+export const DEV_JWT_SECRET = 'dev-only-insecure-secret-change-me';
+export const DEV_INTERNAL_TOKEN = 'dev-internal-token-change-me';
+
+/**
+ * In production a dev secret is a startup error. Elsewhere it is a warning,
+ * like the Python engine does. Tests (`NODE_ENV=test`) stay quiet.
+ */
+function assertRuntimeSecrets(jwtSecret: string, internalToken: string): void {
+  const insecure = [
+    ...(jwtSecret === DEV_JWT_SECRET ? ['JWT_SECRET'] : []),
+    ...(internalToken === DEV_INTERNAL_TOKEN ? ['CONVERTER_INTERNAL_TOKEN'] : []),
+  ];
+  if (insecure.length === 0) return;
+
+  const names = insecure.join(', ');
+  const nodeEnv = env('NODE_ENV');
+  if (nodeEnv === 'production') {
+    throw new Error(
+      `Segredos com valor padrão de desenvolvimento em NODE_ENV=production (${names}). ` +
+        'Defina-os antes de iniciar a API.',
+    );
+  }
+  if (nodeEnv !== 'test') {
+    // Plain console line: this runs before the Nest logger exists.
+    console.warn(
+      `[configuration] segredos com valor padrão de desenvolvimento em uso (${names}): ` +
+        'defina-os antes de expor o serviço',
+    );
+  }
+}
+
 export function configuration(): AppConfiguration {
   const authMode = readEnum<AuthMode>('AUTH_MODE', ['optional', 'required'], 'optional');
   const runtimeMode = readEnum<RuntimeMode>('RUNTIME_MODE', ['standalone', 'full'], 'full');
@@ -174,6 +206,10 @@ export function configuration(): AppConfiguration {
   const partBytes = readInt('UPLOAD_PART_BYTES', 8 * 1024 * 1024, 64 * 1024);
   const partMaxBytes = Math.max(partBytes, readInt('UPLOAD_PART_MAX_BYTES', 32 * 1024 * 1024, 64 * 1024));
 
+  const jwtSecret = readString('JWT_SECRET', DEV_JWT_SECRET);
+  const internalToken = readString('CONVERTER_INTERNAL_TOKEN', DEV_INTERNAL_TOKEN);
+  assertRuntimeSecrets(jwtSecret, internalToken);
+
   return {
     runtimeMode,
     engineVersion: readString('ENGINE_VERSION', '1.0.0'),
@@ -181,8 +217,13 @@ export function configuration(): AppConfiguration {
     api: {
       port: readInt('API_PORT', 3000, 1),
       host: readString('API_HOST', '127.0.0.1'),
-      databaseUrl: readString('API_DATABASE_URL', 'file:./data/api.db'),
-      jwtSecret: readString('JWT_SECRET', 'dev-only-insecure-secret-change-me'),
+      // Runtime datasource. API_DATABASE_URL wins; API_POSTGRES_URL is used only
+      // when the SQLite one is unset (the Postgres deployment sets only that one).
+      databaseUrl:
+        readOptionalString('API_DATABASE_URL') ??
+        readOptionalString('API_POSTGRES_URL') ??
+        'file:./data/api.db',
+      jwtSecret,
       jwtExpiresIn: readString('JWT_EXPIRES_IN', '7d'),
       authMode,
       uploadMaxBytes: readInt('UPLOAD_MAX_BYTES', 52428800, 1),
@@ -211,7 +252,7 @@ export function configuration(): AppConfiguration {
     },
     converter: {
       internalUrl: readString('CONVERTER_INTERNAL_URL', 'http://localhost:8000'),
-      internalToken: readString('CONVERTER_INTERNAL_TOKEN', 'dev-internal-token-change-me'),
+      internalToken,
       timeoutMs: readInt('CONVERTER_TIMEOUT_MS', 30000, 1000),
       pollIntervalMs: readInt('CONVERTER_POLL_INTERVAL_MS', 800, 100),
       healthCacheMs: readInt('CONVERTER_HEALTH_CACHE_MS', 30000, 1000),

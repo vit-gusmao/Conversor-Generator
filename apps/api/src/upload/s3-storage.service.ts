@@ -43,6 +43,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+/**
+ * Only a missing object is "not found". Throttling, auth, network and bucket
+ * errors are storage failures: reporting them as 404 would tell the client a
+ * document is gone when the store is merely unavailable.
+ */
+function isNotFound(error: unknown): boolean {
+  if (!isRecord(error)) return false;
+  const codes = [error['name'], error['Code'], error['code']];
+  if (codes.includes('NoSuchBucket')) return false;
+  if (codes.includes('NoSuchKey') || codes.includes('NotFound')) return true;
+  const metadata = error['$metadata'];
+  return isRecord(metadata) && metadata['httpStatusCode'] === 404;
+}
+
 @Injectable()
 export class S3StorageService implements StorageService {
   readonly backend = 's3' as const;
@@ -85,7 +99,9 @@ export class S3StorageService implements StorageService {
       return await this.readBody(output);
     } catch (error) {
       if (error instanceof ApiError) throw error;
-      throw ApiError.notFound({ reason: 'storage_object_not_found', key });
+      if (isNotFound(error)) throw ApiError.notFound({ reason: 'storage_object_not_found', key });
+      this.logger.error(`Falha ao ler ${key} do S3`, String(error));
+      throw ApiError.storageUnavailable({ backend: 's3', operation: 'get' });
     }
   }
 
@@ -109,8 +125,10 @@ export class S3StorageService implements StorageService {
         new sdk.HeadObjectCommand({ Bucket: this.config.s3.bucket, Key: key }),
       );
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (isNotFound(error)) return false;
+      this.logger.error(`Falha ao consultar ${key} no S3`, String(error));
+      throw ApiError.storageUnavailable({ backend: 's3', operation: 'exists' });
     }
   }
 
@@ -126,11 +144,17 @@ export class S3StorageService implements StorageService {
         callback(null, chunk);
       },
     });
-    const passthrough = stream.pipe(counter);
+    // A source that fails or disappears mid-body must fail the upload. Piping
+    // alone never ends the counter in that case, and the SDK would wait forever.
+    stream.once('error', (error: Error) => counter.destroy(error));
+    stream.once('close', () => {
+      if (!stream.readableEnded) counter.destroy(new Error('source_closed_before_end'));
+    });
+    stream.pipe(counter);
     try {
       await new sdk.Upload({
         client: this.getClient(sdk),
-        params: { Bucket: this.config.s3.bucket, Key: key, Body: passthrough, ContentType: contentType },
+        params: { Bucket: this.config.s3.bucket, Key: key, Body: counter, ContentType: contentType },
       }).done();
       return { key, size };
     } catch (error) {
@@ -142,9 +166,16 @@ export class S3StorageService implements StorageService {
   async openRead(key: string): Promise<Readable> {
     const sdk = this.loadSdk();
     const client = this.getClient(sdk);
-    const output = await client.send(
-      new sdk.GetObjectCommand({ Bucket: this.config.s3.bucket, Key: key }),
-    );
+    let output: unknown;
+    try {
+      output = await client.send(
+        new sdk.GetObjectCommand({ Bucket: this.config.s3.bucket, Key: key }),
+      );
+    } catch (error) {
+      if (isNotFound(error)) throw ApiError.notFound({ reason: 'storage_object_not_found', key });
+      this.logger.error(`Falha ao abrir ${key} do S3`, String(error));
+      throw ApiError.storageUnavailable({ backend: 's3', operation: 'open_read' });
+    }
     if (!isRecord(output) || !isRecord(output['Body'])) {
       throw ApiError.notFound({ reason: 'storage_object_not_found', key });
     }

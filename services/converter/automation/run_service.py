@@ -7,16 +7,30 @@ already published stays in the history.
 
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from api.serialization import iso_utc
 from automation.models import AutomationEventRow, AutomationRunRow
 from automation.repository import AutomationRepository
+from automation.types import FeatureDisabled
+from config import settings
 
 TERMINAL = ("succeeded", "partial", "no_changes", "failed", "cancelled", "skipped")
+#: Worker identity recorded on claims made by run-now requests.
+RUN_NOW_WORKER = "api-run-now"
+
+logger = logging.getLogger("automation.run_service")
+
+
+def executor_enabled() -> bool:
+    """True when this process may execute occurrences (AUTOMATION_EXECUTOR_ENABLED)."""
+    return bool(getattr(settings, "automation_executor_enabled", False))
 
 
 class AutomationRunService:
@@ -83,39 +97,83 @@ class AutomationRunService:
         finally:
             session.close()
 
-    def start_async(self, run_id: str, owner_id: str) -> None:
-        """Advance the occurrence in a daemon thread (standalone executor)."""
-        import threading
+    def start_async(self, run_id: str, owner_id: str) -> bool:
+        """Claim the occurrence, then advance it in a daemon thread.
+
+        The claim happens here, before the thread starts, under the same fence
+        rules as the loop. A second trigger, or the loop, then sees a live lease
+        and cannot advance the same occurrence twice (AU1-13).
+
+        Returns True when this call claimed and started the attempt, False when
+        the occurrence was already claimed, finished, or is not this owner's.
+        Raises ``FeatureDisabled`` when the executor flag is off.
+        """
+        if not executor_enabled():
+            raise FeatureDisabled(
+                "Execução de agendamentos está desativada neste processo.",
+            )
+
+        from automation.scheduler import AutomationScheduler
+        from models.db import get_session_factory
+
+        scheduler = AutomationScheduler(worker_id=RUN_NOW_WORKER)
+        session = get_session_factory()()
+        try:
+            lease = scheduler.claim_run(session, run_id=run_id, owner_id=owner_id)
+            session.commit()
+        finally:
+            session.close()
+        if lease is None:
+            return False
 
         thread = threading.Thread(
-            target=self._advance_safely,
-            args=(run_id, owner_id),
+            target=self._advance_leased,
+            args=(run_id, owner_id, lease.fence),
             daemon=True,
             name=f"automation-{run_id[:8]}",
         )
         thread.start()
+        return True
 
-    def _advance_safely(self, run_id: str, owner_id: str) -> None:
+    def _advance_leased(self, run_id: str, owner_id: str, fence: int) -> None:
+        """Advance one claimed attempt while renewing its lease."""
         from automation.executor import AutomationExecutor
+        from automation.loop import _LeaseKeeper
+        from automation.scheduler import AutomationScheduler
 
+        scheduler = AutomationScheduler(worker_id=RUN_NOW_WORKER)
         try:
-            AutomationExecutor().advance(run_id, owner_id)
+            with _LeaseKeeper(scheduler, run_id, fence):
+                AutomationExecutor().advance(run_id, owner_id, fence=fence)
         except Exception as exc:  # noqa: BLE001 - never let a daemon die silently
-            import traceback
+            logger.exception("run-now attempt %s crashed", run_id)
+            self._fail_leased(run_id, owner_id, fence, exc)
 
-            from models.db import get_session_factory
+    @staticmethod
+    def _fail_leased(run_id: str, owner_id: str, fence: int, exc: BaseException) -> None:
+        """Close a crashed attempt, but only if this attempt still owns the fence."""
+        import traceback
 
-            session = get_session_factory()()
-            try:
-                run = session.get(AutomationRunRow, run_id)
-                if run is not None and run.owner_id == owner_id and run.state not in TERMINAL:
-                    run.state = "failed"
-                    run.error_code = "EXECUTOR_INTERNAL_ERROR"
-                    run.error_message = f"{exc}\n{traceback.format_exc(limit=6)}"
-                    run.finished_at = datetime.now(UTC)
-                    session.commit()
-            finally:
-                session.close()
+        from models.db import get_session_factory
+
+        session = get_session_factory()()
+        try:
+            run = session.get(AutomationRunRow, run_id)
+            if (
+                run is not None
+                and run.owner_id == owner_id
+                and run.fence == fence
+                and run.state not in TERMINAL
+            ):
+                run.state = "failed"
+                run.error_code = "EXECUTOR_INTERNAL_ERROR"
+                run.error_message = f"{exc}\n{traceback.format_exc(limit=6)}"
+                run.finished_at = datetime.now(UTC)
+                run.lease_until = None
+                run.lease_owner = None
+                session.commit()
+        finally:
+            session.close()
 
     # ---------------------------------------------------------------- payload
     @staticmethod
@@ -125,7 +183,7 @@ class AutomationRunService:
             "owner_id": run.owner_id,
             "schedule_id": run.schedule_id,
             "schedule_revision": run.schedule_revision,
-            "scheduled_for": run.scheduled_for.isoformat() if run.scheduled_for else None,
+            "scheduled_for": iso_utc(run.scheduled_for),
             "trigger": run.trigger,
             "occurrence_key": run.occurrence_key,
             "state": run.state,
@@ -140,10 +198,10 @@ class AutomationRunService:
                 else None
             ),
             "snapshot": run.snapshot_json,
-            "created_at": run.created_at.isoformat(),
-            "updated_at": run.updated_at.isoformat(),
-            "started_at": run.started_at.isoformat() if run.started_at else None,
-            "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+            "created_at": iso_utc(run.created_at),
+            "updated_at": iso_utc(run.updated_at),
+            "started_at": iso_utc(run.started_at),
+            "finished_at": iso_utc(run.finished_at),
         }
 
     @staticmethod
@@ -153,7 +211,7 @@ class AutomationRunService:
             "sequence": event.sequence,
             "type": event.type,
             "payload": event.payload_json,
-            "created_at": event.created_at.isoformat(),
+            "created_at": iso_utc(event.created_at),
         }
 
 

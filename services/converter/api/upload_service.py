@@ -7,16 +7,27 @@ product ceiling on document size or page count.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
 import uuid
-from datetime import UTC, datetime, timedelta
+from collections.abc import Iterator
+from datetime import UTC, timedelta
+from pathlib import Path
 from typing import Any, BinaryIO
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.batch_service import TERMINAL_ITEM_STATUSES, emit_event, now
+from api.batch_service import (
+    TERMINAL_ITEM_STATUSES,
+    UPLOAD_PHASE_STATUSES,
+    emit_event,
+    now,
+)
 from api.deps import ApiError
+from api.serialization import iso_utc
 from api.service import ConversionService, _normalize_options, _safe_filename
 from config import settings
 from ingestion.registry import probe_input_path
@@ -36,12 +47,61 @@ def _ttl() -> timedelta:
     return timedelta(hours=settings.upload_session_ttl_hours)
 
 
-def _iso(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.isoformat()
+@contextlib.contextmanager
+def _staged_file(storage, key: str, *, suffix: str = "") -> Iterator[Path]:
+    """A filesystem path holding the staged object for the duration of the block.
+
+    Filesystem backends expose their own path. Other backends (object stores)
+    return None from ``local_path``, so they get a temporary copy that is
+    removed on exit. The probe therefore behaves the same on every backend.
+    """
+    local = storage.local_path(key)
+    if local is not None:
+        yield Path(local)
+        return
+    fd, tmp_name = tempfile.mkstemp(prefix="pdf2x-probe-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(storage.get_bytes(key))
+        yield Path(tmp_name)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+
+
+def _reject_upload(
+    session: Session,
+    upload: PublicUploadSessionRow,
+    item: PublicBatchItemRow,
+    exc: ApiError,
+) -> None:
+    """Records why a completed upload was refused and commits that record.
+
+    The item leaves the flow as `upload_failed` (the same terminal upload state
+    `abort` uses), so the batch can still be sealed and the client can read the
+    reason and re-send the file.
+    """
+    error = exc.detail.get("error", {}) if isinstance(exc.detail, dict) else {}
+    item.status = "upload_failed"
+    item.phase = "upload"
+    item.error_json = {
+        "code": error.get("code") or "INVALID_FILE",
+        "message": error.get("message") or "O arquivo enviado foi recusado.",
+    }
+    upload.updated_at = now()
+    batch = session.get(PublicBatchRow, item.batch_id)
+    if batch is not None:
+        batch.version = int(batch.version or 1) + 1
+        emit_event(
+            session,
+            batch,
+            type_="item",
+            item_id=item.id,
+            item_status="upload_failed",
+            message=f"Upload recusado: {item.filename}.",
+            payload={"code": item.error_json["code"]},
+        )
+    session.commit()
 
 
 def expected_parts(expected_bytes: int, part_size: int) -> int:
@@ -88,9 +148,9 @@ class UploadService:
             # Filled in by `get_session`/`put_part`; 0 here is a safe default.
             "parts_received": 0,
             "next_part": 0,
-            "expires_at": _iso(upload.expires_at),
-            "created_at": _iso(upload.created_at),
-            "updated_at": _iso(upload.updated_at),
+            "expires_at": iso_utc(upload.expires_at),
+            "created_at": iso_utc(upload.created_at),
+            "updated_at": iso_utc(upload.updated_at),
         }
         return payload
 
@@ -324,6 +384,15 @@ class UploadService:
             # creating the conversion and marking the session complete must not
             # let a retry create a second one.
             if item.conversion_id:
+                # A converted item is never left in the upload phase. Rows that an
+                # earlier retry-upload left there are repaired to the conversion's
+                # state; the replay itself writes nothing else.
+                if item.status in UPLOAD_PHASE_STATUSES or upload.state != "completed":
+                    if item.status in UPLOAD_PHASE_STATUSES:
+                        item.status = "queued"
+                        item.phase = "conversion"
+                    upload.state = "completed"
+                    session.commit()
                 return {
                     "upload_id": upload.id,
                     "item_id": item.id,
@@ -335,6 +404,11 @@ class UploadService:
 
             if upload.state in {"aborted"}:
                 raise ApiError(409, "UPLOAD_STATE_CONFLICT", "O upload foi abortado.")
+            # Same rule as `put_part`: an expired session cannot be completed, so
+            # no conversion is created from it. The gateway checks this after the
+            # replay above and before the completeness check, and so does this.
+            if upload.expires_at and upload.expires_at.replace(tzinfo=UTC) < now():
+                raise ApiError(410, "UPLOAD_EXPIRED", "A sessão de upload expirou.")
 
             part_size = int(upload.part_size or settings.upload_part_bytes)
             expected_count = expected_parts(int(upload.expected_bytes or 0), part_size)
@@ -385,29 +459,43 @@ class UploadService:
                 )
 
             # Detect the real content: a `.pdf` extension never decides the kind.
-            # The path probe reads the whole file so XLSX (ZIP directory at the
-            # end) and CSV (declared suffix + validated dialect) are recognized.
-            probe = probe_input_path(storage.local_path(staged_key), filename=item.filename)
-            if probe.kind == "unknown":
+            # The probe reads the whole file so XLSX (ZIP directory at the end)
+            # and CSV (declared suffix + validated dialect) are recognized. A
+            # refused document is recorded on the item and its staged object is
+            # removed, so nothing unvalidated stays in storage.
+            suffix = Path(item.filename or "").suffix
+            try:
+                with _staged_file(storage, staged_key, suffix=suffix) as staged_path:
+                    probe = probe_input_path(staged_path, filename=item.filename)
+                    if probe.kind == "unknown":
+                        raise ApiError(
+                            400,
+                            "INVALID_FILE",
+                            "O arquivo enviado não é um PDF, imagem ou planilha válida.",
+                        )
+                    if probe.kind == "spreadsheet" and not probe.supported:
+                        raise ApiError(
+                            400,
+                            getattr(probe, "reason_code", None) or "INVALID_FILE",
+                            probe.reason or "Planilha inválida.",
+                        )
+                    if probe.kind == "image" and not probe.supported:
+                        raise ApiError(
+                            415,
+                            "CODEC_UNAVAILABLE",
+                            f"O codec para {probe.format} não está instalado nesta máquina.",
+                            details={"format": probe.format},
+                        )
+                    normalized = _normalize_options(
+                        item.options_json or {}, probe.kind, allow_stamped=True
+                    )
+                    page_count = _count_pages(staged_path) if probe.kind == "pdf" else None
+            except Exception as exc:
                 storage.delete(staged_key)
-                raise ApiError(
-                    400,
-                    "INVALID_FILE",
-                    "O arquivo enviado não é um PDF, imagem ou planilha válida.",
-                )
-            if probe.kind == "spreadsheet" and not probe.supported:
-                storage.delete(staged_key)
-                raise ApiError(400, probe.reason_code or "INVALID_FILE", probe.reason or "Planilha inválida.")
-            if probe.kind == "image" and not probe.supported:
-                storage.delete(staged_key)
-                raise ApiError(
-                    415,
-                    "CODEC_UNAVAILABLE",
-                    f"O codec para {probe.format} não está instalado nesta máquina.",
-                    details={"format": probe.format},
-                )
+                if isinstance(exc, ApiError):
+                    _reject_upload(session, upload, item, exc)
+                raise
 
-            normalized = _normalize_options(item.options_json or {}, probe.kind, allow_stamped=True)
             filename = _safe_filename(item.filename, default_ext=probe.format)
             extension = _extension_for_probe(probe)
             final_key = f"documents/{owner_id}/{expected_sha}{extension}"
@@ -415,12 +503,6 @@ class UploadService:
                 storage.delete(staged_key)
             else:
                 storage.move(staged_key, final_key)
-
-            page_count = None
-            if probe.kind == "pdf":
-                local = storage.local_path(final_key)
-                if local is not None:
-                    page_count = _count_pages(local)
 
             result = ConversionService().create_from_stored(
                 owner_id=owner_id,

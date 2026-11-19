@@ -146,10 +146,19 @@ export class AutomationService {
     return this.proxy.json(`/internal/v1/schedule-runs/${encodeURIComponent(runId)}`, { ownerId });
   }
 
-  runEvents(ownerId: string, runId: string): Promise<unknown> {
-    return this.proxy.json(`/internal/v1/schedule-runs/${encodeURIComponent(runId)}/events`, {
-      ownerId,
-    });
+  /**
+   * Run events after `after`. The engine resumes from the `Last-Event-ID`
+   * header; `after` in the query is forwarded too, so both engine forms agree.
+   */
+  runEvents(ownerId: string, runId: string, after: number | null = null): Promise<unknown> {
+    const query = after === null ? '' : `?after=${after}`;
+    return this.proxy.json(
+      `/internal/v1/schedule-runs/${encodeURIComponent(runId)}/events${query}`,
+      {
+        ownerId,
+        ...(after === null ? {} : { headers: { 'Last-Event-ID': String(after) } }),
+      },
+    );
   }
 
   cancelRun(ownerId: string, runId: string): Promise<unknown> {

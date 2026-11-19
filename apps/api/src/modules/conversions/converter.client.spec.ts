@@ -174,4 +174,64 @@ describe('ConverterClient', () => {
       capabilities: { ocr: true },
     });
   });
+
+  /** A body that never finishes until the request is aborted. */
+  function stalledBody(signal: AbortSignal | null | undefined): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        signal?.addEventListener('abort', () => {
+          const error = new Error('The operation was aborted');
+          error.name = 'AbortError';
+          controller.error(error);
+        });
+      },
+    });
+  }
+
+  it('keeps the deadline armed while a JSON body is read (A-26)', async () => {
+    fetchMock.mockImplementation(
+      (_url, init) =>
+        Promise.resolve(
+          new Response(stalledBody(init?.signal), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        ),
+    );
+
+    const error = await captureApiErrorAsync(() => client.status('run-stalled-body'));
+
+    expect(error.status).toBe(503);
+    expect(error.details).toMatchObject({ reason: 'timeout', timeout_ms: 25 });
+  });
+
+  it('keeps the deadline armed while a download body is streamed (A-26)', async () => {
+    fetchMock.mockImplementation(
+      (_url, init) =>
+        Promise.resolve(
+          new Response(stalledBody(init?.signal), {
+            status: 200,
+            headers: { 'content-type': 'application/octet-stream' },
+          }),
+        ),
+    );
+
+    const payload = await client.download('run-stalled-download');
+    await expect(
+      (async () => {
+        for await (const _chunk of payload.stream) {
+          // drain until the deadline aborts the body
+        }
+      })(),
+    ).rejects.toThrow();
+  });
+
+  it('returns the engine cancelled flag (A-17)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ run_id: 'run-1', cancelled: false }));
+    await expect(client.cancel('run-1')).resolves.toEqual({ cancelled: false });
+    expect(fetchMock.mock.calls[0][0]).toBe('http://engine.local/internal/v1/jobs/run-1/cancel');
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ run_id: 'run-1', cancelled: true }));
+    await expect(client.cancel('run-1')).resolves.toEqual({ cancelled: true });
+  });
 });

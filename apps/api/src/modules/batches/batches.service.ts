@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
 import {
   BATCH_LIST_DEFAULT_LIMIT,
   BATCH_LIST_MAX_LIMIT,
@@ -126,6 +126,18 @@ function effectiveStatus(row: BatchItemRow): BatchItemStatus {
   return 'processing';
 }
 
+/** Upload states from which the bytes can still be resumed. */
+const UPLOAD_RESUMABLE_STATUSES: readonly BatchItemStatus[] = [
+  'pending_upload',
+  'uploading',
+  'upload_failed',
+];
+
+/** True when the item's outcome is final, judged by its conversion, not the stored status. */
+function isFinishedItem(row: BatchItemRow): boolean {
+  return (TERMINAL_ITEM_STATUSES as readonly string[]).includes(effectiveStatus(row));
+}
+
 function batchStatus(
   counts: BatchCounts,
   sealed: boolean,
@@ -184,7 +196,7 @@ export class BatchesService {
     private readonly prisma: PrismaService,
     private readonly config: AppConfigService,
     private readonly events: BatchEventsService,
-    private readonly conversions: ConversionsService,
+    @Inject(forwardRef(() => ConversionsService)) private readonly conversions: ConversionsService,
   ) {}
 
   /* ---------------------------------- create -------------------------- */
@@ -254,6 +266,14 @@ export class BatchesService {
       where: { id: row.id },
       data: { status, version: { increment: 1 } },
     })) as BatchRow;
+    // Every roll-up change is announced, including those caused by conversions
+    // that finished on their own, so the batch stream never goes silent.
+    await this.events.record(row.id, {
+      type: 'batch',
+      status,
+      message: 'Estado do lote atualizado.',
+      payload: { counts },
+    });
     return updated;
   }
 
@@ -275,6 +295,8 @@ export class BatchesService {
 
     const counts = emptyCounts();
     let uploadPhase = 0;
+    let uploadFailed = 0;
+    let storedCancelled = 0;
     for (const row of stored) {
       const count = row._count._all;
       counts.total_items += count;
@@ -282,11 +304,13 @@ export class BatchesService {
         counts[row.status as 'pending_upload' | 'uploading'] += count;
         uploadPhase += count;
       } else if (row.status === 'upload_failed') {
-        // Counts as failed for the user but stays resumable; not a terminal
-        // conversion outcome, so it is tracked in the upload bucket.
-        counts.failed -= 0;
+        // Definitive for the batch: it is a failed, terminal item and does not
+        // block sealing. It has no conversion, so it is counted only here.
+        counts.failed += count;
+        uploadFailed += count;
       } else if (row.status === 'cancelled') {
         counts.cancelled += count;
+        storedCancelled += count;
       }
     }
 
@@ -316,8 +340,11 @@ export class BatchesService {
       }
     }
 
-    // Items still uploading (or failed at upload) have no conversion yet.
-    const withoutConversion = counts.total_items - uploadPhase - counts.cancelled - conversionTotal;
+    // Items still uploading (or failed at upload) have no conversion yet. Only
+    // the stored cancellations are subtracted: conversion-level cancellations
+    // are already inside conversionTotal.
+    const withoutConversion =
+      counts.total_items - uploadPhase - uploadFailed - storedCancelled - conversionTotal;
     if (withoutConversion > 0) counts.pending_upload += withoutConversion;
 
     return counts;
@@ -535,35 +562,73 @@ export class BatchesService {
       BATCH_LIST_MAX_LIMIT,
     );
 
-    const where: Prisma.BatchItemWhereInput = { batchId };
+    // The status is derived from the conversion, so it is filtered here, in
+    // scan order, before the page boundary. Filtering after a fixed-size read
+    // returned short pages and a cursor that did not match what was shown.
+    const scan = Math.max(limit, 100);
+    const items: BatchItem[] = [];
+    let position: { ordinal: number; id: string } | null = null;
     const decoded = decodeCursor(query.cursor ?? null);
     if (decoded) {
-      const ordinal = typeof decoded['ordinal'] === 'number' ? decoded['ordinal'] : 0;
-      const id = typeof decoded['id'] === 'string' ? decoded['id'] : '';
-      where.OR = [
-        { ordinal: { gt: ordinal } },
-        { AND: [{ ordinal }, { id: { gt: id } }] },
-      ];
+      position = {
+        ordinal: typeof decoded['ordinal'] === 'number' ? decoded['ordinal'] : 0,
+        id: typeof decoded['id'] === 'string' ? decoded['id'] : '',
+      };
+    }
+    let lastIncluded: BatchItemRow | null = null as BatchItemRow | null;
+    let more = false;
+
+    scanning: for (;;) {
+      const where: Prisma.BatchItemWhereInput = { batchId };
+      if (position) {
+        where.OR = [
+          { ordinal: { gt: position.ordinal } },
+          { AND: [{ ordinal: position.ordinal }, { id: { gt: position.id } }] },
+        ];
+      }
+      const rows = (await this.prisma.batchItem.findMany({
+        where,
+        include: { conversion: { select: { status: true } } },
+        orderBy: [{ ordinal: 'asc' }, { id: 'asc' }],
+        take: scan,
+      })) as BatchItemRow[];
+
+      for (const row of rows) {
+        position = { ordinal: row.ordinal, id: row.id };
+        const payload = this.itemPayload(row);
+        if (query.status && payload.status !== query.status) continue;
+        if (items.length === limit) {
+          // A matching item exists beyond the page: the cursor is needed.
+          more = true;
+          break scanning;
+        }
+        items.push(payload);
+        lastIncluded = row;
+      }
+      if (rows.length < scan) break;
     }
 
-    const rows = (await this.prisma.batchItem.findMany({
-      where,
-      include: { conversion: { select: { status: true } } },
-      orderBy: [{ ordinal: 'asc' }, { id: 'asc' }],
-      take: limit + 1,
-    })) as BatchItemRow[];
-
-    const hasMore = rows.length > limit;
-    const page = hasMore ? rows.slice(0, limit) : rows;
-    let items = page.map((row) => this.itemPayload(row));
-    if (query.status) items = items.filter((item) => item.status === query.status);
-
-    const last = page[page.length - 1];
     return {
       items,
       next_cursor:
-        hasMore && last ? encodeCursor({ ordinal: last.ordinal, id: last.id }) : null,
+        more && lastIncluded
+          ? encodeCursor({ ordinal: lastIncluded.ordinal, id: lastIncluded.id })
+          : null,
     };
+  }
+
+  /** Item lookup by its stable client key: one unique read, never a page scan. */
+  async findItemByClientId(
+    user: AuthenticatedUser,
+    batchId: string,
+    clientItemId: string,
+  ): Promise<BatchItem | null> {
+    await this.load(user, batchId);
+    const row = (await this.prisma.batchItem.findUnique({
+      where: { batchId_clientItemId: { batchId, clientItemId } },
+      include: { conversion: { select: { status: true } } },
+    })) as BatchItemRow | null;
+    return row ? this.itemPayload(row) : null;
   }
 
   itemPayload(row: BatchItemRow): BatchItem {
@@ -684,12 +749,15 @@ export class BatchesService {
       });
     }
 
-    const active = (await this.prisma.batchItem.findMany({
+    const candidates = (await this.prisma.batchItem.findMany({
       where: { batchId, status: { notIn: [...TERMINAL_ITEM_STATUSES] } },
-      select: { id: true, conversionId: true },
-    })) as Array<{ id: string; conversionId: string | null }>;
+      include: { conversion: { select: { status: true } } },
+    })) as BatchItemRow[];
 
-    for (const item of active) {
+    for (const item of candidates) {
+      // A stored "queued" item whose conversion already finished is terminal:
+      // cancelling must not overwrite its real outcome.
+      if (isFinishedItem(item)) continue;
       if (item.conversionId) {
         try {
           await this.conversions.cancel(user, item.conversionId);
@@ -722,7 +790,7 @@ export class BatchesService {
   async cancelItem(user: AuthenticatedUser, batchId: string, itemId: string): Promise<BatchItem> {
     const batch = await this.load(user, batchId);
     const item = await this.loadItem(batchId, itemId);
-    if ((TERMINAL_ITEM_STATUSES as readonly string[]).includes(item.status)) {
+    if (isFinishedItem(item)) {
       return this.itemPayload(item);
     }
 
@@ -759,9 +827,20 @@ export class BatchesService {
     scope: 'upload' | 'conversion',
   ) {
     const batch = await this.load(user, batchId);
+    if (batch.cancelRequestedAt) {
+      throw ApiError.conflict(ERROR_CODES.BATCH_CANCELLED, { batch_id: batchId });
+    }
     const item = await this.loadItem(batchId, itemId);
 
     if (scope === 'upload') {
+      // Only an upload that has not finished can be resumed.
+      if (!UPLOAD_RESUMABLE_STATUSES.includes(effectiveStatus(item))) {
+        throw ApiError.conflict(ERROR_CODES.UPLOAD_STATE_CONFLICT, {
+          item_id: itemId,
+          status: effectiveStatus(item),
+          reason: 'upload_not_resumable',
+        });
+      }
       if (!item.uploadId) {
         throw ApiError.conflict(ERROR_CODES.UPLOAD_NOT_FOUND, { item_id: itemId });
       }
@@ -794,7 +873,8 @@ export class BatchesService {
     if (!item.conversionId) {
       throw ApiError.conflict(ERROR_CODES.NOT_READY, { item_id: itemId });
     }
-    if (!(TERMINAL_ITEM_STATUSES as readonly string[]).includes(item.status)) {
+    // The conversion's real status decides whether it is still running.
+    if (!isFinishedItem(item)) {
       throw ApiError.conflict(ERROR_CODES.CONVERSION_BUSY, { item_id: itemId });
     }
 
@@ -827,15 +907,18 @@ export class BatchesService {
 
   /* ------------------------------ item updates ------------------------ */
 
-  /** Called by the upload completion and by the tracker. */
+  /**
+   * Called by the upload completion. Returns false, and changes nothing, when
+   * the item was cancelled in the meantime: a cancelled item stays cancelled.
+   */
   async markItemQueued(
     batchId: string,
     itemId: string,
     conversionId: string,
     pages: number | null,
-  ): Promise<void> {
-    await this.prisma.batchItem.update({
-      where: { id: itemId },
+  ): Promise<boolean> {
+    const result = await this.prisma.batchItem.updateMany({
+      where: { id: itemId, status: { not: 'cancelled' } },
       data: {
         conversionId,
         status: 'queued',
@@ -845,6 +928,7 @@ export class BatchesService {
           : {}),
       },
     });
+    if (result.count === 0) return false;
     const batch = (await this.prisma.batch.findUnique({ where: { id: batchId } })) as BatchRow | null;
     await this.events.record(batchId, {
       type: 'item',
@@ -854,6 +938,37 @@ export class BatchesService {
       message: 'Upload concluído e conversão enfileirada.',
       payload: { conversion_id: conversionId },
     });
+    return true;
+  }
+
+  /**
+   * An upload that cannot become a conversion (for example, options that the
+   * content does not admit). Recoverable: the same upload identity can resume.
+   */
+  async markItemUploadFailed(
+    batchId: string,
+    itemId: string,
+    error: { code: string; message: string },
+  ): Promise<void> {
+    const result = await this.prisma.batchItem.updateMany({
+      where: { id: itemId, status: { notIn: [...TERMINAL_ITEM_STATUSES] } },
+      data: {
+        status: 'upload_failed',
+        phase: 'upload',
+        errorJson: JSON.stringify({ code: error.code, message: error.message }),
+      },
+    });
+    if (result.count === 0) return;
+    const batch = (await this.prisma.batch.findUnique({ where: { id: batchId } })) as BatchRow | null;
+    await this.events.record(batchId, {
+      type: 'item',
+      itemId,
+      status: batch?.status ?? 'processing',
+      itemStatus: 'upload_failed',
+      message: 'Envio do arquivo recusado.',
+      payload: { code: error.code },
+    });
+    await this.touchBatch(batchId);
   }
 
   /** Recomputes the batch roll-up after an item changed state. */
@@ -861,6 +976,28 @@ export class BatchesService {
     const row = (await this.prisma.batch.findUnique({ where: { id: batchId } })) as BatchRow | null;
     if (!row) return;
     await this.refreshStatus(row);
+  }
+
+  /**
+   * Called when an item's conversion reaches a terminal status: records the
+   * item outcome and recomputes the batch roll-up, so the batch stream reports
+   * it. The conversion tracker is the expected caller.
+   */
+  async onConversionTerminal(conversionId: string): Promise<void> {
+    const item = (await this.prisma.batchItem.findFirst({
+      where: { conversionId },
+      include: { conversion: { select: { status: true } } },
+    })) as BatchItemRow | null;
+    if (!item) return;
+    const batch = (await this.prisma.batch.findUnique({ where: { id: item.batchId } })) as BatchRow | null;
+    await this.events.record(item.batchId, {
+      type: 'item',
+      itemId: item.id,
+      status: batch?.status ?? 'processing',
+      itemStatus: effectiveStatus(item),
+      message: `Item finalizado: ${effectiveStatus(item)}.`,
+    });
+    await this.touchBatch(item.batchId);
   }
 
   private itemFingerprint(

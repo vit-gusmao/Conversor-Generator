@@ -1,5 +1,7 @@
 /** Typed API client for `/api/v1`. */
 
+import { desktopDeviceId } from './platform';
+
 export const DEFAULT_API_BASE = '/api/v1';
 
 export class ApiError extends Error {
@@ -23,6 +25,8 @@ export interface ApiRequestOptions extends Omit<RequestInit, 'body'> {
   /** Explicit bearer token, overriding the registered getter. */
   token?: string | null;
   query?: Record<string, string | number | boolean | null | undefined>;
+  /** Cancels the request; an aborted request rejects with the DOMException AbortError. */
+  signal?: AbortSignal | null;
 }
 
 type TokenGetter = () => string | null | undefined;
@@ -83,6 +87,11 @@ function writeCookie(name: string, value: string): void {
  * The server also keeps an HttpOnly cookie for headerless requests.
  */
 export function getOrCreateDeviceId(): string {
+  // Desktop: the host owns the identity (shared with its granted roots, F4).
+  // localStorage and cookies are not consulted or written in that case.
+  const fromDesktop = desktopDeviceId();
+  if (fromDesktop) return fromDesktop;
+
   const storage = safeLocalStorage();
   const existing = storage?.getItem(DEVICE_ID_KEY) || readCookie(DEVICE_COOKIE);
   if (existing) {
@@ -196,7 +205,7 @@ async function parseErrorResponse(response: Response): Promise<ApiError> {
 }
 
 async function execute(path: string, options: ApiRequestOptions): Promise<Response> {
-  const { json, token, query, headers, body, ...rest } = options;
+  const { json, token, query, headers, body, signal, ...rest } = options;
   const merged = new Headers(authHeaders(token));
   if (headers) {
     new Headers(headers).forEach((value, key) => merged.set(key, value));
@@ -214,6 +223,8 @@ async function execute(path: string, options: ApiRequestOptions): Promise<Respon
       ...rest,
       headers: merged,
       body: requestBody,
+      // Aborting this signal rejects with an AbortError (rethrown below).
+      signal,
     });
   } catch (cause) {
     if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;

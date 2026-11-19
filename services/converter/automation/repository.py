@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from automation.models import (
@@ -100,10 +100,12 @@ class AutomationRepository:
         next_run_at: datetime | None = None,
         recompute_next_run: bool = False,
     ) -> AutomationScheduleRow | None:
-        """Optimistic edit: bumps ``revision``; stale expectations return None."""
-        schedule = self.get_schedule(session, schedule_id=schedule_id, owner_id=owner_id)
-        if schedule is None or schedule.revision != expected_revision:
-            return None
+        """Optimistic edit: bumps ``revision``; stale expectations return None.
+
+        The revision check is part of the UPDATE itself (``WHERE revision = ?``),
+        so two writers holding the same expectation cannot both succeed (S4). A
+        read-then-write check would let the second writer slip in between.
+        """
         allowed = {
             "name",
             "rule_json",
@@ -116,12 +118,26 @@ class AutomationRepository:
             "anchor_at",
             "source_id",
         }
-        for key, value in changes.items():
-            if key in allowed:
-                setattr(schedule, key, value)
-        schedule.revision = expected_revision + 1
+        values: dict[str, Any] = {key: value for key, value in changes.items() if key in allowed}
+        values["revision"] = expected_revision + 1
         if recompute_next_run:
-            schedule.next_run_at = next_run_at
+            values["next_run_at"] = next_run_at
+        result = session.execute(
+            update(AutomationScheduleRow)
+            .where(
+                AutomationScheduleRow.id == schedule_id,
+                AutomationScheduleRow.owner_id == owner_id,
+                AutomationScheduleRow.archived.is_(False),
+                AutomationScheduleRow.revision == expected_revision,
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            return None
+        schedule = session.get(AutomationScheduleRow, schedule_id)
+        if schedule is not None:
+            session.refresh(schedule)
         return schedule
 
     def pause_schedule(

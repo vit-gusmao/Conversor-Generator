@@ -1,4 +1,6 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
+
+import { BatchesModule } from '../batches/batches.module';
 
 import { ConversionEventBus } from './conversion-event-bus.service';
 import { ConversionEventsService } from './conversion-events.service';
@@ -8,6 +10,7 @@ import { InternalHooksController } from './internal-hooks.controller';
 import { InternalTokenGuard } from './internal-token.guard';
 
 @Module({
+  imports: [forwardRef(() => BatchesModule)],
   controllers: [ConversionEventsController, InternalHooksController],
   providers: [
     ConversionEventBus,

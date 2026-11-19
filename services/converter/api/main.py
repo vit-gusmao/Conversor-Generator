@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.batch_routes import router as batch_router
+from api.desktop_guard import DesktopHostGuard
 from api.internal_routes import router as internal_router
 from api.knowledge_routes import router as knowledge_router
 from api.public_routes import router as public_router
@@ -101,20 +102,23 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.origins or ["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=[
-            "X-Device-Id",
-            "Content-Disposition",
-            "Last-Event-ID",
-            "Retry-After",
-            "X-Request-ID",
-        ],
-    )
+    # Desktop mode is same-origin (the SPA is served by this process): no CORS
+    # at all, so no wildcard or foreign origin can read responses.
+    if not settings.desktop_host_enabled:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.origins or ["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=[
+                "X-Device-Id",
+                "Content-Disposition",
+                "Last-Event-ID",
+                "Retry-After",
+                "X-Request-ID",
+            ],
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException):  # noqa: ANN001
@@ -199,6 +203,15 @@ def create_app() -> FastAPI:
             if full_path and candidate.is_file() and WEB_DIST.resolve() in candidate.parents:
                 return FileResponse(candidate)
             return FileResponse(WEB_DIST / "index.html")
+
+    if settings.desktop_host_enabled and settings.desktop_bootstrap_secret:
+        # Registered last so it is the outermost middleware: nothing runs before
+        # the host credential, Host and Origin checks pass.
+        app.add_middleware(
+            DesktopHostGuard,
+            secret=settings.desktop_bootstrap_secret,
+            enabled=True,
+        )
 
     return app
 

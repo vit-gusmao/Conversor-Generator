@@ -201,7 +201,7 @@ def grant_root(
     canonical_path = str(payload.get("canonical_path") or "").strip()
     if not owner_id or not canonical_path:
         raise ApiError(400, "INVALID_PAYLOAD", "owner_id e canonical_path são obrigatórios.")
-    return SourceService().grant_root(
+    created = SourceService().grant_root(
         session,
         owner_id=owner_id,
         canonical_path=canonical_path,
@@ -210,6 +210,9 @@ def grant_root(
         label=payload.get("label"),
         grant_channel=str(payload.get("grant_channel") or "internal"),
     )
+    # Commit before the 201: the grant must be durable when the client sees it.
+    session.commit()
+    return created
 
 
 @internal_router.delete("/source-roots/{root_id}")
@@ -224,6 +227,7 @@ def revoke_root(
     revoked = SourceService().revoke_root(session, root_id=root_id, owner_id=x_owner_id)
     if not revoked:
         raise ApiError(404, "ROOT_NOT_FOUND", "Raiz inexistente para este dono.")
+    session.commit()
     return {"revoked": True}
 
 

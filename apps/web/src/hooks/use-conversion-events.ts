@@ -87,6 +87,11 @@ export type StreamTransport = 'fetch' | 'eventsource' | null;
 
 export interface UseConversionEventsOptions {
   enabled?: boolean;
+  /**
+   * The run the page is showing. Events of another run (a previous attempt that
+   * the replayed stream still carries) are ignored, and cannot finish the stream.
+   */
+  runId?: string | null;
   initialLastEventId?: string | null;
   /** How many events to keep in memory (the log shows the newest ones). */
   maxEvents?: number;
@@ -110,12 +115,20 @@ export interface UseConversionEventsResult {
 
 const MAX_RECONNECT_ATTEMPTS = 8;
 
+/** Adds `run_id` so the server can scope the stream to one run (ignored if unsupported). */
+function withRunId(url: string, runId: string | null | undefined): string {
+  if (!runId) return url;
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}run_id=${encodeURIComponent(runId)}`;
+}
+
 export function useConversionEvents(
   conversionId: string | null | undefined,
   options: UseConversionEventsOptions = {},
 ): UseConversionEventsResult {
   const {
     enabled = true,
+    runId = null,
     initialLastEventId = null,
     maxEvents = 50,
     baseDelayMs = 800,
@@ -140,7 +153,8 @@ export function useConversionEvents(
   onReconnectRef.current = onReconnect;
   maxEventsRef.current = maxEvents;
 
-  // A different conversion means a different event stream.
+  // A different conversion, or a new run of the same conversion, starts a new
+  // event log: nothing from the previous stream may stay visible.
   useEffect(() => {
     lastIdRef.current = initialLastEventId;
     setLastEventId(initialLastEventId);
@@ -149,13 +163,16 @@ export function useConversionEvents(
     setError(null);
     setReconnectAttempts(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversionId]);
+  }, [conversionId, runId]);
 
   useEffect(() => {
     if (!enabled || !conversionId) {
       setConnection('idle');
       return;
     }
+
+    // Captured per run: a retry changes `runId` and restarts this effect.
+    const expectedRunId = runId;
 
     let cancelled = false;
     let finished = false;
@@ -205,6 +222,9 @@ export function useConversionEvents(
 
       const parsed = parseConversionEvent(frame.data);
       if (!parsed) return;
+      // Another run's event (e.g. the previous attempt's terminal `failed`) must
+      // neither be shown nor finish this stream.
+      if (expectedRunId && parsed.run_id && parsed.run_id !== expectedRunId) return;
 
       const nextId = frame.id ?? (Number.isFinite(parsed.sequence) ? String(parsed.sequence) : lastIdRef.current);
       lastIdRef.current = nextId;
@@ -243,10 +263,13 @@ export function useConversionEvents(
 
       try {
         const es = new EventSource(
-          conversionEventsUrl(conversionId, {
-            lastEventId: lastIdRef.current,
-            accessToken: resolveToken(),
-          }),
+          withRunId(
+            conversionEventsUrl(conversionId, {
+              lastEventId: lastIdRef.current,
+              accessToken: resolveToken(),
+            }),
+            expectedRunId,
+          ),
         );
         source = es;
 
@@ -300,7 +323,7 @@ export function useConversionEvents(
         if (lastIdRef.current) headers['Last-Event-ID'] = lastIdRef.current;
 
         const response = await fetch(
-          conversionEventsUrl(conversionId, { lastEventId: lastIdRef.current }),
+          withRunId(conversionEventsUrl(conversionId, { lastEventId: lastIdRef.current }), expectedRunId),
           {
             method: 'GET',
             headers,
@@ -348,7 +371,7 @@ export function useConversionEvents(
       releaseTransport();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversionId, enabled]);
+  }, [conversionId, enabled, runId]);
 
   return {
     events,

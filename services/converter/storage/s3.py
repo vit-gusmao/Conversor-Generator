@@ -13,6 +13,22 @@ from config import settings
 from .base import Storage, StoredObject
 
 
+class _HashingReader:
+    """File-like wrapper that hashes and counts bytes as boto3 reads them."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._stream.read(size)
+        if chunk:
+            self.digest.update(chunk)
+            self.size += len(chunk)
+        return chunk
+
+
 class S3Storage(Storage):
     backend = "s3"
 
@@ -80,25 +96,16 @@ class S3Storage(Storage):
         content_type: str = "application/octet-stream",
     ) -> StoredObject:
         """Multipart upload driven by boto3; bounded memory for large files."""
-        digest = hashlib.sha256()
-        total = 0
-
-        def _hashed():
-            nonlocal total
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    return
-                digest.update(chunk)
-                total += len(chunk)
-                yield chunk
-
+        reader = _HashingReader(stream)
         # boto3 picks multipart automatically for file-like objects.
         self._client.upload_fileobj(
-            _hashed(), self.bucket, key, ExtraArgs={"ContentType": content_type}
+            reader, self.bucket, key, ExtraArgs={"ContentType": content_type}
         )
         return StoredObject(
-            key=key, size_bytes=total, sha256=digest.hexdigest(), content_type=content_type
+            key=key,
+            size_bytes=reader.size,
+            sha256=reader.digest.hexdigest(),
+            content_type=content_type,
         )
 
     def compose(

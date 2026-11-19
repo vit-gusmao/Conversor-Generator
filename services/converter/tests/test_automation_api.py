@@ -14,6 +14,14 @@ from openpyxl import Workbook
 INTERNAL = {"x-internal-token": "test-internal-token"}
 
 
+@pytest.fixture(autouse=True)
+def _executor_enabled(monkeypatch):
+    """Run-now is refused when AUTOMATION_EXECUTOR_ENABLED is off (AU1-13)."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "automation_executor_enabled", True)
+
+
 def _session(api_client) -> dict:
     token = api_client.post("/api/v1/auth/anonymous", json={}).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
@@ -348,3 +356,117 @@ def _manual_occurrence_for(schedule_id: str, owner_id: str, key: str) -> str:
         return run.id
     finally:
         session.close()
+
+
+def test_run_now_queues_without_thread_when_executor_disabled(api_client, tmp_path: Path, monkeypatch):
+    """Flag off: the occurrence is queued for an external runner, no thread starts."""
+    from automation.run_service import AutomationRunService
+    from config import settings
+    from models.db import AutomationRunRow, get_session_factory
+
+    monkeypatch.setattr(settings, "automation_executor_enabled", False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        AutomationRunService,
+        "start_async",
+        lambda self, run_id, owner_id: calls.append(run_id) or True,
+    )
+
+    owner, source_id, _ = _source(api_client, tmp_path)
+    schedule = api_client.post(
+        "/api/v1/schedules", json=_schedule_body(source_id), headers=owner["headers"]
+    ).json()
+    response = api_client.post(
+        f"/api/v1/schedules/{schedule['id']}/run-now",
+        headers={**owner["headers"], "Idempotency-Key": uuid.uuid4().hex},
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["executor_active"] is False
+    assert body["state"] == "queued"
+    assert calls == []
+
+    session = get_session_factory()()
+    try:
+        run = session.get(AutomationRunRow, body["run_id"])
+        assert run.state == "queued"
+        assert run.lease_until is None
+    finally:
+        session.close()
+
+
+def test_run_now_starts_executor_when_enabled(api_client, tmp_path: Path, monkeypatch):
+    from automation.run_service import AutomationRunService
+
+    calls: list[str] = []
+    real_start = AutomationRunService.start_async
+
+    def spy(self, run_id, owner_id):
+        calls.append(run_id)
+        return real_start(self, run_id, owner_id)
+
+    monkeypatch.setattr(AutomationRunService, "start_async", spy)
+
+    owner, source_id, root = _source(api_client, tmp_path)
+    (root / "docs" / "plan.xlsx").write_bytes(_xlsx("ligado"))
+    schedule = api_client.post(
+        "/api/v1/schedules", json=_schedule_body(source_id), headers=owner["headers"]
+    ).json()
+    response = api_client.post(
+        f"/api/v1/schedules/{schedule['id']}/run-now",
+        headers={**owner["headers"], "Idempotency-Key": uuid.uuid4().hex},
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["executor_active"] is True
+    assert calls == [body["run_id"]]
+
+
+def test_run_now_maps_feature_disabled_to_queued_202(api_client, tmp_path: Path, monkeypatch):
+    """If the executor refuses at start time, the request still answers 202 (never 500)."""
+    from automation.run_service import AutomationRunService
+    from automation.types import FeatureDisabled
+
+    def refuse(self, run_id, owner_id):
+        raise FeatureDisabled()
+
+    monkeypatch.setattr(AutomationRunService, "start_async", refuse)
+
+    owner, source_id, _ = _source(api_client, tmp_path)
+    schedule = api_client.post(
+        "/api/v1/schedules", json=_schedule_body(source_id), headers=owner["headers"]
+    ).json()
+    response = api_client.post(
+        f"/api/v1/schedules/{schedule['id']}/run-now",
+        headers={**owner["headers"], "Idempotency-Key": uuid.uuid4().hex},
+    )
+    assert response.status_code == 202, response.text
+    assert response.json()["executor_active"] is False
+    assert response.json()["state"] == "queued"
+
+
+def test_internal_run_now_queues_when_executor_disabled(api_client, tmp_path: Path, monkeypatch):
+    from automation.run_service import AutomationRunService
+    from config import settings
+
+    monkeypatch.setattr(settings, "automation_executor_enabled", False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        AutomationRunService,
+        "start_async",
+        lambda self, run_id, owner_id: calls.append(run_id) or True,
+    )
+
+    owner, source_id, _ = _source(api_client, tmp_path)
+    schedule = api_client.post(
+        "/api/v1/schedules", json=_schedule_body(source_id), headers=owner["headers"]
+    ).json()
+    response = api_client.post(
+        f"/internal/v1/schedules/{schedule['id']}/run-now",
+        headers={**INTERNAL, "x-owner-id": owner["id"], "Idempotency-Key": uuid.uuid4().hex},
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["executor_active"] is False
+    assert body["state"] == "queued"
+    assert calls == []

@@ -20,6 +20,10 @@ export class EngineProxyService {
     return this.config.converterInternalUrl.replace(/\/+$/, '');
   }
 
+  private get timeoutMs(): number {
+    return this.config.converterTimeoutMs;
+  }
+
   private get headers(): Record<string, string> {
     return {
       'x-internal-token': this.config.converterInternalToken,
@@ -30,7 +34,8 @@ export class EngineProxyService {
 
   async runIdFor(userId: string, conversionId: string): Promise<string> {
     const row = await this.prisma.conversion.findFirst({
-      where: { id: conversionId, ownerId: userId },
+      // A soft-deleted conversion is gone for its owner: no run may be reached through it.
+      where: { id: conversionId, ownerId: userId, deletedAt: null },
       select: {
         activeRunId: true,
         runs: { orderBy: { attempt: 'desc' }, take: 1, select: { id: true } },
@@ -42,6 +47,10 @@ export class EngineProxyService {
     return runId;
   }
 
+  /**
+   * JSON call bounded by `CONVERTER_TIMEOUT_MS`. The deadline covers the body
+   * read too. A 204 or an empty body yields `undefined` (DELETE routes).
+   */
   async json<T>(
     path: string,
     options: {
@@ -51,9 +60,8 @@ export class EngineProxyService {
       headers?: Record<string, string>;
     } = {},
   ): Promise<T> {
-    let response: globalThis.Response;
-    try {
-      response = await fetch(`${this.base}${path}`, {
+    return this.withDeadline(async (signal) => {
+      const response = await fetch(`${this.base}${path}`, {
         method: options.method ?? 'GET',
         headers: {
           ...this.headers,
@@ -61,47 +69,65 @@ export class EngineProxyService {
           ...(options.headers ?? {}),
         },
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal,
       });
-    } catch (error) {
-      throw ApiError.converterUnavailable({ cause: String(error) });
-    }
-    if (!response.ok) {
-      throw await this.toError(response);
-    }
-    return (await response.json()) as T;
+      if (!response.ok) {
+        throw await this.toError(response);
+      }
+      if (response.status === 204) return undefined as T;
+      const text = await response.text();
+      if (!text) return undefined as T;
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw ApiError.converterUnavailable({
+          reason: 'invalid_json_from_engine',
+          status: response.status,
+        });
+      }
+    });
   }
 
   async binary(
     path: string,
     ownerId?: string,
   ): Promise<{ body: Buffer; contentType: string; filename: string | null; status: number }> {
-    let response: globalThis.Response;
-    try {
-      response = await fetch(`${this.base}${path}`, {
+    return this.withDeadline(async (signal) => {
+      const response = await fetch(`${this.base}${path}`, {
         headers: {
           ...this.headers,
           ...(ownerId ? { 'x-owner-id': ownerId } : {}),
         },
+        signal,
       });
-    } catch (error) {
-      throw ApiError.converterUnavailable({ cause: String(error) });
-    }
-    if (!response.ok) throw await this.toError(response);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    return {
-      body: buffer,
-      contentType: response.headers.get('content-type') ?? 'application/octet-stream',
-      filename: parseFilename(response.headers.get('content-disposition')),
-      status: response.status,
-    };
+      if (!response.ok) throw await this.toError(response);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return {
+        body: buffer,
+        contentType: response.headers.get('content-type') ?? 'application/octet-stream',
+        filename: parseFilename(response.headers.get('content-disposition')),
+        status: response.status,
+      };
+    });
   }
 
-  /** Streams the engine's SSE response to the client without buffering. */
+  /**
+   * Streams the engine's SSE response to the client without buffering.
+   *
+   * Time to first byte is bounded by `CONVERTER_TIMEOUT_MS`: the engine must
+   * answer its headers within that window. Once the stream is open it is
+   * long-lived, so only a client disconnect or the engine closing it ends it.
+   */
   async stream(
     response: Response,
     path: string,
     options: { method?: string; body?: unknown; ownerId: string },
   ): Promise<void> {
+    const controller = new AbortController();
+    const ttfb = setTimeout(() => controller.abort(), this.timeoutMs);
+    const onClientClose = (): void => controller.abort();
+    response.on('close', onClientClose);
+
     let upstream: globalThis.Response;
     try {
       upstream = await fetch(`${this.base}${path}`, {
@@ -112,11 +138,18 @@ export class EngineProxyService {
           'x-owner-id': options.ownerId,
         },
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: controller.signal,
       });
     } catch (error) {
-      throw ApiError.converterUnavailable({ cause: String(error) });
+      response.off('close', onClientClose);
+      throw this.transportError(error);
+    } finally {
+      clearTimeout(ttfb);
     }
-    if (!upstream.ok || !upstream.body) throw await this.toError(upstream);
+    if (!upstream.ok || !upstream.body) {
+      response.off('close', onClientClose);
+      throw await this.toError(upstream);
+    }
 
     response.status(upstream.status);
     response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -135,10 +168,35 @@ export class EngineProxyService {
         if (done) break;
         response.write(Buffer.from(value));
       }
+    } catch (error) {
+      // Client gone or upstream dropped mid-stream: close our side cleanly.
+      this.logger.debug(`stream do motor encerrado: ${String(error)}`);
     } finally {
       response.off('close', abort);
+      response.off('close', onClientClose);
       response.end();
     }
+  }
+
+  /** Runs one engine call under the converter deadline. */
+  private async withDeadline<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      return await run(controller.signal);
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw this.transportError(error);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private transportError(error: unknown): ApiError {
+    if (isAbortError(error)) {
+      return ApiError.converterUnavailable({ reason: 'timeout', timeout_ms: this.timeoutMs });
+    }
+    return ApiError.converterUnavailable({ cause: String(error) });
   }
 
   private async toError(response: globalThis.Response): Promise<ApiError> {
@@ -160,10 +218,20 @@ export class EngineProxyService {
   }
 }
 
+function isAbortError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError';
+}
+
 function parseFilename(disposition: string | null): string | null {
   if (!disposition) return null;
   const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
-  if (encoded?.[1]) return decodeURIComponent(encoded[1]);
+  if (encoded?.[1]) {
+    try {
+      return decodeURIComponent(encoded[1]);
+    } catch {
+      return encoded[1];
+    }
+  }
   const plain = /filename="([^"]+)"/i.exec(disposition);
   return plain?.[1] ?? null;
 }

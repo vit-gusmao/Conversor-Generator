@@ -10,7 +10,7 @@ import { PageHeader } from '@/components/layout/page-header';
 import { EmptyBlock, ErrorBlock, LoadingBlock } from '@/components/layout/states';
 import { QualityBadge, StatusBadge } from '@/components/status-badge';
 import { SheetPreview } from '@/components/sheet-preview';
-import { SheetSelector } from '@/components/sheet-selector';
+import { SheetSelector, type SheetCatalog } from '@/components/sheet-selector';
 import { ResultActions } from '@/components/result-actions';
 import { ResultSummaryLine } from '@/components/result-summary';
 import { useConversion } from '@/hooks/use-conversions';
@@ -33,6 +33,8 @@ export function ResultPage() {
   const conversionQuery = useConversion(id);
   const overviewQuery = useResultOverview(id);
   const [activeSheet, setActiveSheet] = useState<string | null>(null);
+  // What the selector has loaded from the unfiltered sheet list (all pages so far).
+  const [catalog, setCatalog] = useState<SheetCatalog | null>(null);
 
   const overview = overviewQuery.data;
   const conversion = conversionQuery.data;
@@ -49,16 +51,22 @@ export function ResultPage() {
     table_id: sheet.table_id,
   }));
 
-  // The default sheet comes from the server; a stale selection (after a retry)
-  // falls back to it instead of showing an empty table.
+  // The default sheet comes from the server. A selection falls back to it only
+  // when the sheet is known to be absent: the whole catalog is loaded and the
+  // name is not in it. A sheet merely beyond the first page is kept.
   useEffect(() => {
     if (!overview) return;
-    const stale =
-      activeSheet !== null &&
-      sheets.length > 0 &&
-      !sheets.some((sheet) => sheet.name === activeSheet);
-    if (activeSheet === null || stale) setActiveSheet(overview.default_sheet);
-  }, [overview, sheets, activeSheet]);
+    if (activeSheet === null) {
+      setActiveSheet(overview.default_sheet);
+      return;
+    }
+    const knownMissing =
+      catalog !== null &&
+      catalog.exhausted &&
+      catalog.names.length > 0 &&
+      !catalog.names.includes(activeSheet);
+    if (knownMissing) setActiveSheet(overview.default_sheet);
+  }, [overview, activeSheet, catalog]);
 
   if (!id) {
     return (
@@ -189,7 +197,12 @@ export function ResultPage() {
             ) : null}
           </div>
           {overview.counts.sheets > 0 ? (
-            <SheetSelector conversionId={id} value={activeSheet} onChange={setActiveSheet} />
+            <SheetSelector
+              conversionId={id}
+              value={activeSheet}
+              onChange={setActiveSheet}
+              onCatalogChange={setCatalog}
+            />
           ) : null}
         </CardHeader>
         <CardContent className="pt-0">

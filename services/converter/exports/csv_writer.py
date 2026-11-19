@@ -27,6 +27,8 @@ from models.document import DocumentIR, TableStructure
 
 _UNSAFE = re.compile(r"[^\w.\-]+", re.UNICODE)
 _NUMERIC = re.compile(r"^-?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d+)?$|^-?\d+(?:\.\d+)?$")
+_PT_NUMBER = re.compile(r"^-?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d+)?$")
+_DOT_THOUSANDS = re.compile(r"^-?\d{1,3}(?:\.\d{3})+$")
 _FORMULA_START = {"=", "+", "-", "@"}
 
 
@@ -152,7 +154,7 @@ def _select_tables(ir: DocumentIR, table_ids: list[str] | None) -> list[CsvTable
     for index, table in enumerate(selected, start=1):
         rows: list[list[str]] = []
         if table.headers:
-            rows.append([str(cell) for cell in table.headers])
+            rows.append([str(cell) if cell is not None else "" for cell in table.headers])
         for row in table.rows:
             rows.append([str(cell) if cell is not None else "" for cell in row])
         if not any(any(cell.strip() for cell in row) for row in rows):
@@ -195,9 +197,15 @@ def _canonical(value: str) -> str:
         return value
     if raw.startswith("0") and len(raw) > 1 and raw[1].isdigit():
         return value
-    if _NUMERIC.match(raw):
-        normalised = raw.replace(".", "").replace(",", ".")
-        return normalised
+    if "," in raw:
+        # pt-BR: "." groups thousands, "," is the decimal mark.
+        if _PT_NUMBER.match(raw):
+            return raw.replace(".", "").replace(",", ".")
+        return value
+    if "." in raw and _DOT_THOUSANDS.match(raw):
+        # Only dotted thousands groups ("1.234") lose their dots; a single
+        # dot such as "3.14" or "0.5" is a decimal mark and is kept.
+        return raw.replace(".", "")
     return value
 
 

@@ -34,6 +34,7 @@ from typing import Callable
 
 from config import settings
 from engine.ocr.base import OcrEngine, OcrUnavailable, OcrWord
+from models.model_tags import model_tag_matches
 
 # Task prompts documented by the GLM-OCR repository for each content class.
 TASK_TEXT_PROMPT = "Text Recognition:"
@@ -193,10 +194,8 @@ class GlmOcrClient:
             models = response.json().get("models", [])
         except Exception:  # noqa: BLE001
             return False
-        wanted = self.model.lower()
         for item in models:
-            name = str(item.get("name", "")).lower()
-            if name == wanted or name.split(":")[0] == wanted.split(":")[0]:
+            if model_tag_matches(str(item.get("name", "")), self.model):
                 return True
         return False
 

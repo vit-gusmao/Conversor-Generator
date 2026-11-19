@@ -5,13 +5,18 @@ finalize``. Every step re-reads the frozen snapshot, so an edit made after the
 occurrence was created never changes which files that run processes; revoking
 the root still blocks reads. A crash at any boundary resumes from the persisted
 ``import_id`` and stable client keys — never a duplicate batch or conversion.
+
+Failures that can succeed later (gateway timeouts/unavailability, HTTP 5xx,
+408/429, connection errors) return the occurrence to ``queued`` with a
+not-before time from ``RETRY_DELAYS``; the attempt that follows resumes the same
+import. Any other failure, or the attempt after the last delay, is terminal.
 """
 
 from __future__ import annotations
 
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import select
 
@@ -21,14 +26,55 @@ from automation.types import RunProgress
 from models.db import get_session_factory
 
 TERMINAL_STATES = ("succeeded", "partial", "no_changes", "failed", "cancelled", "skipped")
+#: Not-before delay after the 1st, 2nd and 3rd failed attempt (then terminal).
 RETRY_DELAYS = (30, 120, 300)
 CONVERT_WAIT_SECONDS = 120
+TRANSIENT_CODES = frozenset({"GATEWAY_TIMEOUT", "GATEWAY_UNAVAILABLE"})
+TRANSIENT_HTTP_STATUS = frozenset({408, 429})
+#: How a finished index job closes its occurrence (a failed index is partial).
+_RUN_STATE_FOR_JOB = {"completed": "succeeded", "partial": "partial", "failed": "partial"}
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True only for failures that a later attempt can plausibly clear."""
+    from api.deps import ApiError
+    from sources.gateway_submission import GatewaySubmissionError
+
+    if isinstance(exc, ApiError):
+        envelope = exc.detail.get("error", {}) if isinstance(exc.detail, dict) else {}
+        return (
+            exc.status_code in TRANSIENT_HTTP_STATUS
+            or exc.status_code >= 500
+            or envelope.get("code") in TRANSIENT_CODES
+        )
+    if isinstance(exc, GatewaySubmissionError):
+        status = int(exc.details.get("status") or 0)
+        return exc.code in TRANSIENT_CODES or status in TRANSIENT_HTTP_STATUS or status >= 500
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
+def _error_code_message(exc: BaseException) -> tuple[str, str]:
+    from api.deps import ApiError
+    from sources.gateway_submission import GatewaySubmissionError
+
+    if isinstance(exc, ApiError):
+        envelope = (exc.detail or {}).get("error", {}) if isinstance(exc.detail, dict) else {}
+        return envelope.get("code", "IMPORT_FAILED"), envelope.get("message", str(exc))
+    if isinstance(exc, GatewaySubmissionError):
+        return exc.code, exc.message
+    return "EXECUTOR_ERROR", str(exc)
 
 
 class AutomationExecutor:
-    def __init__(self, *, submission=None) -> None:
+    def __init__(
+        self,
+        *,
+        submission=None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.repository = AutomationRepository()
         self._submission = submission
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     # ------------------------------------------------------------------ entry
     def advance(
@@ -75,13 +121,22 @@ class AutomationExecutor:
             detail = {"import_id": import_id, "counts": result.get("counts")}
 
             if state == "succeeded":
-                index_detail = self._index_if_requested(run_id, owner, snapshot, result)
+                index_detail = self._index_phase(run_id, owner, snapshot, result)
                 if index_detail:
                     detail["index"] = index_detail
                     if index_detail.get("status") == "queued":
                         # Indexing runs as a durable job; the occurrence waits
                         # for it instead of declaring itself complete early.
-                        self._set_run_fields(run_id, state="waiting_children")
+                        if not self._mark_waiting_children(run_id, self.fence):
+                            # A cancellation (S15) or a reclaim landed first:
+                            # honour it instead of overwriting. _finish is
+                            # fence-checked, so a lost fence writes nothing.
+                            self._finish(run_id, "cancelled", detail)
+                            return RunProgress(
+                                run_id=run_id, state="cancelled", phase="index",
+                                done=True, detail=detail,
+                            )
+                        self._reconcile_waiting(index_detail["job_id"])
                         return RunProgress(
                             run_id=run_id,
                             state="waiting_children",
@@ -89,8 +144,8 @@ class AutomationExecutor:
                             done=False,
                             detail=detail,
                         )
-                    if index_detail.get("status") not in {"indexed", "skipped", None}:
-                        state = "partial"
+                    if index_detail.get("status") == "terminal":
+                        state = _RUN_STATE_FOR_JOB.get(index_detail.get("job_status"), "partial")
             self._finish(run_id, state, detail)
             return RunProgress(run_id=run_id, state=state, phase="finalize", done=True, detail=detail)
         except Exception as exc:  # noqa: BLE001 - terminal with diagnostics
@@ -98,12 +153,17 @@ class AutomationExecutor:
 
             from api.deps import ApiError
 
-            if isinstance(exc, ApiError):
-                envelope = (
-                    (exc.detail or {}).get("error", {}) if isinstance(exc.detail, dict) else {}
-                )
-                code = envelope.get("code", "IMPORT_FAILED")
-                detail_message = envelope.get("message", str(exc))
+            transient = _is_transient(exc)
+            if transient:
+                code, message = _error_code_message(exc)
+                retry = self._schedule_retry(run_id, code, message)
+                if retry is not None:
+                    return retry
+
+            # Exhausted transient failures keep their original code (e.g.
+            # GATEWAY_TIMEOUT) instead of collapsing into EXECUTOR_ERROR.
+            if transient or isinstance(exc, ApiError):
+                code, detail_message = _error_code_message(exc)
                 self._finish(run_id, "failed", {"code": code, "message": detail_message})
                 return RunProgress(
                     run_id=run_id,
@@ -146,20 +206,46 @@ class AutomationExecutor:
         return getattr(self, "_fence", None)
 
     def _fence_valid(self, session, run: AutomationRunRow) -> bool:
-        """A stale worker (reclaimed lease) must not write results."""
+        """A stale worker must not write results.
+
+        The fence alone decides ownership. Reclaiming an expired lease bumps the
+        fence, so a holder that is still alive keeps its right to finalize even
+        when a long attempt outlives the wall-clock lease (its heartbeat renews
+        it). Comparing the lease time here dropped valid finalizations (AU1-12).
+        """
         expected = self.fence
         if expected is None:
             return True
-        if run.fence != expected:
-            return False
-        if run.lease_until is not None:
-            lease = run.lease_until
-            now = datetime.now(UTC)
-            if lease.tzinfo is None:
-                lease = lease.replace(tzinfo=UTC)
-            if lease < now:
-                return False
-        return True
+        return run.fence == expected
+
+    def _mark_waiting_children(self, run_id: str, fence: int | None = None) -> bool:
+        """Move an occurrence to ``waiting_children`` under its fence.
+
+        Conditional on the state: a cancellation that arrived meanwhile
+        (``cancelling``) or a terminal result is never overwritten (S15). False
+        means the transition did not apply. Without a fence (legacy unfenced
+        advance) only the state guard applies.
+        """
+        from sqlalchemy import update
+
+        criteria = [
+            AutomationRunRow.id == run_id,
+            AutomationRunRow.state.notin_(("cancelling",) + TERMINAL_STATES),
+        ]
+        if fence is not None:
+            criteria.append(AutomationRunRow.fence == fence)
+        session = get_session_factory()()
+        try:
+            result = session.execute(
+                update(AutomationRunRow)
+                .where(*criteria)
+                .values(state="waiting_children")
+                .execution_options(synchronize_session=False)
+            )
+            session.commit()
+            return result.rowcount == 1
+        finally:
+            session.close()
 
     def _ensure_import(self, run: AutomationRunRow, owner_id: str, snapshot: dict[str, Any]):
         """Idempotent import creation from the frozen snapshot."""
@@ -208,26 +294,59 @@ class AutomationExecutor:
         self._set_run_fields(run.id, import_id=record["id"])
         return record
 
-    def _index_if_requested(
+    def _index_job_id(self, run_id: str) -> str | None:
+        session = get_session_factory()()
+        try:
+            run = session.get(AutomationRunRow, run_id)
+            return run.index_job_id if run is not None else None
+        finally:
+            session.close()
+
+    def _index_phase(
         self, run_id: str, owner_id: str, snapshot: dict[str, Any], result: dict[str, Any]
     ) -> dict[str, Any] | None:
+        """Create the occurrence's index job once, or report the one it already has."""
         collection_id = snapshot.get("index_collection_id")
         if not collection_id:
             return None
         from knowledge.job_runner import KnowledgeJobRunner
 
         runner = KnowledgeJobRunner()
+        known_job = self._index_job_id(run_id)
+        if known_job:
+            existing = runner.get(known_job, owner_id)
+            if existing["status"] != "not_found":
+                return self._index_detail(known_job, existing["status"])
+
         conversion_ids = self._successful_conversion_ids(owner_id, result.get("id"))
         if not conversion_ids:
             return {"status": "skipped", "reason": "no_published_conversions"}
-        job = runner.enqueue(
+        # Deterministic id per occurrence: a crash between create and the run
+        # update cannot leave a second job behind on the next advance.
+        job = runner.create(
             owner_id=owner_id,
             collection_id=collection_id,
             conversion_ids=conversion_ids,
             schedule_run_id=run_id,
+            job_id=f"idx_{run_id}",
         )
         self._set_run_fields(run_id, index_job_id=job["job_id"])
-        return {"status": "queued", "job_id": job["job_id"]}
+        if job["status"] == "queued":
+            runner.dispatch_async(job["job_id"], owner_id)
+        return self._index_detail(job["job_id"], job["status"])
+
+    @staticmethod
+    def _index_detail(job_id: str, job_status: str) -> dict[str, Any]:
+        if job_status in {"queued", "running"}:
+            return {"status": "queued", "job_id": job_id, "job_status": job_status}
+        return {"status": "terminal", "job_id": job_id, "job_status": job_status}
+
+    @staticmethod
+    def _reconcile_waiting(job_id: str) -> None:
+        """Close the occurrence if its job finished before it was marked waiting."""
+        from knowledge.job_runner import KnowledgeJobRunner
+
+        KnowledgeJobRunner().finalize_parent_run(job_id)
 
     def _successful_conversion_ids(self, owner_id: str, import_id: str | None) -> list[str]:
         if not import_id:
@@ -284,6 +403,42 @@ class AutomationExecutor:
         finally:
             session.close()
 
+    def _schedule_retry(self, run_id: str, code: str, message: str) -> RunProgress | None:
+        """Requeue after a transient failure; None when the attempt is terminal."""
+        session = get_session_factory()()
+        try:
+            run = session.get(AutomationRunRow, run_id)
+            if run is None or not self._fence_valid(session, run):
+                return None
+            attempt = max(int(run.attempt or 0), 1)
+            if attempt > len(RETRY_DELAYS):
+                return None
+            delay = RETRY_DELAYS[attempt - 1]
+            phase = run.phase or "scan"
+            run.state = "queued"
+            run.phase = phase
+            run.lease_until = None
+            run.lease_owner = None
+            run.next_attempt_at = self._clock() + timedelta(seconds=delay)
+            run.error_code = code
+            run.error_message = (message or "")[:2000]
+            self.repository.append_event(
+                session,
+                run_id=run_id,
+                type="RUN_RETRY_SCHEDULED",
+                payload={"attempt": attempt, "retry_in_seconds": delay, "code": code},
+            )
+            session.commit()
+        finally:
+            session.close()
+        return RunProgress(
+            run_id=run_id,
+            state="queued",
+            phase=phase,
+            done=False,
+            detail={"code": code, "attempt": attempt, "retry_in_seconds": delay},
+        )
+
     def _finish(self, run_id: str, state: str, detail: dict[str, Any]) -> None:
         session = get_session_factory()()
         try:
@@ -301,7 +456,7 @@ class AutomationExecutor:
             run.phase = "finalize"
             run.lease_until = None
             run.lease_owner = None
-            run.finished_at = datetime.now(UTC)
+            run.finished_at = self._clock()
             if detail.get("code"):
                 run.error_code = str(detail["code"])
             if detail.get("message"):

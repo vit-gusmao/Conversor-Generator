@@ -102,3 +102,83 @@ def test_retrieval_respects_selected_collection():
     )
     assert results
     assert all("charlie" in item.excerpt for item in results)
+
+
+def _chunk_plan(*segments: str, max_tokens: int, overlap: int):
+    plan = _plan((1, list(segments)))
+    return chunk_text_plan(
+        plan,
+        owner_id="o",
+        collection_id="c",
+        document_id="d",
+        run_id="r",
+        min_tokens=max_tokens,
+        max_tokens=max_tokens,
+        overlap=overlap,
+    )
+
+
+def test_no_chunk_is_only_overlap_tail_after_long_segment():
+    # AU2-24: an overlap tail carried over a long segment must not become a
+    # standalone chunk at the end of the page.
+    long_text = " ".join(f"w{i}" for i in range(1, 15))
+    drafts = _chunk_plan("a1 a2", "b1 b2", long_text, max_tokens=5, overlap=3)
+    texts = [draft.text for draft in drafts]
+    assert "b1 b2" not in texts[1:]
+    for text in texts[1:]:
+        assert text in long_text, text
+
+
+def test_chunks_never_exceed_max_tokens_after_overlap_tail():
+    # AU2-24: the tail carried into the next chunk must still respect max_tokens.
+    drafts = _chunk_plan("a1 a2", "b1 b2", "c1 c2 c3 c4", max_tokens=5, overlap=2)
+    assert drafts
+    assert all(draft.token_count <= 5 for draft in drafts), [d.text for d in drafts]
+
+
+def test_study_paragraphs_split_on_crlf_blank_lines():
+    # AU2-25: CRLF paragraph separators must split paragraphs like LF ones do.
+    from knowledge.chunker import chunk_study_text
+
+    drafts = chunk_study_text(
+        "alpha beta\r\n\r\ngamma delta",
+        owner_id="o",
+        collection_id="c",
+        document_id="d",
+        source_path="x.md",
+        max_tokens=2,
+        overlap=0,
+    )
+    assert [draft.text for draft in drafts] == ["alpha beta", "gamma delta"]
+
+
+def test_study_chunks_never_exceed_max_tokens_with_overlap():
+    from knowledge.chunker import chunk_study_text
+
+    text = "l1a l1b l1c l1d l1e l1f\nl2a l2b l2c l2d\nl3a l3b l3c l3d l3e l3f l3g\nl4a l4b"
+    drafts = chunk_study_text(
+        text,
+        owner_id="o",
+        collection_id="c",
+        document_id="d",
+        source_path="x.md",
+        max_tokens=10,
+        overlap=8,
+    )
+    assert drafts
+    assert all(draft.token_count <= 10 for draft in drafts), [d.text for d in drafts]
+
+
+def test_unnamed_collection_submits_reuse_one_collection_per_owner():
+    # AU2-17: the lookup must use the same resolved name as the create path.
+    import uuid
+
+    repo = KnowledgeRepository()
+    owner = f"owner-{uuid.uuid4().hex}"
+    first = repo.ensure_collection(owner_id=owner, collection_id=None, name=None, scope="documents")
+    second = repo.ensure_collection(owner_id=owner, collection_id=None, name="  ", scope="documents")
+    third = repo.ensure_collection(owner_id=owner, collection_id=None, name="", scope="documents")
+    assert first["name"] == "Documentos"
+    assert second["collection_id"] == first["collection_id"]
+    assert third["collection_id"] == first["collection_id"]
+    assert len(repo.list_collections(owner)) == 1

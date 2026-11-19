@@ -211,6 +211,20 @@ def validate_schedule_create(raw: dict[str, Any]) -> ScheduleCreate:
     return parsed
 
 
+class FeatureDisabled(Exception):
+    """A feature flag is off, so the requested work cannot start (maps to 409).
+
+    ``code`` is the stable machine-readable identifier the API returns.
+    """
+
+    code = "FEATURE_DISABLED"
+
+    def __init__(self, message: str = "Executor de automação desativado.", *, feature: str = "automation_executor") -> None:
+        super().__init__(message)
+        self.message = message
+        self.feature = feature
+
+
 @dataclass(slots=True, frozen=True)
 class RunLease:
     """Fenced lease over one occurrence claim (doc 05, §6)."""

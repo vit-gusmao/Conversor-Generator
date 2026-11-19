@@ -21,7 +21,9 @@ from config import settings  # noqa: E402
 from models.db import Base  # noqa: E402
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.converter_database_url)
+# ConfigParser interpolation treats '%' as syntax; escape it so a path or
+# password containing one reaches SQLAlchemy unchanged.
+config.set_main_option("sqlalchemy.url", settings.converter_database_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

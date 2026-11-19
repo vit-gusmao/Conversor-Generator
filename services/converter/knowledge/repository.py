@@ -11,7 +11,8 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from knowledge.chunker import CHUNKER_VERSION, PARSER_VERSION, ChunkDraft
 from models.db import (
@@ -20,6 +21,8 @@ from models.db import (
     KnowledgeIndexJobRow,
     get_session_factory,
 )
+from sources.models import SourceImportItemRow, SourceImportRow, SourceKnowledgeHeadRow
+from sources.repository import SourceRepository
 
 
 def _now() -> datetime:
@@ -84,21 +87,20 @@ class KnowledgeRepository:
             if existing is None:
                 raise LookupError("Coleção não encontrada.")
             return existing
+        # Same resolved name for lookup and create (create stores name.strip()[:200]),
+        # so repeated unnamed submits reuse one collection per owner.
+        resolved = (name or "").strip()[:200] or ("Documentos" if scope == "documents" else "Estudos")
         with self._session() as session:
             row = session.execute(
                 select(KnowledgeCollectionRow).where(
                     KnowledgeCollectionRow.owner_id == owner_id,
-                    KnowledgeCollectionRow.name == (name or "").strip(),
+                    KnowledgeCollectionRow.name == resolved,
                     KnowledgeCollectionRow.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if row is not None:
                 return _collection_dict(row, chunks=0)
-        return self.create_collection(
-            owner_id=owner_id,
-            name=name or ("Documentos" if scope == "documents" else "Estudos"),
-            scope=scope,
-        )
+        return self.create_collection(owner_id=owner_id, name=resolved, scope=scope)
 
     def delete_collection(self, owner_id: str, collection_id: str) -> bool:
         with self._session() as session:
@@ -212,12 +214,171 @@ class KnowledgeRepository:
                 or 0
             )
 
+    # -- source-backed generations (source_knowledge_heads) -----------------
+    def source_origin(self, owner_id: str, conversion_id: str) -> dict[str, str] | None:
+        """Logical source file that produced ``conversion_id``, or None for manual uploads."""
+        with self._session() as session:
+            row = session.execute(
+                select(SourceImportItemRow.relative_path, SourceImportRow.source_id)
+                .join(SourceImportRow, SourceImportRow.id == SourceImportItemRow.import_id)
+                .where(
+                    SourceImportItemRow.conversion_id == conversion_id,
+                    SourceImportRow.owner_id == owner_id,
+                )
+                .order_by(SourceImportItemRow.id.desc())
+                .limit(1)
+            ).first()
+        if row is None:
+            return None
+        return {"source_id": row.source_id, "relative_path": row.relative_path}
+
+    def head_generation(
+        self, owner_id: str, collection_id: str, origin: dict[str, str]
+    ) -> int | None:
+        """Generation currently promoted for the logical file, or None if none yet."""
+        with self._session() as session:
+            return session.execute(
+                select(SourceKnowledgeHeadRow.index_generation).where(
+                    SourceKnowledgeHeadRow.owner_id == owner_id,
+                    SourceKnowledgeHeadRow.collection_id == collection_id,
+                    SourceKnowledgeHeadRow.source_id == origin["source_id"],
+                    SourceKnowledgeHeadRow.relative_path == origin["relative_path"],
+                )
+            ).scalar_one_or_none()
+
+    def promote_source_head(
+        self,
+        *,
+        owner_id: str,
+        collection_id: str,
+        origin: dict[str, str],
+        document_id: str,
+        run_id: str,
+        expected_generation: int | None,
+    ) -> bool:
+        """Make ``document_id`` the active generation, only if nothing moved meanwhile.
+
+        ``expected_generation`` is the value observed before the new chunks were
+        written. ``None`` means no head existed then, so only a create can win.
+        The update is a compare-and-set on ``index_generation``: a stale writer
+        matches zero rows and returns False, leaving the promoted head untouched.
+        """
+        with self._session() as session:
+            try:
+                if expected_generation is None:
+                    # Create-only: an existing head means another writer moved first.
+                    # promote_knowledge_head would overwrite it, so check here.
+                    existing = session.execute(
+                        select(SourceKnowledgeHeadRow.id).where(
+                            SourceKnowledgeHeadRow.owner_id == owner_id,
+                            SourceKnowledgeHeadRow.collection_id == collection_id,
+                            SourceKnowledgeHeadRow.source_id == origin["source_id"],
+                            SourceKnowledgeHeadRow.relative_path == origin["relative_path"],
+                        )
+                    ).first()
+                    if existing is not None:
+                        return False
+                    SourceRepository().promote_knowledge_head(
+                        session,
+                        owner_id=owner_id,
+                        collection_id=collection_id,
+                        source_id=origin["source_id"],
+                        relative_path=origin["relative_path"],
+                        document_id=document_id,
+                        run_id=run_id,
+                        index_generation=1,
+                    )
+                    session.commit()
+                    return True
+                result = session.execute(
+                    update(SourceKnowledgeHeadRow)
+                    .where(
+                        SourceKnowledgeHeadRow.owner_id == owner_id,
+                        SourceKnowledgeHeadRow.collection_id == collection_id,
+                        SourceKnowledgeHeadRow.source_id == origin["source_id"],
+                        SourceKnowledgeHeadRow.relative_path == origin["relative_path"],
+                        SourceKnowledgeHeadRow.index_generation == expected_generation,
+                    )
+                    .values(
+                        active_document_id=document_id,
+                        active_run_id=run_id,
+                        index_generation=expected_generation + 1,
+                        source_missing=False,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                session.commit()
+                return result.rowcount == 1
+            except IntegrityError:
+                # Lost a create race: another writer inserted the head first.
+                session.rollback()
+                return False
+
+    def active_heads(
+        self, owner_id: str, collection_ids: list[str] | None
+    ) -> dict[tuple[str, str, str], dict[str, Any]]:
+        """Head per ``(collection_id, source_id, relative_path)`` for this owner."""
+        with self._session() as session:
+            query = select(SourceKnowledgeHeadRow).where(
+                SourceKnowledgeHeadRow.owner_id == owner_id
+            )
+            if collection_ids:
+                query = query.where(SourceKnowledgeHeadRow.collection_id.in_(collection_ids))
+            rows = session.execute(query).scalars().all()
+            return {
+                (row.collection_id, row.source_id, row.relative_path): {
+                    "active_document_id": row.active_document_id,
+                    "active_run_id": row.active_run_id,
+                    "index_generation": int(row.index_generation),
+                    "source_missing": bool(row.source_missing),
+                }
+                for row in rows
+            }
+
+    def mark_source_missing(
+        self,
+        owner_id: str,
+        source_id: str,
+        relative_paths: list[str],
+        *,
+        session: Any | None = None,
+    ) -> int:
+        """Flag heads whose origin file vanished from the source. Returns rows flagged.
+
+        The head keeps pointing at the last good generation, so search still
+        returns its chunks; citations carry ``source_missing``.
+        """
+        paths = sorted({path for path in relative_paths if path})
+        if not paths:
+            return 0
+        statement = (
+            update(SourceKnowledgeHeadRow)
+            .where(
+                SourceKnowledgeHeadRow.owner_id == owner_id,
+                SourceKnowledgeHeadRow.source_id == source_id,
+                SourceKnowledgeHeadRow.relative_path.in_(paths),
+            )
+            .values(source_missing=True)
+            .execution_options(synchronize_session=False)
+        )
+        if session is not None:
+            return int(session.execute(statement).rowcount or 0)
+        with self._session() as own:
+            count = int(own.execute(statement).rowcount or 0)
+            own.commit()
+            return count
+
     # -- index jobs --------------------------------------------------------
     def create_job(
-        self, *, owner_id: str, collection_id: str | None, source: dict[str, Any]
+        self,
+        *,
+        owner_id: str,
+        collection_id: str | None,
+        source: dict[str, Any],
+        job_id: str | None = None,
     ) -> dict[str, Any]:
         job = KnowledgeIndexJobRow(
-            id=f"idx_{uuid.uuid4().hex}",
+            id=job_id or f"idx_{uuid.uuid4().hex}",
             owner_id=owner_id,
             collection_id=collection_id,
             status="queued",

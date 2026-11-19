@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { SourcesPage } from '@/pages/sources-page';
@@ -145,5 +146,90 @@ describe('SourcesPage', () => {
     await screen.findByText(/Nenhuma pasta foi concedida ainda/i);
     // No Electron/Node import is required for this screen to render.
     expect((window as unknown as { desktop?: unknown }).desktop).toBeUndefined();
+  });
+});
+
+describe('SourcesPage native picker and imports', () => {
+  const availableRoot = {
+    id: 'root_1',
+    label: 'Dados',
+    runtime_id: 'local',
+    runtime_available: true,
+    granted_by: 'owner',
+    created_at: new Date().toISOString(),
+    revoked_at: null,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRoots.mockResolvedValue([availableRoot]);
+  });
+
+  afterEach(() => {
+    delete (window as unknown as { desktop?: unknown }).desktop;
+  });
+
+  it('leaves the path and root unchanged when the native picker is cancelled', async () => {
+    const pickSource = vi.fn().mockResolvedValue(null);
+    (window as unknown as { desktop?: unknown }).desktop = { pickSource };
+    mockSources.mockResolvedValue([]);
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Procurar…' }));
+
+    await waitFor(() => expect(pickSource).toHaveBeenCalledWith({ kind: 'directory' }));
+    expect(screen.getByPlaceholderText('financeiro/planilhas')).toHaveValue('');
+  });
+
+  it('shows a partial import result with the failing file and its error code', async () => {
+    mockSources.mockResolvedValue([
+      {
+        id: 'src_1',
+        owner_id: 'owner',
+        root_id: 'root_1',
+        relative_path: 'docs',
+        kind: 'directory',
+        name: 'Docs',
+        recursive: true,
+        include_patterns: null,
+        exclude_patterns: null,
+        enabled: true,
+        version: 1,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+    ]);
+    const startImport = sourcesService.startImport as unknown as ReturnType<typeof vi.fn>;
+    const getImport = sourcesService.getImport as unknown as ReturnType<typeof vi.fn>;
+    const listImportItems = sourcesService.listImportItems as unknown as ReturnType<typeof vi.fn>;
+    startImport.mockResolvedValue({ id: 'imp_1', status: 'pending' });
+    getImport.mockResolvedValue({
+      id: 'imp_1',
+      status: 'partial',
+      counts: { imported: 1, skipped: 0, failed: 1 },
+      error: null,
+    });
+    listImportItems.mockResolvedValue([
+      {
+        id: 1,
+        relative_path: 'a.xlsx',
+        status: 'failed',
+        size_bytes: 10,
+        sha256: null,
+        upload_id: null,
+        conversion_id: null,
+        error_code: 'INVALID_FILE',
+        error_message: 'corrompido',
+        attempts: 1,
+      },
+    ]);
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: /Importar agora/i }));
+
+    expect(await screen.findByText('Parcial')).toBeInTheDocument();
+    expect(screen.getByText(/1 falha\(s\)/)).toBeInTheDocument();
+    expect(screen.getByText('a.xlsx')).toBeInTheDocument();
+    expect(screen.getByText('INVALID_FILE')).toBeInTheDocument();
   });
 });

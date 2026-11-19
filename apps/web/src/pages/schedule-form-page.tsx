@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { CalendarClock, Eye } from 'lucide-react';
-import type { ScheduleCreateRequest } from '@pdf2x/contracts';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { CalendarClock, Eye, RefreshCw } from 'lucide-react';
+import type { ScheduleCreateRequest, ScheduleRecord } from '@pdf2x/contracts';
 import { Button } from '@/components/ui/button';
+import { Alert } from '@/components/ui/alert';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -20,14 +21,13 @@ import {
   useCreateSchedule,
   usePreviewSchedule,
   useSchedule,
-  useScheduleRuns,
   useUpdateSchedule,
 } from '@/hooks/use-schedules';
 import { useSources } from '@/hooks/use-sources';
+import { errorCode } from '@/lib/api';
 import { explainError } from '@/lib/errors';
 import { formatDateTime } from '@/lib/format';
 import { toast } from '@/stores/ui';
-import { Link } from 'react-router-dom';
 
 const TIMEZONES = ['America/Sao_Paulo', 'UTC', 'America/Manaus', 'America/Belem'] as const;
 const INTERVAL_UNITS = [
@@ -35,19 +35,6 @@ const INTERVAL_UNITS = [
   { key: 'hours', label: 'horas', factor: 3600 },
   { key: 'days', label: 'dias', factor: 86_400 },
 ] as const;
-
-const RUN_STATE_LABELS: Record<string, string> = {
-  queued: 'na fila',
-  running: 'executando',
-  waiting_children: 'aguardando',
-  cancelling: 'cancelando',
-  succeeded: 'sucesso',
-  partial: 'parcial',
-  no_changes: 'sem novidades',
-  failed: 'falhou',
-  cancelled: 'cancelada',
-  skipped: 'ignorada',
-};
 
 export function ScheduleFormPage() {
   useEnsureSession();
@@ -59,7 +46,11 @@ export function ScheduleFormPage() {
   const createSchedule = useCreateSchedule();
   const updateSchedule = useUpdateSchedule();
   const preview = usePreviewSchedule();
-  const runs = useScheduleRuns(id ?? null);
+  // Set when the server rejects a save because the schedule moved on (409).
+  const [conflict, setConflict] = useState(false);
+  // The form is hydrated once from the server; later refetches must not
+  // overwrite what the operator is typing. Reload is an explicit action.
+  const hydratedId = useRef<string | null>(null);
 
   const [name, setName] = useState('');
   const [sourceId, setSourceId] = useState(searchParams.get('source') ?? '');
@@ -71,9 +62,7 @@ export function ScheduleFormPage() {
   const [misfire, setMisfire] = useState<'run_once_latest' | 'skip'>('run_once_latest');
   const [overlap, setOverlap] = useState<'skip' | 'queue_one'>('skip');
 
-  useEffect(() => {
-    if (!existing.data) return;
-    const schedule = existing.data;
+  const applySchedule = (schedule: ScheduleRecord) => {
     setName(schedule.name);
     setSourceId(schedule.source_id);
     setTimezone(schedule.timezone);
@@ -96,7 +85,29 @@ export function ScheduleFormPage() {
         setIntervalValue(Math.max(1, Math.round(seconds / 60)));
       }
     }
+  };
+
+  useEffect(() => {
+    if (!existing.data || hydratedId.current === existing.data.id) return;
+    hydratedId.current = existing.data.id;
+    applySchedule(existing.data);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [existing.data]);
+
+  const reloadLatest = async () => {
+    const latest = await existing.refetch();
+    if (!latest.data) {
+      toast({ title: 'Falha', description: explainError(latest.error), variant: 'error' });
+      return;
+    }
+    applySchedule(latest.data);
+    setConflict(false);
+    toast({
+      title: 'Versão mais recente carregada',
+      description: `Revisão ${latest.data.revision}. Reaplique suas alterações e salve.`,
+      variant: 'info',
+    });
+  };
 
   const seconds = useMemo(() => {
     const factor = INTERVAL_UNITS.find((unit) => unit.key === intervalUnit)?.factor ?? 3600;
@@ -141,9 +152,19 @@ export function ScheduleFormPage() {
           changes: request as unknown as Record<string, unknown>,
         },
         {
-          onSuccess: () => toast({ title: 'Agenda atualizada', variant: 'success' }),
-          onError: (error) =>
-            toast({ title: 'Falha', description: explainError(error), variant: 'error' }),
+          onSuccess: (schedule) => {
+            setConflict(false);
+            toast({ title: 'Agenda atualizada', variant: 'success' });
+            navigate(`/schedules/${schedule.id}`);
+          },
+          onError: (error) => {
+            if (errorCode(error) === 'REVISION_CONFLICT') {
+              setConflict(true);
+              toast({ title: 'Conflito de revisão', description: explainError(error), variant: 'error' });
+              return;
+            }
+            toast({ title: 'Falha', description: explainError(error), variant: 'error' });
+          },
         },
       );
       return;
@@ -171,8 +192,26 @@ export function ScheduleFormPage() {
       <PageHeader
         title={id ? 'Editar agenda' : 'Nova agenda'}
         description="A mesma regra calcula a prévia e o disparo real — nunca um timer no navegador."
-        backTo={{ to: '/schedules', label: 'Agendamentos' }}
+        backTo={
+          id ? { to: `/schedules/${id}`, label: 'Agenda' } : { to: '/schedules', label: 'Agendamentos' }
+        }
       />
+
+      {conflict ? (
+        <Alert variant="error" title="Esta agenda foi alterada em outro lugar">
+          <div className="flex flex-col gap-2">
+            <p>
+              Outra aba ou sessão salvou uma revisão mais nova desde que você abriu esta página. Suas
+              alterações não foram salvas: recarregue a versão mais recente e reaplique o que precisar.
+            </p>
+            <div>
+              <Button size="sm" variant="outline" onClick={() => void reloadLatest()}>
+                <RefreshCw className="mr-1 h-4 w-4" aria-hidden /> Recarregar versão mais recente
+              </Button>
+            </div>
+          </div>
+        </Alert>
+      ) : null}
 
       {sources.data && sources.data.length === 0 ? (
         <EmptyBlock
@@ -333,34 +372,6 @@ export function ScheduleFormPage() {
         </CardContent>
       </Card>
 
-      {id ? (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Execuções</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2 text-sm">
-            {(runs.data ?? []).length === 0 ? (
-              <p className="text-muted">Nenhuma execução registrada ainda.</p>
-            ) : (
-              <ul className="divide-y divide-border/60">
-                {(runs.data ?? []).map((run) => (
-                  <li key={run.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
-                    <Link to={`/schedule-runs/${run.id}`} className="text-accent hover:underline">
-                      {formatDateTime(run.scheduled_for)}
-                    </Link>
-                    <span className="flex items-center gap-2 text-xs text-muted">
-                      <Badge variant={run.state === 'failed' ? 'danger' : 'muted'}>
-                        {RUN_STATE_LABELS[run.state] ?? run.state}
-                      </Badge>
-                      <span>{run.trigger}</span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </CardContent>
-        </Card>
-      ) : null}
     </div>
   );
 }

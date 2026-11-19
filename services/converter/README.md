@@ -3,7 +3,7 @@
 Serviço FastAPI que executa o pipeline PDF → XLSX e persiste toda a
 proveniência.
 
-> **Somente local.** O launcher (`starter-server.cmd`) sobe o motor em
+> **Somente local.** O launcher (`starter-local-server.cmd`) sobe o motor em
 > `127.0.0.1:8000`. Dentro do contêiner o uvicorn usa `0.0.0.0`, mas isso vale só
 > para o contêiner. Os dados ficam em `services/converter/data/` (banco SQLite
 > `converter.db`, `storage/` e `work/`). Veja [`../../docs/STORAGE.md`](../../docs/STORAGE.md).
@@ -62,6 +62,14 @@ Fluxo de ponta a ponta: [`../../docs/FLOW.md`](../../docs/FLOW.md).
 ```bash
 .venv/Scripts/python -m worker.cli documento.pdf -o saida.xlsx
 ```
+
+Opções: `-o/--output` (caminho de saída) e `--no-ocr`.
+
+## Empacotamento Windows
+
+O backend congelado (PyInstaller, onedir) é gerado por `packaging/converter.spec`.
+O fluxo completo, com o aplicativo Electron, está em
+[`packaging/README.md`](packaging/README.md) e em [`../../docs/DESKTOP.md`](../../docs/DESKTOP.md).
 
 ## Migrações
 

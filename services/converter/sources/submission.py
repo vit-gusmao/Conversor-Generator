@@ -5,8 +5,8 @@
 straight to the content-addressed storage key (they are already hashed); the
 conversion is created through ``ConversionService.create_from_stored`` with a
 stable idempotency key — so a lost HTTP response or a process crash never
-duplicates a conversion. ``GatewaySubmissionPort`` (T6) implements the same
-contract over the gateway's internal API.
+duplicates a conversion. The full-mode adapter with the same contract over the
+gateway's internal API lives in ``sources.gateway_submission``.
 """
 
 from __future__ import annotations
@@ -178,11 +178,4 @@ class StandaloneSubmissionPort:
         BatchService().cancel_batch(owner_id=owner_id, batch_id=batch_id)
 
 
-class GatewaySubmissionPort:
-    """Full-mode adapter (implemented in T6)."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError("GatewaySubmissionPort é entregue na tarefa T6.")
-
-
-__all__ = ["GatewaySubmissionPort", "StandaloneSubmissionPort", "SubmissionResult"]
+__all__ = ["StandaloneSubmissionPort", "SubmissionResult"]

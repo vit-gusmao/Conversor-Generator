@@ -86,6 +86,11 @@ export interface EnqueueRequest {
   options?: EnqueueOptions;
 }
 
+export interface CancelResult {
+  /** `true` only when the engine confirmed the cancellation. */
+  cancelled: boolean;
+}
+
 export interface EnqueueResult {
   accepted: boolean;
   run_id: string | null;
@@ -255,8 +260,14 @@ export class ConverterClient {
     };
   }
 
-  async cancel(runId: string): Promise<void> {
-    await this.requestJson<Json>(runId, '/cancel', { method: 'POST', body: '{}' });
+  /**
+   * Asks the engine to cancel a run. `cancelled` is true only when the engine
+   * confirmed it (the run had not been published yet). A false value means the
+   * run already finished or is unknown to the engine.
+   */
+  async cancel(runId: string): Promise<CancelResult> {
+    const payload = await this.requestJson<Json>(runId, '/cancel', { method: 'POST', body: '{}' });
+    return { cancelled: payload['cancelled'] === true };
   }
 
   async status(runId: string): Promise<ConverterJobState> {
@@ -309,12 +320,16 @@ export class ConverterClient {
   }
 
   async download(runId: string): Promise<DownloadPayload> {
-    const { response } = await this.requestRaw(runId, '/download', { method: 'GET' });
+    const { response, release } = await this.requestRaw(runId, '/download', { method: 'GET' });
     if (!response.body) {
+      release();
       throw ApiError.converterUnavailable({ reason: 'empty_download_body', run_id: runId });
     }
+    const stream = Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]);
+    // The deadline covers the body until it is fully consumed (or fails).
+    stream.once('close', release);
     return {
-      stream: Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]),
+      stream,
       contentType:
         response.headers.get('content-type') ??
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -364,12 +379,20 @@ export class ConverterClient {
   }
 
   async auditExport(runId: string, query: QueryParams = {}): Promise<AuditExportResponse> {
-    const { response } = await this.requestRaw(runId, '/audit/export', { method: 'GET' }, query);
+    const { response, release } = await this.requestRaw(
+      runId,
+      '/audit/export',
+      { method: 'GET' },
+      query,
+    );
     if (!response.body) {
+      release();
       throw ApiError.converterUnavailable({ reason: 'empty_audit_export_body', run_id: runId });
     }
+    const stream = Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]);
+    stream.once('close', release);
     return {
-      stream: Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]),
+      stream,
       contentType: response.headers.get('content-type') ?? 'application/json',
       filename: this.readFilename(response) ?? `auditoria-${runId}.json`,
     };
@@ -422,32 +445,57 @@ export class ConverterClient {
     query?: QueryParams,
     absolutePath?: string,
   ): Promise<T> {
-    const { response } = await this.requestRaw(runId, suffix, init, query, absolutePath);
-    const text = await response.text();
-    if (!text) return {} as T;
+    const { response, url, release } = await this.requestRaw(
+      runId,
+      suffix,
+      init,
+      query,
+      absolutePath,
+    );
     try {
-      return JSON.parse(text) as T;
-    } catch {
-      throw ApiError.converterUnavailable({
-        reason: 'invalid_json_from_converter',
-        run_id: runId,
-        status: response.status,
-      });
+      // The body is read under the same deadline as the headers (A-26).
+      const text = await response.text();
+      if (!text) return {} as T;
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw ApiError.converterUnavailable({
+          reason: 'invalid_json_from_converter',
+          run_id: runId,
+          status: response.status,
+        });
+      }
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw this.transportError(error, url);
+    } finally {
+      release();
     }
   }
 
+  /**
+   * Sends the request under `CONVERTER_TIMEOUT_MS`. The returned `release`
+   * must be called once the body has been read (or abandoned); until then the
+   * deadline stays armed, so a stalled body cannot hang the caller.
+   */
   private async requestRaw(
     runId: string | null,
     suffix: string | null,
     init: RequestInit = {},
     query?: QueryParams,
     absolutePath?: string,
-  ): Promise<{ response: Response; url: string }> {
+  ): Promise<{ response: Response; url: string; release: () => void }> {
     const path = absolutePath ?? this.jobPath(runId ?? '', suffix ?? DEFAULT_JOB_SUFFIX);
     const url = `${this.baseUrl}/internal/v1${path}${toQueryString(query)}`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      clearTimeout(timer);
+    };
 
     try {
       const response = await this.fetchImpl(url, {
@@ -465,24 +513,27 @@ export class ConverterClient {
         throw await this.toApiError(response, url);
       }
 
-      return { response, url };
+      return { response, url, release };
     } catch (error) {
+      release();
       if (error instanceof ApiError) throw error;
-      if (this.isAbortError(error)) {
-        throw ApiError.converterUnavailable({
-          reason: 'timeout',
-          timeout_ms: this.timeoutMs,
-          url,
-        });
-      }
-      throw ApiError.converterUnavailable({
-        reason: 'network_error',
-        url,
-        detail: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      clearTimeout(timer);
+      throw this.transportError(error, url);
     }
+  }
+
+  private transportError(error: unknown, url: string): ApiError {
+    if (this.isAbortError(error)) {
+      return ApiError.converterUnavailable({
+        reason: 'timeout',
+        timeout_ms: this.timeoutMs,
+        url,
+      });
+    }
+    return ApiError.converterUnavailable({
+      reason: 'network_error',
+      url,
+      detail: error instanceof Error ? error.message : String(error),
+    });
   }
 
   private async toApiError(response: Response, url: string): Promise<ApiError> {

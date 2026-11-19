@@ -30,7 +30,12 @@ import { cn } from '@/lib/utils';
 import { toast } from '@/stores/ui';
 import { useUploadQueue } from '@/stores/upload-queue';
 import { defaultConversionOptions } from '@pdf2x/contracts';
-import { newClientKey, startBatch, type TransferItem } from '@/services/transfer';
+import {
+  cancelTransfer,
+  newClientKey,
+  startBatch,
+  type TransferItem,
+} from '@/services/transfer';
 
 const FEATURES = [
   {
@@ -326,7 +331,11 @@ export function HomePage() {
               onRetry={(clientItemId) =>
                 setItemState(clientItemId, { state: 'queued', error: undefined })
               }
-              onCancel={(clientItemId) => setItemState(clientItemId, { state: 'cancelled' })}
+              onCancel={(clientItemId) => {
+                // Aborts the in-flight or waiting transfer; the cancelled state is kept.
+                cancelTransfer(clientItemId);
+                setItemState(clientItemId, { state: 'cancelled' });
+              }}
               emptyMessage="A fila está vazia. Adicione PDFs ou imagens para começar."
             />
 

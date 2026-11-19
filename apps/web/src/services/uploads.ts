@@ -116,10 +116,12 @@ export async function completeUpload(
   uploadId: string,
   sha256: string,
   totalParts: number,
+  options: { signal?: AbortSignal } = {},
 ): Promise<CompleteUploadResponse> {
   return apiFetch<CompleteUploadResponse>(`/uploads/${encodeURIComponent(uploadId)}/complete`, {
     method: 'POST',
     json: { sha256, total_parts: totalParts },
+    signal: options.signal,
   });
 }
 

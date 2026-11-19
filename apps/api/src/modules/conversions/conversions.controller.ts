@@ -30,6 +30,7 @@ import type {
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ListConversionsQueryDto } from '../../common/dto/pagination.dto';
+import { contentDisposition } from '../../common/content-disposition';
 import { ApiError } from '../../common/errors/api-error';
 import { ERROR_CODES } from '../../common/errors/error-codes';
 import type { AuthenticatedUser } from '../../common/request-context';
@@ -61,12 +62,6 @@ function parseOptionsField(body: CreateConversionBody | undefined): unknown {
   } catch {
     throw ApiError.badRequest(ERROR_CODES.INVALID_OPTION, { reason: 'malformed_json' });
   }
-}
-
-function contentDisposition(filename: string): string {
-  const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
-  const encoded = encodeURIComponent(filename);
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 @Controller('conversions')

@@ -181,8 +181,15 @@ export function useRetryConversion(id: string | null | undefined) {
   return useMutation<CreateConversionResponse, unknown, void>({
     mutationFn: () => retryConversion(id as string),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.conversions.detail(id ?? '') });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.audit.all(id ?? '') });
+      const conversionId = id ?? '';
+      void queryClient.invalidateQueries({ queryKey: queryKeys.conversions.detail(conversionId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.audit.all(conversionId) });
+      // The result, sheets, preview and exports belong to the previous run.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.result(conversionId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.resultOverview(conversionId) });
+      void queryClient.invalidateQueries({ queryKey: ['conversions', conversionId, 'sheets'] });
+      void queryClient.invalidateQueries({ queryKey: ['conversions', conversionId, 'preview'] });
+      void queryClient.invalidateQueries({ queryKey: ['exports', conversionId] });
     },
   });
 }

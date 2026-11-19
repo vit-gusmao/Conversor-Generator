@@ -31,10 +31,24 @@ interface Diagnostics {
   notes?: string[];
 }
 
+interface ApplyResult {
+  status?: 'applied' | 'deferred' | 'rolled_back';
+  applied_version?: number | null;
+  blockers?: string[];
+  error?: string | null;
+}
+
+/**
+ * Paths are never part of the draft: the web sees only redacted presence
+ * flags, so untouched paths are omitted from every payload (never sent as null).
+ */
+interface PathEdits {
+  ollama_path?: string;
+  models_dir?: string;
+}
+
 interface Draft {
   mode: 'external' | 'managed';
-  ollama_path: string | null;
-  models_dir: string | null;
   ocr: { enabled: boolean; model: string; endpoint_host: string; endpoint_port: number };
   assistant: {
     enabled: boolean;
@@ -48,8 +62,6 @@ interface Draft {
 
 const DEFAULT_DRAFT: Draft = {
   mode: 'external',
-  ollama_path: null,
-  models_dir: null,
   ocr: { enabled: true, model: 'glm-ocr:latest', endpoint_host: '127.0.0.1', endpoint_port: 11434 },
   assistant: {
     enabled: false,
@@ -60,6 +72,8 @@ const DEFAULT_DRAFT: Draft = {
     max_output_tokens: 1024,
   },
 };
+
+const DEFAULT_GGUF_TAG = 'converter/gguf-import:latest';
 
 /**
  * Configurações → IA local (T13). No desktop aplica pelo perfil do host; no
@@ -73,6 +87,14 @@ export function LocalModelsPage() {
   const [version, setVersion] = useState<number | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pathEdits, setPathEdits] = useState<PathEdits>({});
+  const [ollamaPathConfigured, setOllamaPathConfigured] = useState(false);
+  const [modelsDirConfigured, setModelsDirConfigured] = useState(false);
+  /** Work blocking the last apply; non-empty means the apply was deferred. */
+  const [deferredBlockers, setDeferredBlockers] = useState<string[]>([]);
+  const [ggufTag, setGgufTag] = useState(DEFAULT_GGUF_TAG);
+  const [importProgress, setImportProgress] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
 
   useEffect(() => {
     if (!bridge) return;
@@ -80,6 +102,8 @@ export function LocalModelsPage() {
       .readRuntimeProfile()
       .then((profile) => {
         setVersion(Number(profile.version ?? 1));
+        setOllamaPathConfigured(Boolean(profile.ollama_path_configured));
+        setModelsDirConfigured(Boolean(profile.models_dir_configured));
         setDraft((current) => ({
           ...current,
           mode: (profile.mode as Draft['mode']) ?? current.mode,
@@ -89,10 +113,14 @@ export function LocalModelsPage() {
             enabled: Boolean(profile.assistant_enabled),
             model: String(profile.assistant_model ?? current.assistant.model),
           },
-          models_dir: profile.models_dir_configured ? current.models_dir : null,
         }));
       })
       .catch(() => undefined);
+  }, [bridge]);
+
+  useEffect(() => {
+    if (!bridge?.onGgufProgress) return;
+    return bridge.onGgufProgress((line) => setImportProgress(line));
   }, [bridge]);
 
   if (!bridge) {
@@ -111,10 +139,13 @@ export function LocalModelsPage() {
     );
   }
 
+  /** Draft fields plus only the paths the user picked in this session. */
+  const buildPayload = (): Record<string, unknown> => ({ ...draft, ...pathEdits });
+
   const test = async () => {
     setBusy(true);
     try {
-      const result = (await bridge.testModelProfile(draft as unknown as Record<string, unknown>)) as Diagnostics;
+      const result = (await bridge.testModelProfile(buildPayload())) as Diagnostics;
       setDiagnostics(result);
       toast({
         title: result.runtime_detected ? 'Runtime detectado' : 'Runtime indisponível',
@@ -128,32 +159,71 @@ export function LocalModelsPage() {
     }
   };
 
-  const apply = async () => {
+  const apply = async (force: boolean) => {
     setBusy(true);
     try {
       const result = (await bridge.applyRuntimeProfile(
-        draft as unknown as Record<string, unknown>,
+        buildPayload(),
         version,
-      )) as { status?: string; applied_version?: number | null; blockers?: string[] };
-      setVersion(result.applied_version ?? version);
-      toast({
-        title:
-          result.status === 'applied'
-            ? 'Perfil aplicado'
-            : result.status === 'deferred'
-              ? 'Aplicação adiada'
-              : 'Perfil revertido',
-        description: result.blockers?.length
-          ? `Aguardando: ${result.blockers.join(', ')}`
-          : 'O backend reiniciou com os modelos selecionados.',
-        variant: result.status === 'applied' ? 'success' : 'warning',
-      });
+        force ? { force: true } : undefined,
+      )) as ApplyResult;
+      if (result.status === 'applied') {
+        setVersion(result.applied_version ?? version);
+        setDeferredBlockers([]);
+        setPathEdits({});
+        // A path chosen in this session is now saved in the profile.
+        setOllamaPathConfigured((saved) => saved || Boolean(pathEdits.ollama_path));
+        setModelsDirConfigured((saved) => saved || Boolean(pathEdits.models_dir));
+        toast({
+          title: 'Perfil aplicado',
+          description: 'O backend reiniciou com os modelos selecionados.',
+          variant: 'success',
+        });
+      } else if (result.status === 'deferred') {
+        setDeferredBlockers(result.blockers ?? []);
+        toast({
+          title: 'Aplicação adiada',
+          description: `Aguardando: ${(result.blockers ?? []).join(', ') || 'trabalho em andamento'}`,
+          variant: 'warning',
+        });
+      } else if (result.status === 'rolled_back') {
+        setDeferredBlockers([]);
+        toast({
+          title: 'Perfil revertido',
+          description: result.error ?? 'A versão anterior foi restaurada.',
+          variant: 'error',
+        });
+      }
     } catch (error) {
       toast({ title: 'Falha ao aplicar', description: explainError(error), variant: 'error' });
     } finally {
       setBusy(false);
     }
   };
+
+  const importGguf = async () => {
+    if (!bridge.importGguf) return;
+    setImporting(true);
+    setImportProgress(null);
+    try {
+      const result = await bridge.importGguf({ tag: ggufTag.trim() });
+      if (!result) {
+        toast({ title: 'Importação cancelada', variant: 'info' });
+        return;
+      }
+      toast({
+        title: 'GGUF importado',
+        description: `Tag local ${String(result.tag ?? ggufTag)} criada.`,
+        variant: 'success',
+      });
+    } catch (error) {
+      toast({ title: 'Falha na importação', description: explainError(error), variant: 'error' });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const managed = draft.mode === 'managed';
 
   return (
     <div className="space-y-6">
@@ -192,12 +262,17 @@ export function LocalModelsPage() {
           <div className="space-y-1">
             <span className="text-sm font-medium">Executável (ollama.exe)</span>
             <div className="flex gap-2">
-              <Input value={draft.ollama_path ?? ''} readOnly placeholder="não selecionado" />
+              <Input
+                value={pathEdits.ollama_path ?? ''}
+                readOnly
+                placeholder={ollamaPathConfigured ? 'configurado (mantido)' : 'não configurado'}
+                aria-label="Executável selecionado"
+              />
               <Button
                 variant="outline"
                 onClick={async () => {
                   const selection = await pickModelResource('ollama_executable');
-                  if (selection) setDraft({ ...draft, ollama_path: selection.path });
+                  if (selection) setPathEdits({ ...pathEdits, ollama_path: selection.path });
                 }}
               >
                 Procurar…
@@ -207,12 +282,17 @@ export function LocalModelsPage() {
           <div className="space-y-1 sm:col-span-2">
             <span className="text-sm font-medium">Pasta de modelos do Ollama</span>
             <div className="flex gap-2">
-              <Input value={draft.models_dir ?? ''} readOnly placeholder="padrão do Ollama" />
+              <Input
+                value={pathEdits.models_dir ?? ''}
+                readOnly
+                placeholder={modelsDirConfigured ? 'configurado (mantido)' : 'padrão do Ollama'}
+                aria-label="Pasta de modelos selecionada"
+              />
               <Button
                 variant="outline"
                 onClick={async () => {
                   const selection = await pickModelResource('models_directory');
-                  if (selection) setDraft({ ...draft, models_dir: selection.path });
+                  if (selection) setPathEdits({ ...pathEdits, models_dir: selection.path });
                 }}
               >
                 Procurar…
@@ -329,24 +409,36 @@ export function LocalModelsPage() {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
-          <Button
-            variant="outline"
-            onClick={async () => {
-              const selection = await pickModelResource('gguf');
-              if (selection) {
-                toast({
-                  title: 'GGUF selecionado',
-                  description:
-                    'A importação cria uma tag local com um Modelfile gerado pelo aplicativo.',
-                  variant: 'info',
-                });
-              }
-            }}
-          >
-            Selecionar arquivo .gguf
-          </Button>
+          {managed && bridge.importGguf ? (
+            <>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <span className="text-sm font-medium">Tag local</span>
+                  <Input
+                    value={ggufTag}
+                    onChange={(event) => setGgufTag(event.target.value)}
+                    aria-label="Tag local do GGUF"
+                    placeholder={DEFAULT_GGUF_TAG}
+                  />
+                </div>
+              </div>
+              <Button variant="outline" onClick={importGguf} disabled={importing || busy}>
+                Importar GGUF
+              </Button>
+              {importing && importProgress ? (
+                <p className="text-xs text-muted" role="status">
+                  {importProgress}
+                </p>
+              ) : null}
+            </>
+          ) : (
+            <p className="text-xs text-muted">
+              Disponível somente no modo “Iniciar Ollama pelo aplicativo”.
+            </p>
+          )}
           <p className="text-xs text-muted">
-            Pesos não são baixados automaticamente e não acompanham o instalador.
+            Pesos não são baixados automaticamente e não acompanham o instalador. A importação cria
+            uma tag local com um Modelfile gerado pelo aplicativo.
           </p>
         </CardContent>
       </Card>
@@ -355,14 +447,35 @@ export function LocalModelsPage() {
         <Button onClick={test} disabled={busy}>
           <ShieldCheck className="mr-1 h-4 w-4" aria-hidden /> Testar modelos
         </Button>
-        <Button variant="outline" onClick={apply} disabled={busy}>
+        <Button variant="outline" onClick={() => void apply(false)} disabled={busy}>
           Aplicar perfil
         </Button>
         <p className="text-xs text-muted">
-          Aplicar grava o perfil atomicamente e reinicia apenas os processos gerenciados; falha
-          restaura a versão anterior.
+          Aplicar grava o perfil atomicamente e reinicia o backend; falha restaura a versão anterior.
         </p>
       </div>
+
+      {deferredBlockers.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Aplicação adiada</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <p className="text-muted">
+              O backend tem trabalho em andamento. Nada foi alterado. Aguarde a conclusão ou aplique
+              mesmo assim: o trabalho em andamento poderá ser interrompido.
+            </p>
+            <ul className="list-disc pl-5">
+              {deferredBlockers.map((blocker) => (
+                <li key={blocker}>{blocker}</li>
+              ))}
+            </ul>
+            <Button variant="destructive" onClick={() => void apply(true)} disabled={busy}>
+              Aplicar mesmo assim
+            </Button>
+          </CardContent>
+        </Card>
+      ) : null}
 
       {diagnostics ? (
         <Card>

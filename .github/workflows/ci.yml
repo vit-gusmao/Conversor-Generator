@@ -99,3 +99,46 @@ jobs:
       - name: Test converter
         working-directory: services/converter
         run: pytest tests -q
+
+  desktop:
+    # Electron shell tests mock 'electron' and branch on process.platform, so
+    # they run on Linux. The Windows packaging pipeline is desktop.yml.
+    name: desktop (Electron shell, unit tests)
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install desktop
+        run: npm --prefix apps/desktop ci
+
+      - name: Test desktop
+        run: npm --prefix apps/desktop test
+
+      - name: Build desktop (tsc)
+        run: npm --prefix apps/desktop run build
+
+  mcp:
+    name: mcp (adapter tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/mcp/package-lock.json
+
+      - name: Install mcp
+        run: npm --prefix apps/mcp ci
+
+      - name: Test mcp
+        run: npm run test:mcp

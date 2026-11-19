@@ -27,10 +27,10 @@ export class InternalTokenGuard implements CanActivate {
     const token = Array.isArray(header) ? header[0] : header;
 
     if (!token) {
-      throw ApiError.unauthenticated({ reason: 'missing_internal_token' });
+      throw ApiError.unauthorizedInternal({ reason: 'missing_internal_token' });
     }
     if (!safeEquals(token, this.config.converterInternalToken)) {
-      throw ApiError.unauthenticated({ reason: 'invalid_internal_token' });
+      throw ApiError.unauthorizedInternal({ reason: 'invalid_internal_token' });
     }
     return true;
   }

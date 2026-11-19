@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.deps import ApiError
+from api.serialization import iso_utc
 from api.service import _normalize_options
 from config import settings
 from models.db import (
@@ -37,6 +38,8 @@ TERMINAL_ITEM_STATUSES = frozenset(
 UPLOAD_PHASE_STATUSES = frozenset(
     {"pending_upload", "uploading", "upload_failed"}
 )
+#: Upload states from which the bytes can still be resumed (gateway parity).
+UPLOAD_RESUMABLE_STATUSES = frozenset({"pending_upload", "uploading", "upload_failed"})
 ACTIVE_STATUSES = frozenset(
     {
         "received",
@@ -139,19 +142,31 @@ def effective_item_status(item: PublicBatchItemRow, conversion_status: str | Non
     return "processing"
 
 
+#: Keys of `_counts` that are final outcomes. `_counts` reports warnings under
+#: `with_warnings` (not the item status name), so the terminal sum uses these.
+_TERMINAL_COUNT_KEYS = ("completed", "with_warnings", "failed", "cancelled", "upload_failed")
+#: Terminal outcomes that flag the batch for review.
+_PROBLEM_COUNT_KEYS = ("failed", "cancelled", "with_warnings", "upload_failed")
+
+
+def _conversion_status(session: Session, item: PublicBatchItemRow) -> str | None:
+    """Status of the conversion an item points at, or None when it has none."""
+    if not item.conversion_id:
+        return None
+    return session.execute(
+        select(PublicConversionRow.status).where(PublicConversionRow.id == item.conversion_id)
+    ).scalar_one_or_none()
+
+
 def _batch_status(counts: dict[str, int], sealed: bool, cancel_requested: bool) -> str:
     total = int(counts.get("total_items", 0))
     if cancel_requested and counts.get("cancelled", 0) == total and total > 0:
         return "cancelled"
     if not sealed:
         return "accepting"
-    terminal = sum(counts.get(status, 0) for status in TERMINAL_ITEM_STATUSES)
+    terminal = sum(int(counts.get(key, 0)) for key in _TERMINAL_COUNT_KEYS)
     if terminal >= total:
-        problems = (
-            counts.get("failed", 0)
-            + counts.get("cancelled", 0)
-            + counts.get("with_warnings", 0)
-        )
+        problems = sum(int(counts.get(key, 0)) for key in _PROBLEM_COUNT_KEYS)
         return "completed_with_errors" if problems > 0 else "completed"
     return "processing"
 
@@ -305,8 +320,8 @@ def item_payload(
         "pages_failed": item.pages_failed,
         "phase": item.phase,
         "error": item.error_json or None,
-        "created_at": _iso(item.created_at),
-        "updated_at": _iso(item.updated_at),
+        "created_at": iso_utc(item.created_at),
+        "updated_at": iso_utc(item.updated_at),
         "links": _item_links(item.batch_id, item.id, item.conversion_id),
     }
 
@@ -325,20 +340,12 @@ def batch_payload(
         "client_batch_key": batch.client_batch_key,
         "counts": resolved_counts,
         "progress": resolved_progress,
-        "created_at": _iso(batch.created_at),
-        "sealed_at": _iso(batch.sealed_at),
-        "cancel_requested_at": _iso(batch.cancel_requested_at),
+        "created_at": iso_utc(batch.created_at),
+        "sealed_at": iso_utc(batch.sealed_at),
+        "cancel_requested_at": iso_utc(batch.cancel_requested_at),
         "version": int(batch.version or 1),
         "links": _links(batch.id),
     }
-
-
-def _iso(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.isoformat()
 
 
 def emit_event(
@@ -478,14 +485,9 @@ class BatchService:
         size = int(size_bytes or 0)
         if size <= 0:
             raise ApiError(400, "INVALID_FILE", "O arquivo está vazio.")
-        max_file = settings.upload_max_bytes if settings.upload_max_bytes else None
-        if max_file and size > max_file:
-            raise ApiError(
-                400,
-                "FILE_TOO_LARGE",
-                f"O arquivo excede o limite de {max_file // (1024 * 1024)} MiB.",
-            )
-
+        # No size ceiling here: the resumable path transfers the document in
+        # parts and the document is processed whole. The single-request cap
+        # (`UPLOAD_MAX_BYTES`) applies only to `POST /api/v1/conversions`.
         kind = declared_kind(safe_name)
         if kind == "unknown":
             raise ApiError(
@@ -529,7 +531,7 @@ class BatchService:
                     "part_size": settings.upload_part_bytes,
                     "next_part": _next_part(session, existing.upload_id),
                     "replayed": True,
-                    "expires_at": _iso(upload.expires_at) if upload else None,
+                    "expires_at": iso_utc(upload.expires_at) if upload else None,
                 }
 
             ordinal = (
@@ -610,7 +612,7 @@ class BatchService:
                 "part_size": settings.upload_part_bytes,
                 "next_part": 0,
                 "replayed": False,
-                "expires_at": _iso(upload.expires_at),
+                "expires_at": iso_utc(upload.expires_at),
             }
         finally:
             session.close()
@@ -628,46 +630,66 @@ class BatchService:
         session = get_session_factory()()
         try:
             batch = self._load(session, owner_id, batch_id)
-            query = (
-                select(PublicBatchItemRow, PublicConversionRow.status)
-                .outerjoin(
-                    PublicConversionRow,
-                    PublicConversionRow.id == PublicBatchItemRow.conversion_id,
-                )
-                .where(PublicBatchItemRow.batch_id == batch.id)
-                .order_by(PublicBatchItemRow.ordinal, PublicBatchItemRow.id)
-                .limit(size + 1)
-            )
-            decoded = decode_cursor(cursor)
-            if decoded:
-                ordinal = int(decoded.get("ordinal", 0))
-                last_id = str(decoded.get("id", ""))
-                query = query.where(
-                    (PublicBatchItemRow.ordinal > ordinal)
-                    | (
-                        (PublicBatchItemRow.ordinal == ordinal)
-                        & (PublicBatchItemRow.id > last_id)
+            after = decode_cursor(cursor)
+
+            def page_query(scan_after: dict[str, Any] | None, chunk: int):
+                query = (
+                    select(PublicBatchItemRow, PublicConversionRow.status)
+                    .outerjoin(
+                        PublicConversionRow,
+                        PublicConversionRow.id == PublicBatchItemRow.conversion_id,
                     )
+                    .where(PublicBatchItemRow.batch_id == batch.id)
+                    .order_by(PublicBatchItemRow.ordinal, PublicBatchItemRow.id)
+                    .limit(chunk)
                 )
+                if scan_after:
+                    ordinal = int(scan_after.get("ordinal", 0))
+                    last_id = str(scan_after.get("id", ""))
+                    query = query.where(
+                        (PublicBatchItemRow.ordinal > ordinal)
+                        | (
+                            (PublicBatchItemRow.ordinal == ordinal)
+                            & (PublicBatchItemRow.id > last_id)
+                        )
+                    )
+                return query
 
-            rows = session.execute(query).all()
-            has_more = len(rows) > size
-            rows = rows[:size]
-
-            items = [
-                item_payload(item, conversion_status=conversion_status)
-                for item, conversion_status in rows
-            ]
-            if status:
-                items = [payload for payload in items if payload["status"] == status]
+            # The status is derived from the conversion, so it cannot be
+            # filtered in SQL. Scan forward in chunks and keep only matches:
+            # the page is filled before the limit applies, and the cursor
+            # always points at the last item returned, so no item is skipped.
+            chunk = max(size + 1, 200)
+            matched: list[dict[str, Any]] = []
+            cursor_item: PublicBatchItemRow | None = None
+            has_more = False
+            scan_after = after
+            done = False
+            while not done:
+                rows = session.execute(page_query(scan_after, chunk)).all()
+                for item, conversion_status in rows:
+                    payload = item_payload(item, conversion_status=conversion_status)
+                    if status and payload["status"] != status:
+                        continue
+                    if len(matched) == size:
+                        has_more = True
+                        done = True
+                        break
+                    matched.append(payload)
+                    cursor_item = item
+                if done or len(rows) < chunk:
+                    break
+                scan_after = {
+                    "ordinal": int(rows[-1][0].ordinal or 0),
+                    "id": rows[-1][0].id,
+                }
 
             next_cursor = None
-            if has_more and rows:
-                last_item = rows[-1][0]
+            if has_more and cursor_item is not None:
                 next_cursor = encode_cursor(
-                    {"ordinal": int(last_item.ordinal or 0), "id": last_item.id}
+                    {"ordinal": int(cursor_item.ordinal or 0), "id": cursor_item.id}
                 )
-            return {"items": items, "next_cursor": next_cursor}
+            return {"items": matched, "next_cursor": next_cursor}
         finally:
             session.close()
 
@@ -680,7 +702,7 @@ class BatchService:
                 return {
                     "batch_id": batch.id,
                     "status": batch.status,
-                    "sealed_at": _iso(batch.sealed_at),
+                    "sealed_at": iso_utc(batch.sealed_at),
                     "message": "O lote já estava selado.",
                 }
 
@@ -716,7 +738,7 @@ class BatchService:
             return {
                 "batch_id": batch.id,
                 "status": batch.status,
-                "sealed_at": _iso(batch.sealed_at),
+                "sealed_at": iso_utc(batch.sealed_at),
                 "message": "Lote selado.",
             }
         finally:
@@ -730,18 +752,24 @@ class BatchService:
                 batch.cancel_requested_at = now()
                 batch.version = int(batch.version or 1) + 1
 
-            # Active items are cancelled; published artifacts are never undone.
+            # Items still in flight are cancelled; finished items keep their
+            # outcome and published artifacts are never undone. The status is
+            # derived from the conversion, so the stored value is not enough.
             rows = session.execute(
-                select(PublicBatchItemRow).where(
-                    PublicBatchItemRow.batch_id == batch.id,
-                    PublicBatchItemRow.status.notin_(list(TERMINAL_ITEM_STATUSES)),
+                select(PublicBatchItemRow, PublicConversionRow.status)
+                .outerjoin(
+                    PublicConversionRow,
+                    PublicConversionRow.id == PublicBatchItemRow.conversion_id,
                 )
-            ).scalars()
+                .where(PublicBatchItemRow.batch_id == batch.id)
+            ).all()
             from api.service import ConversionService
 
             service = ConversionService()
-            for item in rows:
-                if item.conversion_id:
+            for item, conversion_status in rows:
+                if effective_item_status(item, conversion_status) in TERMINAL_ITEM_STATUSES:
+                    continue
+                if item.conversion_id and conversion_status not in TERMINAL_ITEM_STATUSES:
                     try:
                         service.cancel(owner_id=owner_id, conversion_id=item.conversion_id)
                     except ApiError:
@@ -767,10 +795,11 @@ class BatchService:
         try:
             batch = self._load(session, owner_id, batch_id)
             item = self._load_item(session, batch.id, item_id)
-            if item.status in TERMINAL_ITEM_STATUSES:
-                return item_payload(item)
+            conversion_status = _conversion_status(session, item)
+            if effective_item_status(item, conversion_status) in TERMINAL_ITEM_STATUSES:
+                return item_payload(item, conversion_status=conversion_status)
 
-            if item.conversion_id:
+            if item.conversion_id and conversion_status not in TERMINAL_ITEM_STATUSES:
                 from api.service import ConversionService
 
                 try:
@@ -790,7 +819,7 @@ class BatchService:
             )
             session.commit()
             session.refresh(item)
-            return item_payload(item)
+            return item_payload(item, conversion_status=conversion_status)
         finally:
             session.close()
 
@@ -806,6 +835,28 @@ class BatchService:
             item = self._load_item(session, batch.id, item_id)
 
             if scope == "upload":
+                if item.conversion_id:
+                    # The document is already converted: moving the item back
+                    # into the upload phase would hide a finished result.
+                    raise ApiError(
+                        409,
+                        "ALREADY_CONVERTED",
+                        "O item já foi convertido: repita a conversão, não o envio.",
+                    )
+                # Only an upload that has not finished can be resumed. Same rule as
+                # the gateway (UPLOAD_RESUMABLE_STATUSES): a cancelled item or one
+                # whose upload completed is not moved back into the upload phase.
+                if item.status not in UPLOAD_RESUMABLE_STATUSES:
+                    raise ApiError(
+                        409,
+                        "UPLOAD_STATE_CONFLICT",
+                        "Este item não está em um envio que possa ser retomado.",
+                        details={
+                            "item_id": item.id,
+                            "status": item.status,
+                            "reason": "upload_not_resumable",
+                        },
+                    )
                 # Keeps the same identity: the client resumes into the same
                 # session with the same client_item_id.
                 upload = (
@@ -833,7 +884,8 @@ class BatchService:
                     "NOT_READY",
                     "Este item ainda não possui uma conversão para repetir.",
                 )
-            if item.status not in TERMINAL_ITEM_STATUSES:
+            conversion_status = _conversion_status(session, item)
+            if effective_item_status(item, conversion_status) not in TERMINAL_ITEM_STATUSES:
                 raise ApiError(409, "CONVERSION_BUSY", "A conversão ainda está em andamento.")
 
             from api.service import ConversionService
@@ -844,7 +896,10 @@ class BatchService:
             item.status = "queued"
             item.phase = "conversion"
             session.commit()
-            return {"item": item_payload(item), "conversion": result}
+            return {
+                "item": item_payload(item, conversion_status="queued"),
+                "conversion": result,
+            }
         finally:
             session.close()
 
@@ -874,7 +929,7 @@ class BatchService:
                     "item_status": row.item_status,
                     "message": row.message,
                     "payload": row.payload_json or {},
-                    "at": _iso(row.created_at),
+                    "at": iso_utc(row.created_at),
                 }
                 for row in rows
             ]

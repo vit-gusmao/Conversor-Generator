@@ -70,7 +70,9 @@ class CheckpointRepository:
     ) -> CheckpointRef:
         data = encode_artifact(page)
         digest = hashlib.sha256(data).hexdigest()
-        artifact_key = f"runs/{run_id}/pages/{stage}/{page.page_number:06d}.json.gz"
+        # Content-addressed: a losing concurrent writer stores a different object and
+        # cannot overwrite the bytes the winning row points to.
+        artifact_key = f"runs/{run_id}/pages/{stage}/{page.page_number:06d}-{digest}.json.gz"
         get_storage().put_bytes(artifact_key, data, "application/gzip")
 
         session = get_session_factory()()
@@ -217,10 +219,19 @@ class CheckpointRepository:
             if row is None:
                 row = RunCheckpointRow(run_id=run_id, phase=phase)
                 session.add(row)
-            row.cursor = cursor
-            row.last_event_sequence = max(int(row.last_event_sequence or 0), int(event_sequence))
-            row.updated_at = utcnow()
-            session.commit()
+            _apply_cursor(row, cursor, event_sequence)
+            try:
+                session.commit()
+            except IntegrityError:
+                # Another writer inserted the (run, phase) row first: update that row.
+                session.rollback()
+                row = session.execute(
+                    select(RunCheckpointRow).where(
+                        RunCheckpointRow.run_id == run_id, RunCheckpointRow.phase == phase
+                    )
+                ).scalar_one()
+                _apply_cursor(row, cursor, event_sequence)
+                session.commit()
         finally:
             session.close()
 
@@ -234,6 +245,12 @@ class CheckpointRepository:
             ).scalar_one_or_none()
         finally:
             session.close()
+
+
+def _apply_cursor(row: RunCheckpointRow, cursor: str | None, event_sequence: int) -> None:
+    row.cursor = cursor
+    row.last_event_sequence = max(int(row.last_event_sequence or 0), int(event_sequence))
+    row.updated_at = utcnow()
 
 
 __all__ = [

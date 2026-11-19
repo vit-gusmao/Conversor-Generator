@@ -23,7 +23,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Iterable
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from audit.events import AuditEvent, AuditRecorder, canonical_timestamp, payload_hash
 from audit.manifest import build_export_text
@@ -36,6 +36,7 @@ from models.db import (
     CellEvidenceRow,
     CoverageRowModel,
     DecisionRow,
+    EngineJobRow,
     EngineUsageRow,
     ExportArtifactRow,
     ExtractedFieldRow,
@@ -73,6 +74,14 @@ class RunCancelled(Exception):
     The publication transaction refuses to commit, so a cancelled run can never
     leave artifacts behind. The engine is the authority: the API records a
     *request*, the engine decides whether it won.
+    """
+
+
+class LeaseLost(Exception):
+    """The worker's job fence is no longer current.
+
+    Another owner claimed the unit (the lease expired or was reassigned), so the
+    stale worker must publish nothing: the transaction is rolled back.
     """
 
 
@@ -199,6 +208,10 @@ class ConversionRepository:
             run = session.get(Run, run_id)
             if run is None:
                 return
+            if run.cancel_requested_at is not None or run.status == "cancelled":
+                # A cancelled run keeps its terminal state; late progress from
+                # a unit that has not yet observed the cancel is ignored.
+                return
             run.status = status
             run.stage = stage
             run.progress = round(max(0.0, min(1.0, progress)), 4)
@@ -272,11 +285,21 @@ class ConversionRepository:
         validation: dict[str, Any] | None,
         error_code: str | None = None,
         error_message: str | None = None,
+        job_id: int | None = None,
+        fence: int | None = None,
     ) -> None:
         with self._session() as session:
+            self._assert_fence(session, job_id, fence)
             run = session.get(Run, run_id)
             if run is None:
                 return
+            if run.cancel_requested_at is not None:
+                # A confirmed cancellation is the terminal outcome, whatever the
+                # unit reports last: a late "completed" must not flip it back.
+                status = "cancelled"
+                quality = "failed"
+                error_code = error_code or "CANCELLED"
+                error_message = error_message or "Conversão cancelada."
             run.status = status
             run.quality = quality
             run.stage = "done" if status in {"completed", "completed_with_warnings"} else run.stage
@@ -353,7 +376,31 @@ class ConversionRepository:
     # ------------------------------------------------------------------ #
     # Persist the whole result
     # ------------------------------------------------------------------ #
-    def persist(self, result: PipelineResult, recorder: AuditRecorder) -> None:
+    def _assert_fence(self, session, job_id: int | None, fence: int | None) -> None:
+        """Refuses to publish unless the caller still owns the job fence.
+
+        The UPDATE takes the job row's write lock for the rest of the
+        transaction, so a claim by another worker waits for this commit (or
+        fails the check). `job_id is None` is the inline, job-less path.
+        """
+        if job_id is None or fence is None:
+            return
+        result = session.execute(
+            update(EngineJobRow)
+            .where(EngineJobRow.id == job_id, EngineJobRow.fence == fence)
+            .values(updated_at=utcnow())
+        )
+        if result.rowcount != 1:
+            raise LeaseLost(f"job {job_id} fence {fence} is no longer current")
+
+    def persist(
+        self,
+        result: PipelineResult,
+        recorder: AuditRecorder,
+        *,
+        job_id: int | None = None,
+        fence: int | None = None,
+    ) -> None:
         run_id = recorder.run_id
         plan = result.plan
         ir = result.ir
@@ -361,6 +408,7 @@ class ConversionRepository:
 
         with self._session() as session:
             self._assert_publishable(session, run_id)
+            self._assert_fence(session, job_id, fence)
             self._clear_run(session, run_id)
 
             for page in ir.pages:
@@ -637,8 +685,9 @@ class ConversionRepository:
                 )
             # Final arbitration point: a cancellation confirmed while the
             # transaction was open refuses the commit, so no artifact and no
-            # cell is published.
+            # cell is published. The fence is checked again for the same reason.
             self._assert_publishable(session, run_id)
+            self._assert_fence(session, job_id, fence)
             session.commit()
 
         # Artifacts (outside the DB transaction: object storage is not
@@ -832,7 +881,9 @@ class ConversionRepository:
             ExportArtifactRow,
         ):
             session.query(model).filter(model.run_id == run_id).delete()
-        session.commit()
+        # Flush, not commit: the delete belongs to the caller's publication
+        # transaction, so a failure later on rolls the old rows back too.
+        session.flush()
 
     # ------------------------------------------------------------------ #
     # Reads — run state

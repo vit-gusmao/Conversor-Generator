@@ -15,7 +15,7 @@ parses a PDF: every conversion is delegated over HTTP to the Python engine
 
 ## Requirements
 
-- Node.js 22 (recommended; same major as the Docker images). `package.json` declares `>=20`.
+- Node.js 22 (recommended; same major as the Docker images). `package.json` não declara o campo `engines`; o `.nvmrc` da raiz fixa a versão usada pela CI.
 - The Python engine reachable at `CONVERTER_INTERNAL_URL` (default `http://localhost:8000`).
 
 ## Quick start
@@ -57,9 +57,9 @@ The full list is in [`.env.example`](../../.env.example) and
 | `PUBLIC_API_URL` | `http://localhost:3000` | Informational: advertised public URL. Not used by request handling. |
 | `RUNTIME_MODE` | `full` | Reported as `runtime_mode` in `/settings`. It does not change routing. |
 | `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3000` | CORS allow-list |
-| `API_DATABASE_URL` | `file:./data/api.db` | Prisma datasource (SQLite). Resolved relative to `prisma/schema.prisma`, see [Database](#database). |
-| `API_POSTGRES_URL` | — | used by `prisma/schema.postgres.prisma` |
-| `JWT_SECRET` | dev value | HMAC secret for bearer tokens |
+| `API_DATABASE_URL` | `file:./data/api.db` | Database URL the API connects to, when set. SQLite paths resolve relative to `prisma/schema.prisma`, see [Database](#database). |
+| `API_POSTGRES_URL` | — | Database URL used only when `API_DATABASE_URL` is unset (the PostgreSQL deployment). Also the variable read by `prisma/schema.postgres.prisma`. |
+| `JWT_SECRET` | dev value | HMAC secret for bearer tokens. In `NODE_ENV=production` the dev value stops startup. |
 | `JWT_EXPIRES_IN` | `7d` | token lifetime (`7d`, `12h`, `3600`) |
 | `AUTH_MODE` | `optional` | `optional` = device sessions, `required` = 401 without token |
 
@@ -177,9 +177,9 @@ Jobs and cancellations are written to an `OutboxEvent` table in the same
 database transaction as the conversion and its run, then delivered by
 `OutboxService` (`modules/conversions/outbox.service.ts`):
 
-- The drainer runs every **5 s** and takes up to 20 rows whose `availableAt` has passed. Dispatch is also attempted right away after a create.
+- The drainer runs every **5 s** and takes up to 20 rows per pass (`drain(limit = 20)`) whose `availableAt` has passed. Dispatch is also attempted right away after a create.
 - A dispatcher claims a row with a compare-and-set **lease of 60 s**. A row whose lease expired is picked up again. The engine is idempotent per `run_id`, so a replay is harmless.
-- A failed delivery is retried with exponential backoff (`min(60 s, 1 s × 2^attempts)`). After **8 attempts** the row becomes `failed`, and the conversion and its run are marked `failed` with **`QUEUE_DELIVERY_FAILED`**, so nothing sits in `queued` forever. `OutboxService.requeue()` can move a failed row back to `pending`; no HTTP route calls it today.
+- A failed delivery is retried with exponential backoff (`min(60 s, 1 s × 2^min(attempts, 6))`). After **8 attempts** the row becomes `failed`, and the conversion and its run are marked `failed` with **`QUEUE_DELIVERY_FAILED`**, so nothing sits in `queued` forever. `OutboxService.requeue()` can move a failed row back to `pending`; no HTTP route calls it today.
 
 A crash between "task created" and "engine notified" is therefore recovered by the drainer.
 
@@ -200,13 +200,14 @@ and rejects any key that escapes that root.
 
 | Object | Key layout |
 | --- | --- |
-| Stored document | `documents/<ownerId>/<ab>/<sha256>.<ext>` — `<ab>` is the first two hex chars of the SHA-256; `<ext>` is the document extension (`pdf` by default, the detected format for images). Keys are derived from the content hash, so the same bytes for one owner map to the same key. |
+| Stored document | `documents/<ownerId>/<ab>/<sha256>.<ext>` — `<ab>` is the first two hex chars of the SHA-256; `<ext>` is the document extension. `<ownerId>` is sanitized (characters outside `A-Za-z0-9_-` become `_`). Keys are derived from the content hash, so the same bytes for one owner map to the same key. |
 | Upload part | `uploads/<uploadId>/<00001>.part` (sequential part number, 5 digits) |
 | Upload part in flight | `uploads/<uploadId>/incoming/<00001>-<nonce>.part`, renamed into place only after a full write |
 | Assembled upload | `uploads/<uploadId>/assembled.bin` before it is moved to its document key |
 
-`S3StorageService` uses the same key layout in the bucket `S3_BUCKET`. It requires
-`@aws-sdk/client-s3`, installed lazily: the app boots, and tests pass, without it.
+`S3StorageService` uses the same key layout in the bucket `S3_BUCKET`. The SDK
+(`@aws-sdk/client-s3`) is a declared dependency and is loaded on demand when
+`STORAGE_BACKEND=s3`.
 
 ## Database
 
@@ -214,8 +215,17 @@ SQLite by default (`prisma/schema.prisma`). The datasource URL
 `file:./data/api.db` is resolved by Prisma **relative to the schema file**, so the
 database is `apps/api/prisma/data/api.db`, not `apps/api/data/api.db`.
 
+Which variable is read:
+
+- **Runtime** (the API process): `API_DATABASE_URL` if it is set; otherwise
+  `API_POSTGRES_URL` if it is set; otherwise `file:./data/api.db`.
+- **Prisma CLI** (`prisma generate`, `prisma db push`): the variable named in the
+  `url = env(...)` line of the schema in use. `schema.prisma` reads
+  `API_DATABASE_URL`; `schema.postgres.prisma` reads `API_POSTGRES_URL`.
+
 For PostgreSQL copy `prisma/schema.postgres.prisma` over `prisma/schema.prisma`, set
-`API_POSTGRES_URL` and run `npx prisma generate && npx prisma db push`.
+`API_POSTGRES_URL` (and `API_DATABASE_URL` to the same URL, so the CLI and the
+runtime agree) and run `npx prisma generate && npx prisma db push`.
 
 In Docker, do not copy by hand: pass `--build-arg DATABASE_PROVIDER=postgres`
 when building the image and `DATABASE_PROVIDER=postgres` at runtime. The

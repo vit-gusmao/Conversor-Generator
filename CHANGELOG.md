@@ -7,7 +7,51 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
 ## [Não lançado]
 
-### Adicionado — upgrade de fontes, planilhas, agendador e desktop
+### Corrigido — dados, filas, lotes, limites e pacote Windows
+
+- **Separador decimal:** uma cauda de 4 ou mais dígitos após vírgula ou ponto passa a
+  ser parte decimal (antes podia ser lida como milhar). Vale para o valor de cada
+  célula (`engine/normalization/normalizer.py`).
+- **CSV canônico:** `csv.value_mode=canonical` converte apenas números que
+  inequivocamente são pt-BR ou en; identificadores com zeros à esquerda e texto livre
+  permanecem inalterados (`exports/csv_writer.py`).
+- **Fila durável:** jobs do motor e de indexação de conhecimento usam lease com
+  `fence`; uma escrita de um worker com fence antigo é rejeitada. A entrega da outbox
+  da API usa lease de 60 s.
+- **Estado de lote:** o status do lote é derivado de forma única a partir dos
+  contadores, do selamento e do pedido de cancelamento (`_batch_status` em
+  `api/batch_service.py`).
+- **Teto de tamanho:** o envio simples (`POST /conversions`) respeita o menor valor
+  entre `UPLOAD_MAX_BYTES` e `CONVERTER_MAX_PDF_BYTES`. Lotes e envio por partes não
+  têm teto de documento; cada parte acima de `part_size` é recusada com `413
+  FILE_TOO_LARGE`.
+- **Aplicativo Windows:** o executável sai com o nome `conversor-generator.exe`
+  (`executableName` do electron-builder) e os `extraResources` apontam para o backend
+  e a SPA corretos; o workflow `desktop.yml` usa o cwd correto no CI.
+- **Inicializador Windows:** `starter-local-server.cmd` procura Python 3.11+ (prefere 3.12), recria o venv quando
+  necessário, reinstala as dependências só quando `pyproject.toml` muda, compila a
+  interface quando falta e aguarda `/health`.
+
+### Plano — conclusão dos itens T8, T10 a T14
+
+- **T8:** calendário determinístico (DST e fuso IANA), claims com fence, executor
+  retomável, indexação durável com recuperação de jobs órfãos e limpeza do histórico
+  de automação. Retentativas de execução com espera de 30, 120 e 300 s. O `run-now`
+  responde `202` com `queued` e a flag `executor_active`.
+- **T10:** telas de Fontes (cadastro, validação e importação) e de Agendamentos
+  (lista, formulário e ocorrência).
+- **T11:** runtime empacotável com diretórios explícitos (`APP_DATA_DIR`, `WORK_DIR`,
+  `LOG_DIR`), entry point congelável (`desktop_entry.py`), spec do PyInstaller em
+  `packaging/converter.spec` e migração de banco com lock, backup (5 mais recentes)
+  e recusa de schema mais novo.
+- **T12:** shell Electron com supervisor do backend, isolamento de contexto,
+  perfil atômico e IPC validado.
+- **T13:** diagnóstico real de GLM-OCR e do LLM local (visão e geração), gerenciamento
+  de modelos pelo aplicativo e importação de GGUF por Modelfile gerado.
+- **T14:** CI Windows de empacotamento com smoke test do pacote, documentação
+  operacional e flags publicadas em `/capabilities`.
+
+### Adicionado — fontes, planilhas, agendador e desktop
 
 - **Contratos v3 de opções** com seção `spreadsheet` (abas, cabeçalho, encoding e
   dialeto CSV, política de fórmulas), `reader_version` estampada pelo servidor e
@@ -166,7 +210,7 @@ projeto adota [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 ### Conhecido e não implementado
 
 - Estado `REVIEW_REQUIRED` e endpoint de revisão humana: ausentes. Veja
-  [docs/API.md](docs/FLOW.md#limitações-e-divergências-conhecidas).
+  [docs/FLOW.md](docs/FLOW.md#limitações-e-divergências-conhecidas).
 - OCR por célula ou linha existe no componente, mas ainda não é acionado pelo
   pipeline.
 - A execução com Docker Compose não foi verificada no ambiente de construção.

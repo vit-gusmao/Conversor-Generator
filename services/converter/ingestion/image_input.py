@@ -79,8 +79,24 @@ def detect_signature(data: bytes) -> str | None:
         return "PSD"
     for signature, fmt, _mime in SIGNATURES:
         if head.startswith(signature):
+            # Two-byte magics are too weak on their own: "BMF;Ativo" and
+            # "P2;Nome" are CSV rows, not bitmaps.
+            if fmt == "BMP" and not _valid_bmp_header(data):
+                continue
+            if fmt == "PNM" and not _valid_pnm_header(data):
+                continue
             return fmt
     return None
+
+
+def _valid_bmp_header(data: bytes) -> bool:
+    """BMP file header: at least 26 bytes, reserved fields (bytes 6-9) are zero."""
+    return len(data) >= 26 and data[6:10] == b"\0\0\0\0"
+
+
+def _valid_pnm_header(data: bytes) -> bool:
+    """Netpbm magic is always followed by whitespace (``P5 ...``, ``P1\\n``)."""
+    return data[2:3].isspace()
 
 
 def declared_mime(fmt: str | None) -> str | None:
@@ -117,11 +133,19 @@ def image_capabilities() -> list[dict[str, Any]]:
         },
         {
             "group": "advanced",
-            "formats": ["JPEG2000", "ICO", "PNM"],
+            "formats": ["ICO", "PNM"],
             "outputs": ["txt"],
             "multipage": False,
             "available": True,
             "dependency": "Pillow",
+        },
+        {
+            "group": "jpeg2000",
+            "formats": ["JPEG2000"],
+            "outputs": ["txt"],
+            "multipage": False,
+            "available": checks["jpg_2000"],
+            "dependency": "Pillow[jpeg2000] (OpenJPEG)",
         },
         {
             "group": "advanced-modern",
@@ -133,8 +157,17 @@ def image_capabilities() -> list[dict[str, Any]]:
             "dependency": "pillow-heif / Pillow[avif]",
         },
         {
+            "group": "photoshop",
+            "formats": ["PSD"],
+            "outputs": ["txt"],
+            "multipage": False,
+            "available": True,
+            "dependency": "Pillow",
+            "notes": "PSD é lido pelo Pillow (imagem composta); não depende de rawpy.",
+        },
+        {
             "group": "photographic",
-            "formats": ["PSD", "DNG/RAW"],
+            "formats": ["DNG/RAW"],
             "outputs": ["txt"],
             "multipage": False,
             "available": _module_available("rawpy"),

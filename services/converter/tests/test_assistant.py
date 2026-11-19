@@ -149,3 +149,90 @@ async def test_generation_failure_is_recoverable(monkeypatch):
     )
     error = next(item for item in events if item["type"] == "error")
     assert error["code"] == "MODEL_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_replay_after_failed_then_completed_attempt_does_not_crash(monkeypatch):
+    # AU2-13: a failed attempt followed by a completed one leaves two assistant
+    # rows for the same request; the replay lookup must pick the completed one.
+    monkeypatch.setattr(settings, "assistant_enabled", True)
+    owner = "assistant_owner_replay"
+    collection_id = _seed(owner, "Fonte suficiente para responder.")
+    service = AssistantService(FakeClient())  # type: ignore[arg-type]
+    conversation = service.create_conversation(owner_id=owner, collection_id=collection_id)
+    cid = conversation["conversation_id"]
+    kwargs = {"owner_id": owner, "conversation_id": cid, "content": "Fonte?", "request_id": "req_retry"}
+
+    await _collect(AssistantService(FailingClient()), **kwargs)  # type: ignore[arg-type]
+    await _collect(AssistantService(FakeClient(["Resposta final [1]."])), **kwargs)  # type: ignore[arg-type]
+    events = await _collect(AssistantService(FakeClient()), **kwargs)  # type: ignore[arg-type]
+
+    done = next(item for item in events if item["type"] == "done")
+    assert done["replayed"] is True
+    assert "Resposta final" in done["content"]
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_persists_reply_as_cancelled(monkeypatch):
+    # AU2-14: closing the stream while it is suspended at a yield must still
+    # persist the assistant row (status cancelled) instead of leaving it pending.
+    monkeypatch.setattr(settings, "assistant_enabled", True)
+    owner = "assistant_owner_disconnect"
+    collection_id = _seed(owner, "Fonte suficiente para responder.")
+    service = AssistantService(FakeClient(["parte um ", "parte dois [1]."]))  # type: ignore[arg-type]
+    conversation = service.create_conversation(owner_id=owner, collection_id=collection_id)
+    cid = conversation["conversation_id"]
+
+    stream = service.stream_reply(
+        owner_id=owner, conversation_id=cid, content="Fonte?", request_id="req_disconnect"
+    )
+    async for item in stream:
+        if item["type"] == "delta":
+            break
+    await stream.aclose()
+
+    stored = service.get_conversation(owner, cid)
+    assistant_rows = [message for message in stored["messages"] if message["role"] == "assistant"]
+    assert assistant_rows
+    assert assistant_rows[-1]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_transport_error_maps_to_model_unavailable(monkeypatch):
+    # AU2-15: any httpx transport failure is a MODEL_UNAVAILABLE, not a crash.
+    import httpx
+
+    from assistant import ollama_client as module
+
+    def handler(request):
+        raise httpx.RemoteProtocolError("connection dropped by server")
+
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    client = module.OllamaClient(base_url="http://ollama.test", model="qwen3.5:4b")
+    with pytest.raises(OllamaError) as info:
+        async for _ in client.chat_stream([{"role": "user", "content": "oi"}]):
+            pass
+    assert info.value.code == "MODEL_UNAVAILABLE"
+
+
+def test_model_status_requires_exact_tag_match(monkeypatch):
+    # AU2-16: configured qwen3.5:4b is not available when only qwen3.5:9b is installed.
+    from assistant.ollama_client import OllamaClient
+
+    client = OllamaClient(base_url="http://ollama.test", model="qwen3.5:4b")
+    monkeypatch.setattr(client, "server_version", lambda: "0.5.1")
+    monkeypatch.setattr(client, "list_models", lambda: [{"name": "qwen3.5:9b"}])
+    assert client.model_status()["available"] is False
+
+    monkeypatch.setattr(client, "list_models", lambda: [{"name": "qwen3.5:4b"}])
+    assert client.model_status()["available"] is True
+
+    untagged = OllamaClient(base_url="http://ollama.test", model="qwen3.5")
+    monkeypatch.setattr(untagged, "server_version", lambda: "0.5.1")
+    monkeypatch.setattr(untagged, "list_models", lambda: [{"name": "qwen3.5:latest"}])
+    assert untagged.model_status()["available"] is True

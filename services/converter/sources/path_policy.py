@@ -25,6 +25,26 @@ class PathPolicyError(Exception):
         self.details = details or {}
 
 
+#: Exact Windows device stems. Only the stem before the first dot counts, so
+#: ``Compras.xlsx`` and ``Comissões`` are ordinary names while ``con.txt`` and
+#: ``COM1`` are devices. Superscript digits are reserved too on Windows.
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+    | {"COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"}
+)
+
+
+def is_windows_reserved_name(component: str) -> bool:
+    """True when a path component names a Windows device (case-insensitive).
+
+    Windows ignores trailing spaces in the stem, so ``"NUL .txt"`` is ``NUL``.
+    """
+    stem = component.split(".", 1)[0].rstrip(" ").upper()
+    return stem in _WINDOWS_RESERVED_STEMS
+
+
 def _windows_drive(path: PureWindowsPath) -> str | None:
     return path.drive or None
 
@@ -118,8 +138,7 @@ def resolve_source_path(
                 details={"relative_path": relative_path},
             )
         if sys.platform == "win32":
-            lowered = part.lower()
-            if lowered in {"con", "prn", "aux", "nul"} or lowered.startswith(("com", "lpt")):
+            if is_windows_reserved_name(part):
                 raise _reject(
                     "SPECIAL_PATH_DENIED",
                     f"Nome especial de dispositivo não é permitido: {part}.",
@@ -170,9 +189,15 @@ def _casefold_parts(path: Path) -> tuple[str, ...]:
 
 
 def assert_snapshot_inside_root(final_path: Path, root_canonical_path: str) -> None:
-    """Post-open containment proof (TOCTOU backstop for swapped junctions)."""
-    root_parts = _casefold_parts(Path(root_canonical_path))
-    final_parts = _casefold_parts(Path(final_path))
+    """Post-open containment proof (TOCTOU backstop for swapped junctions).
+
+    Both sides are compared in their real form: the opened file is always
+    resolved, so the root must be resolved too, or a junction/subst/8.3 root
+    would look like an escape. A junction *inside* the root that leads
+    elsewhere still resolves outside and is refused.
+    """
+    root_parts = _casefold_parts(Path(os.path.realpath(root_canonical_path)))
+    final_parts = _casefold_parts(Path(os.path.realpath(final_path)))
     if final_parts[: len(root_parts)] != root_parts:
         raise _reject(
             "PATH_ESCAPED",

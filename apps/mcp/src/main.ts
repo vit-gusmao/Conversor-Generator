@@ -25,7 +25,7 @@ function log(message: string): void {
 
 async function buildRuntime(config: McpConfig) {
   const principal = await resolvePrincipal(config);
-  const store = await SubmissionStore.open(config.configDir);
+  const store = await SubmissionStore.open(config.configDir, { log });
 
   const api = new ApiClient({
     baseUrl: principal.apiBaseUrl,

@@ -48,14 +48,25 @@ function read(env: NodeJS.ProcessEnv, key: string): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-/** Expands `~` and `~/x`, then resolves against the current directory. */
-export function expandPath(value: string): string {
-  let expanded = value;
-  if (value === '~') expanded = homedir();
-  else if (value.startsWith('~/') || value.startsWith('~\\')) {
-    expanded = path.join(homedir(), value.slice(2));
+/**
+ * Expands a leading `~` or `~/x` to the home directory and nothing else.
+ * Tool inputs use this so absoluteness can be checked before resolution.
+ */
+export function expandHome(value: string): string {
+  if (value === '~') return homedir();
+  if (value.startsWith('~/') || value.startsWith('~\\')) {
+    return path.join(homedir(), value.slice(2));
   }
-  return path.resolve(expanded);
+  return value;
+}
+
+/**
+ * Expands `~` and then resolves against the current directory. Only for
+ * server configuration; tool inputs must use `expandHome` and reject relative
+ * results instead of silently anchoring them to the working directory.
+ */
+export function expandPath(value: string): string {
+  return path.resolve(expandHome(value));
 }
 
 function parseApiBaseUrl(raw: string | undefined): string {

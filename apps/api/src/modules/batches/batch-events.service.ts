@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import type { BatchEvent } from '@pdf2x/contracts';
-import { Subject, type Observable } from 'rxjs';
+import { Observable, Subject } from 'rxjs';
 
 import { PrismaService } from '../../database/prisma.service';
 import { parseJson } from '../../database/json.util';
@@ -40,12 +40,31 @@ export class BatchEventsService implements OnModuleDestroy {
     this.streams.clear();
   }
 
+  /**
+   * Live fan-out for one batch. The per-batch subject exists only while someone
+   * is subscribed: the last unsubscribe removes it, so abandoned batches do not
+   * accumulate in memory.
+   */
   stream(batchId: string): Observable<BatchEvent> {
-    const existing = this.streams.get(batchId);
-    if (existing) return existing.asObservable();
-    const subject = new Subject<BatchEvent>();
-    this.streams.set(batchId, subject);
-    return subject.asObservable();
+    return new Observable<BatchEvent>((subscriber) => {
+      let subject = this.streams.get(batchId);
+      if (!subject) {
+        subject = new Subject<BatchEvent>();
+        this.streams.set(batchId, subject);
+      }
+      const inner = subject.subscribe(subscriber);
+      return () => {
+        inner.unsubscribe();
+        this.pruneIfUnobserved(batchId);
+      };
+    });
+  }
+
+  private pruneIfUnobserved(batchId: string): void {
+    const subject = this.streams.get(batchId);
+    if (subject && !subject.observed) {
+      this.streams.delete(batchId);
+    }
   }
 
   async record(

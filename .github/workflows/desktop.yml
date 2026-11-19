@@ -2,6 +2,10 @@ name: Desktop (Windows)
 
 # Pipeline de distribuição do aplicativo Windows. Separado da CI Linux: depende
 # de toolchain Windows e de um ambiente Python fixado para o PyInstaller.
+#
+# A sequência de build vive em scripts/build-desktop.ps1 (a mesma usada
+# localmente); este workflow prepara o ambiente, chama o script e valida o
+# resultado com scripts/smoke-desktop.ps1.
 on:
   workflow_dispatch:
   push:
@@ -34,55 +38,39 @@ jobs:
         with:
           python-version: '3.12'
 
-      # --- backend (contracts/SPA + venv fixado + PyInstaller) ---------------
-      - name: Build contracts and SPA
-        run: |
-          npm --prefix packages/contracts ci
-          npm --prefix packages/contracts run build
-          npm --prefix apps/web ci
-          npm --prefix apps/web run build
-
-      - name: Install converter dependencies
+      # build-desktop.ps1 only accepts the venv at services\converter\.venv.
+      # Tests run before the OCR extra is installed, so the test environment
+      # matches the Linux converter job (no Tesseract binary on this runner).
+      - name: Create converter venv (test + migrate + pyinstaller)
         working-directory: services/converter
         run: |
           python -m venv .venv
-          .venv\Scripts\python.exe -m pip install --upgrade pip
-          .venv\Scripts\python.exe -m pip install -e ".[test,migrate]" pyinstaller
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e ".[test,migrate]" pyinstaller
 
       - name: Run converter tests
         working-directory: services/converter
-        run: .venv\Scripts\python.exe -m pytest tests -q
+        run: .\.venv\Scripts\python.exe -m pytest tests -q
 
-      - name: Freeze backend (onedir)
+      - name: Install OCR extra for the frozen bundle
         working-directory: services/converter
-        run: .venv\Scripts\pyinstaller.exe --clean --noconfirm packaging/converter.spec
+        run: .\.venv\Scripts\python.exe -m pip install -e ".[ocr]"
 
-      - name: Smoke test the frozen backend (clean cwd, no repo on PATH)
-        shell: pwsh
-        run: |
-          $data = Join-Path $env:RUNNER_TEMP "cg-userdata"
-          $env:APP_DATA_DIR = $data
-          $env:WORK_DIR = Join-Path $data "work"
-          $env:LOG_DIR = Join-Path $data "logs"
-          $env:STORAGE_LOCAL_ROOT = Join-Path $data "storage"
-          $env:WEB_DIST_DIR = Join-Path $env:GITHUB_WORKSPACE "apps/web/dist"
-          $env:CONVERTER_OCR_ENABLED = "false"
-          $out = & .\dist\converter\converter.exe --no-serve
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          if ($out -notmatch "CONVERTER_READY") { throw "readiness ausente" }
-          if (-not (Test-Path (Join-Path $data "converter.db"))) { throw "banco não criado" }
-
-      # --- desktop shell ----------------------------------------------------
       - name: Desktop unit tests
         run: |
           npm --prefix apps/desktop ci
           npm --prefix apps/desktop test
           npm --prefix apps/desktop run build
 
-      - name: Package installer
-        working-directory: apps/desktop
-        # electron-builder resolves extraResources relative to this directory.
-        run: npx electron-builder --win nsis --x64
+      # Contracts, SPA, PyInstaller (onedir) with backend smoke, electron-builder
+      # NSIS + win-unpacked into apps/desktop/release.
+      - name: Build desktop package
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+
+      - name: Smoke test packaged app
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-desktop.ps1
+          -AppDir apps/desktop/release/win-unpacked -RequireGuard
 
       - name: Verify executable name and artifacts
         shell: pwsh

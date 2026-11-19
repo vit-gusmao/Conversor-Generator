@@ -16,7 +16,7 @@ cookie) and only sees its own files.
 
 ## Requirements
 
-- Node.js 22 (recommended; same major as the Docker images)
+- Node.js 22 (recommended; same major as the Docker images). Vite 7 requires Node.js 20.19+ or 22+; `starter-local-server.cmd` checks for this.
 - The contracts package at `packages/contracts` (installed via `file:../../packages/contracts`)
 - A running API: `apps/api` on port 3000 (full mode), or the engine on port 8000 (standalone mode)
 
@@ -58,7 +58,7 @@ Uploads use the resumable batch API, not the legacy single-shot `POST /conversio
 Up to **3 documents transfer at the same time** (`MAX_PARALLEL_TRANSFERS` in
 `src/services/transfer.ts`). This is client-side politeness. Within one document, parts are sent one at a time. `UPLOAD_CONCURRENCY` is not used by the web client and is not advertised by the server.
 
-Before upload, the client validates size against `upload.max_file_bytes` from `/settings`. Both backends return `null` by default, so the client does not check size. The standalone server still rejects batch items above `UPLOAD_MAX_BYTES` (50 MiB). The whole-file SHA-256 has no fixed 64 MiB limit; `LARGE_FILE_HASH_WARNING_BYTES` is an unused constant.
+Before upload, the client validates size against `upload.max_file_bytes` from `/settings`. Both backends return `null` by default, so the client does not check size. Batch items and resumable uploads have no size ceiling by default. The only single-request cap in the standalone engine is on the legacy `POST /conversions` (`min(CONVERTER_MAX_PDF_BYTES, UPLOAD_MAX_BYTES)`, 50 MiB by default), which the web client does not use. `LARGE_FILE_HASH_WARNING_BYTES` (`src/services/transfer.ts`) is defined but not read.
 
 Interrupted uploads resume from the server's `next_part`, so parts already
 confirmed are not sent again.
@@ -113,8 +113,9 @@ npm run preview     # serve dist/ locally
 
 `dist/` is the build output. In **standalone mode** the engine serves it from
 `apps/web/dist` at `/`, so after `npm run build` the whole product runs from
-`http://127.0.0.1:8000`. `starter-server.cmd` builds it automatically when it is
-missing.
+`http://127.0.0.1:8000`. `starter-local-server.cmd` builds it automatically when it is missing (compiling
+`packages/contracts` first and installing dependencies with `npm ci` when
+`node_modules` is absent). `--rebuild-web` forces a new build.
 
 ## Test
 

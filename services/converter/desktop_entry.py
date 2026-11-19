@@ -17,13 +17,61 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
 import socket
 import sys
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 
 ENGINE_VERSION_FALLBACK = "0.0.0"
+
+DEV_INTERNAL_TOKEN = "dev-internal-token-change-me"
+DEV_JWT_SECRET = "dev-jwt-secret-change-me"
+MIN_SECRET_LENGTH = 16
+#: Exit status for "refused to start: configuration" (EX_CONFIG).
+EXIT_REFUSED = 78
+
+
+class DesktopSecretError(RuntimeError):
+    """The supervisor did not supply a usable secret; the process must not serve."""
+
+
+def required_desktop_secrets(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Secrets the Electron supervisor must pass in the environment.
+
+    `config.settings` reads the environment once, when it is first imported.
+    A secret generated after that import is silently ignored and the documented
+    development default stays active (AU1-23). So the process refuses to start
+    unless every secret is supplied, and it never generates a fallback here.
+    """
+    env = os.environ if environ is None else environ
+    rules: tuple[tuple[str, str | None], ...] = (
+        ("CONVERTER_INTERNAL_TOKEN", DEV_INTERNAL_TOKEN),
+        ("DESKTOP_BOOTSTRAP_SECRET", None),
+        ("JWT_SECRET", DEV_JWT_SECRET),
+    )
+    values: dict[str, str] = {}
+    for name, insecure in rules:
+        value = (env.get(name) or "").strip()
+        if len(value) < MIN_SECRET_LENGTH or value == insecure:
+            raise DesktopSecretError(
+                f"{name} não foi fornecido pelo aplicativo desktop "
+                "(ausente, curto demais ou com o valor de desenvolvimento)."
+            )
+        values[name] = value
+    return values
+
+
+def verify_settings_secrets(settings_obj: object, supplied: Mapping[str, str]) -> None:
+    """The settings singleton must carry exactly the supplied values."""
+    actual = {
+        "CONVERTER_INTERNAL_TOKEN": getattr(settings_obj, "converter_internal_token", None),
+        "DESKTOP_BOOTSTRAP_SECRET": getattr(settings_obj, "desktop_bootstrap_secret", None),
+        "JWT_SECRET": getattr(settings_obj, "jwt_secret", None),
+    }
+    for name, value in actual.items():
+        if value != supplied[name]:
+            raise DesktopSecretError(f"a configuração {name} não reflete o valor fornecido.")
 
 
 def _boot_id() -> str:
@@ -46,9 +94,18 @@ def prepare_runtime() -> dict:
     paths.ensure()
     paths.apply()
 
-    from models.db import init_db
+    # Exclusive lock, refusal of a newer schema and a consistent backup happen
+    # inside this call, before any table is created or altered (T11).
+    from models.db import get_engine
+    from runtime.db_migrate import run_startup_migrations
 
-    init_db()
+    run_startup_migrations(paths.app_data_dir, get_engine())
+
+    # The singleton has just been created from the environment: prove it holds
+    # the supplied secrets, not the development defaults.
+    from config import settings
+
+    verify_settings_secrets(settings, required_desktop_secrets())
 
     try:
         from version import ENGINE_VERSION  # type: ignore
@@ -92,8 +149,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-serve", action="store_true", help="Prepare runtime and exit (tests)")
     args = parser.parse_args(argv)
 
-    metadata = prepare_runtime()
+    # Refuse before ANY import that creates config.settings (AU1-23).
+    try:
+        required_desktop_secrets()
+    except DesktopSecretError as exc:
+        print(f"CONVERTER_REFUSED {exc}", file=sys.stderr, flush=True)
+        return EXIT_REFUSED
+    # Desktop mode is always host-guarded; the supervisor's profile sets this too.
+    os.environ["DESKTOP_HOST_ENABLED"] = "true"
+
+    from runtime.db_migrate import MigrationLockTimeout, SchemaTooNewError
+
+    try:
+        metadata = prepare_runtime()
+    except (SchemaTooNewError, MigrationLockTimeout) as exc:
+        # The database was not modified: refuse to serve it.
+        print(f"CONVERTER_REFUSED {exc}", file=sys.stderr, flush=True)
+        return EXIT_REFUSED
     if args.no_serve:
+        # Same guarantee as serving: READY only after the ASGI app imports, so
+        # the smoke test catches a broken bundle (e.g. a missing DLL).
+        from api.main import app  # noqa: F401
+
         publish_readiness(0, metadata["boot_id"], metadata["version"], None)
         return 0
 
@@ -106,15 +183,18 @@ def main(argv: list[str] | None = None) -> int:
     listener.listen(2048)
     port = int(listener.getsockname()[1])
 
-    # The internal token authenticates privileged requests from the host; the
-    # supervisor passes one, and we never fall back to the documented default.
-    token = os.environ.get("CONVERTER_INTERNAL_TOKEN") or os.environ.get(
-        "DESKTOP_BOOTSTRAP_SECRET"
-    )
-    if not token or token == "dev-internal-token-change-me":
-        token = secrets.token_urlsafe(32)
-    os.environ["CONVERTER_INTERNAL_TOKEN"] = token
-    os.environ["DESKTOP_BOOTSTRAP_SECRET"] = token
+    # Readiness is published only after the ASGI app imports cleanly: a broken
+    # bundle (missing DLL, bad module) must fail here, never look "ready".
+    try:
+        import uvicorn
+
+        from api.main import app
+    except BaseException:
+        try:
+            listener.close()
+        except OSError:
+            pass
+        raise
 
     publish_readiness(
         port,
@@ -122,10 +202,6 @@ def main(argv: list[str] | None = None) -> int:
         metadata["version"],
         Path(args.readiness_file) if args.readiness_file else None,
     )
-
-    import uvicorn
-
-    from api.main import app
 
     config = uvicorn.Config(
         app, log_level=os.environ.get("LOG_LEVEL", "info").lower(), lifespan="on"

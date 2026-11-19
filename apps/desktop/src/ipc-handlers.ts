@@ -29,7 +29,36 @@ export const IPC_CHANNELS = {
   testProfile: 'desktop:test-profile',
   applyProfile: 'desktop:apply-profile',
   runtimeStatus: 'desktop:runtime-status',
+  importGguf: 'desktop:import-gguf',
+  /** main → renderer event: one progress line of an import in flight. */
+  ggufProgress: 'desktop:gguf-progress',
 } as const;
+
+const GGUF_TAG_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._\-/:]{0,79}$/;
+
+/** Local tag for an imported GGUF; the same rule the model manager enforces. */
+export function validateGgufTagArgs(tag: unknown): string {
+  if (typeof tag !== 'string' || !GGUF_TAG_PATTERN.test(tag)) {
+    throw new IpcError(
+      'IPC_INVALID_ARGUMENT',
+      'A tag local deve ter 1–80 caracteres alfanuméricos (., _, -, /, :).',
+    );
+  }
+  return tag;
+}
+
+/** Apply options: only `force` exists, and it must be a boolean when given. */
+export function validateApplyOptions(options: unknown): { force: boolean } {
+  if (options === undefined || options === null) return { force: false };
+  if (typeof options !== 'object' || Array.isArray(options)) {
+    throw new IpcError('IPC_INVALID_ARGUMENT', 'As opções de aplicação devem ser um objeto.');
+  }
+  const force = (options as { force?: unknown }).force;
+  if (force !== undefined && typeof force !== 'boolean') {
+    throw new IpcError('IPC_INVALID_ARGUMENT', 'force deve ser booleano.');
+  }
+  return { force: force === true };
+}
 
 const SOURCE_KINDS = new Set(['file', 'directory']);
 const MODEL_KINDS = new Set(['ollama_executable', 'models_directory', 'gguf']);

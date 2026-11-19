@@ -82,8 +82,10 @@ function LiveConversion({ conversion }: { conversion: Conversion }) {
   const conversionUrl = `/conversions/${conversion.conversion_id}`;
   const active = !isTerminal(conversion.status);
 
+  const currentRunId = conversion.run.run_id;
   const stream = useConversionEvents(conversion.conversion_id, {
     enabled: active,
+    runId: currentRunId,
     onReconnect: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.conversions.detail(conversion.conversion_id) });
     },
@@ -96,12 +98,17 @@ function LiveConversion({ conversion }: { conversion: Conversion }) {
     },
   });
 
-  const status = stream.lastEvent?.status ?? conversion.status;
-  const stage = stream.lastEvent?.stage ?? conversion.stage;
-  const indeterminate = stream.lastEvent
-    ? stream.lastEvent.progress_indeterminate
+  // Only an event of the run on screen may describe it; otherwise the
+  // conversion record (refetched after a retry) is the truth.
+  const lastEvent = stream.lastEvent;
+  const currentEvent =
+    lastEvent && (!lastEvent.run_id || lastEvent.run_id === currentRunId) ? lastEvent : null;
+  const status = currentEvent?.status ?? conversion.status;
+  const stage = currentEvent?.stage ?? conversion.stage;
+  const indeterminate = currentEvent
+    ? currentEvent.progress_indeterminate
     : conversion.progress_indeterminate;
-  const reportedProgress = stream.lastEvent?.progress ?? conversion.progress;
+  const reportedProgress = currentEvent?.progress ?? conversion.progress;
   const percent = overallProgress({ status, progress: reportedProgress }) * 100;
   const success = isSuccessful(status);
 

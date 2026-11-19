@@ -707,7 +707,7 @@ def _read_csv(path: Path, options: SpreadsheetOptions) -> SpreadsheetDocument:
     reader = csv_module.reader(io.StringIO(text, newline=""), delimiter=delimiter)
     rows: list[list[SpreadsheetCell | None]] = []
     physical_line = 1
-    for record in reader:
+    for record in _csv_records(reader):
         if not record:
             physical_line += 1
             continue
@@ -740,6 +740,18 @@ def _read_csv(path: Path, options: SpreadsheetOptions) -> SpreadsheetDocument:
         detected_encoding=detected,
         workbook_filename=path.name,
     )
+
+
+def _csv_records(reader):
+    """Surface parser failures (oversized field, bad dialect) as IngestionError."""
+    try:
+        yield from reader
+    except csv_module.Error as exc:
+        raise IngestionError(
+            "CSV_PARSE_FAILED",
+            f"O CSV não pôde ser lido: {exc}.",
+            details={"error": str(exc), "field_size_limit": csv_module.field_size_limit()},
+        ) from exc
 
 
 def _physical_span(text: str, start_line: int, record: list[str]) -> tuple[int, int]:

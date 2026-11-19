@@ -42,6 +42,9 @@ const SourceDetailPage = lazy(() =>
 const SchedulesPage = lazy(() =>
   import('@/pages/schedules-page').then((module) => ({ default: module.SchedulesPage })),
 );
+const ScheduleDetailPage = lazy(() =>
+  import('@/pages/schedule-detail-page').then((module) => ({ default: module.ScheduleDetailPage })),
+);
 const ScheduleFormPage = lazy(() =>
   import('@/pages/schedule-form-page').then((module) => ({ default: module.ScheduleFormPage })),
 );
@@ -94,7 +97,8 @@ export const router = createBrowserRouter(
         { path: 'sources/:id', element: <SourceDetailPage /> },
         { path: 'schedules', element: <SchedulesPage /> },
         { path: 'schedules/new', element: <ScheduleFormPage /> },
-        { path: 'schedules/:id', element: <ScheduleFormPage /> },
+        { path: 'schedules/:id', element: <ScheduleDetailPage /> },
+        { path: 'schedules/:id/edit', element: <ScheduleFormPage /> },
         { path: 'schedule-runs/:id', element: <ScheduleRunPage /> },
         { path: 'history', element: <HistoryPage /> },
         { path: 'assistant', element: <AssistantPage /> },

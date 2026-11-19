@@ -7,7 +7,6 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import type { Observable } from 'rxjs';
-import { tap } from 'rxjs/operators';
 
 import type { RequestWithContext } from '../request-context';
 
@@ -35,18 +34,22 @@ export class LoggingInterceptor implements NestInterceptor {
     const response = http.getResponse<Response>();
     const startedAt = Date.now();
 
+    // The status is only final once the response has been written. At
+    // interceptor time an error still carries the default 200, because the
+    // exception filter runs later and sets the real code (A-25). So the line
+    // is written on 'finish' (or 'close' when the client went away first).
+    let logged = false;
     const write = (): void => {
+      if (logged) return;
+      logged = true;
       const duration = Date.now() - startedAt;
       this.logger.log(
         `${request.method} ${redactUrl(request.originalUrl)} ${response.statusCode} ${duration}ms rid=${request.requestId ?? '-'}`,
       );
     };
+    response.once('finish', write);
+    response.once('close', write);
 
-    return next.handle().pipe(
-      tap({
-        next: write,
-        error: write,
-      }),
-    );
+    return next.handle();
   }
 }

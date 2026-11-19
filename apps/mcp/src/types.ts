@@ -77,7 +77,7 @@ export interface BatchItem {
   ordinal: number;
   filename: string;
   size_bytes: number;
-  kind: 'pdf' | 'image' | 'unknown';
+  kind: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
   status: BatchItemStatus;
   options: Record<string, unknown>;
   available_formats: OutputFormat[];

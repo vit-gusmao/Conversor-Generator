@@ -11,32 +11,6 @@ servers:
 security:
   - bearer: []
 paths:
-  /auth/register:
-    post:
-      tags: [Auth]
-      summary: Cria usuário
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/RegisterRequest'
-      responses:
-        '201': { $ref: '#/components/responses/AuthSession' }
-  /auth/login:
-    post:
-      tags: [Auth]
-      summary: Autentica
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/LoginRequest'
-      responses:
-        '200': { $ref: '#/components/responses/AuthSession' }
   /auth/anonymous:
     post:
       tags: [Auth]
@@ -78,7 +52,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/CreateConversionResponse' }
         '400': { $ref: '#/components/responses/Error' }
-        '429': { $ref: '#/components/responses/Error' }
     get:
       tags: [Conversions]
       summary: Histórico
@@ -177,15 +150,30 @@ paths:
       summary: Cria nova execução
       parameters: [{ $ref: '#/components/parameters/ConversionId' }]
       responses:
-        '202': { $ref: '#/components/responses/Error' }
+        '202':
+          description: Nova execução enfileirada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateConversionResponse' }
         '409': { $ref: '#/components/responses/Error' }
   /conversions/{id}/cancel:
     post:
       tags: [Conversions]
       summary: Solicita cancelamento
+      description: 200 no gateway (202 no standalone). Conversão já terminal responde 409 ALREADY_TERMINAL.
       parameters: [{ $ref: '#/components/parameters/ConversionId' }]
       responses:
-        '202': { $ref: '#/components/responses/Error' }
+        '200':
+          description: Cancelamento solicitado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversion_id: { type: string }
+                  status: { type: string }
+                  message: { type: string }
+        '409': { $ref: '#/components/responses/Error' }
   /conversions/{id}/audit:
     get:
       tags: [Audit]
@@ -595,6 +583,26 @@ components:
       name: id
       required: true
       schema: { type: string, format: uuid }
+    SourceId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    ImportId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    ScheduleId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    ScheduleRunId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
   responses:
     Error:
       description: Erro
@@ -619,41 +627,7 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/responses/Error' }
-  parameters:
-    SourceId:
-      in: path
-      name: id
-      required: true
-      schema: { type: string }
-    ImportId:
-      in: path
-      name: id
-      required: true
-      schema: { type: string }
-    ScheduleId:
-      in: path
-      name: id
-      required: true
-      schema: { type: string }
-    ScheduleRunId:
-      in: path
-      name: id
-      required: true
-      schema: { type: string }
   schemas:
-    RegisterRequest:
-      type: object
-      required: [email, password]
-      properties:
-        email: { type: string, format: email }
-        password: { type: string, minLength: 8 }
-        name: { type: string }
-    LoginRequest:
-      type: object
-      required: [email, password]
-      properties:
-        email: { type: string, format: email }
-        password: { type: string }
     User:
       type: object
       properties:
@@ -716,22 +690,35 @@ components:
       type: object
       properties:
         conversion_id: { type: string }
+        run_id: { type: string }
         status: { type: string }
         quality: { type: string }
-        pages: { type: integer }
-        tables: { type: integer }
-        sheets: { type: integer }
-        cells: { type: integer }
-        records: { type: integer }
-        fields: { type: integer }
-        download_url: { type: string }
+        publication_status: { type: string }
+        counts:
+          type: object
+          properties:
+            pages: { type: integer }
+            tables: { type: integer }
+            sheets: { type: integer }
+            cells: { type: integer }
+            records: { type: integer }
+            fields: { type: integer }
+        available_formats:
+          type: array
+          items: { type: string }
+        default_sheet: { type: string, nullable: true }
+        warning_counts:
+          type: object
+          properties:
+            total: { type: integer }
+            error: { type: integer }
+            critical: { type: integer }
+            warning: { type: integer }
+        partial: { type: boolean }
+        pages_failed: { type: integer }
+        pages_total: { type: integer }
+        download_url: { type: string, nullable: true }
         audit_url: { type: string }
-        sheets:
-          type: array
-          items: { type: object }
-        warnings:
-          type: array
-          items: { type: object }
     Preview:
       type: object
       properties:

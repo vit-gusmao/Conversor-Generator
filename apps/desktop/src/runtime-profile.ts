@@ -8,7 +8,7 @@
  * rejected instead of silently overwriting.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 export const PROFILE_VERSION = 1;
@@ -50,6 +50,7 @@ export interface RedactedProfile {
   ocr_model: string | null;
   assistant_enabled: boolean;
   assistant_model: string | null;
+  ollama_path_configured: boolean;
   models_dir_configured: boolean;
 }
 
@@ -124,8 +125,26 @@ export class ProfileStore {
       ocr_model: profile.ocr.model,
       assistant_enabled: profile.assistant.enabled,
       assistant_model: profile.assistant.model,
+      ollama_path_configured: Boolean(profile.ollama_path),
       models_dir_configured: Boolean(profile.models_dir),
     };
+  }
+
+  /** Raw bytes of the stored profile (null when none), for an exact rollback. */
+  snapshotRaw(): string | null {
+    return existsSync(this.filePath) ? readFileSync(this.filePath, 'utf8') : null;
+  }
+
+  /** Restores a snapshot atomically; `null` removes the file (back to defaults). */
+  restoreRaw(raw: string | null): void {
+    if (raw === null) {
+      rmSync(this.filePath, { force: true });
+      return;
+    }
+    mkdirSync(dirname(this.filePath), { recursive: true });
+    const staging = `${this.filePath}.tmp-${process.pid}`;
+    writeFileSync(staging, raw, { encoding: 'utf8', mode: 0o600 });
+    renameSync(staging, this.filePath);
   }
 
   /**
@@ -162,6 +181,57 @@ export function mergeProfile(base: RuntimeProfile, patch: Partial<RuntimeProfile
     // The stored revision survives a read (it is the optimistic token).
     version: patch.version ?? base.version,
   };
+}
+
+/** Keys a draft may set; anything else (version, data_dir, work_dir) is host-owned. */
+const NESTED_KEYS = ['ocr', 'assistant', 'preferences'] as const;
+const PATH_KEYS = ['ollama_path', 'models_dir'] as const;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Null-safe merge of a renderer draft over the stored profile (F5).
+ *
+ * - `undefined` and `null` never clear anything: a draft that omits a path, or
+ *   sends it as null, keeps the saved path;
+ * - a path is cleared only by an empty string or an explicit
+ *   `clear_ollama_path` / `clear_models_dir` flag set to `true`;
+ * - nested sections merge field by field, ignoring undefined fields.
+ */
+export function mergeDraft(current: RuntimeProfile, draft: Record<string, unknown>): RuntimeProfile {
+  const next: RuntimeProfile = { ...current, ocr: { ...current.ocr }, assistant: { ...current.assistant }, preferences: { ...current.preferences } };
+
+  if (draft.mode !== undefined && draft.mode !== null) {
+    if (draft.mode !== 'external' && draft.mode !== 'managed') {
+      throw new ProfileError('INVALID_MODE', "O modo deve ser 'external' ou 'managed'.");
+    }
+    next.mode = draft.mode as OllamaMode;
+  }
+
+  for (const key of PATH_KEYS) {
+    const value = draft[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'string') {
+      throw new ProfileError('INVALID_PATH', `${key} deve ser texto.`);
+    }
+    next[key] = value === '' ? null : value;
+  }
+  if (draft.clear_ollama_path === true) next.ollama_path = null;
+  if (draft.clear_models_dir === true) next.models_dir = null;
+
+  for (const key of NESTED_KEYS) {
+    const section = draft[key];
+    if (!isPlainObject(section)) continue;
+    const target = next[key] as unknown as Record<string, unknown>;
+    for (const [field, value] of Object.entries(section)) {
+      if (value === undefined) continue;
+      if (!(field in target)) continue; // unknown fields never reach the profile
+      target[field] = value;
+    }
+  }
+  return next;
 }
 
 /** Only loopback endpoints are accepted in the first desktop version. */

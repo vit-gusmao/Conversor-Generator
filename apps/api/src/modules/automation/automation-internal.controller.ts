@@ -181,11 +181,12 @@ export class AutomationInternalController {
     ownerId: string,
   ): Promise<{ options: NormalizedConversionOptions }> {
     const owner = this.ownerFrom(ownerId);
-    const items = (await this.batches.listItems(owner, batchId, { limit: 200 })) as unknown as {
-      items?: Array<{ client_item_id?: string; options?: NormalizedConversionOptions }>;
-    };
-    const match = (items.items ?? []).find((item) => item.client_item_id === clientItemId);
-    const options = match?.options ?? ({ schema_version: 3 } as NormalizedConversionOptions);
+    // A direct lookup by the unique (batch, client item) key: a page scan would
+    // miss any item beyond the first page of a large import.
+    const item = await this.batches.findItemByClientId(owner, batchId, clientItemId);
+    const options =
+      (item?.options as NormalizedConversionOptions | undefined) ??
+      ({ schema_version: 3 } as NormalizedConversionOptions);
     return { options };
   }
 

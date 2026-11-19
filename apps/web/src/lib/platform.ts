@@ -18,7 +18,17 @@ export interface DesktopModelSelection {
   path: string;
 }
 
+export interface DesktopApplyOptions {
+  /** Apply even while backend work is running (explicit operator choice). */
+  force?: boolean;
+}
+
 export interface DesktopBridge {
+  /**
+   * Owner key of this installation, shared with the host's granted roots (F4).
+   * Used as the page's device id instead of a browser-only value.
+   */
+  readonly deviceId?: string;
   pickSource(input: { kind: 'file' | 'directory' }): Promise<DesktopSelection | null>;
   pickModelResource(input: {
     kind: DesktopModelSelection['kind'];
@@ -28,8 +38,11 @@ export interface DesktopBridge {
   applyRuntimeProfile(
     draft: Record<string, unknown>,
     expectedVersion: number | null,
+    options?: DesktopApplyOptions,
   ): Promise<Record<string, unknown>>;
   getRuntimeStatus(): Promise<Record<string, unknown>>;
+  importGguf?(input: { tag: string }): Promise<Record<string, unknown> | null>;
+  onGgufProgress?(listener: (line: string) => void): () => void;
 }
 
 declare global {
@@ -50,6 +63,16 @@ export function isDesktopRuntime(): boolean {
   if (!hasDesktopBridge()) return false;
   // The bridge only exists inside the Electron window.
   return true;
+}
+
+/**
+ * The host's device id when running in the desktop; `null` in a browser. The
+ * value is used as the device identity INSTEAD of localStorage/cookies, so the
+ * page and the host resolve to the same owner.
+ */
+export function desktopDeviceId(): string | null {
+  const id = desktopBridge()?.deviceId;
+  return typeof id === 'string' && id.length > 0 ? id : null;
 }
 
 /** Native picker (grants the root) or `null` when cancelled/unavailable. */

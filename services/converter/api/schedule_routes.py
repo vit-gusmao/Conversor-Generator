@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Header
+from fastapi import APIRouter, Body, Depends, Header, Request, Response
 from fastapi.responses import StreamingResponse
 
-from api.deps import ApiError, current_user, get_db, internal_guard
+from api.deps import DEVICE_COOKIE, ApiError, current_user, get_db, internal_guard
+from api.sse import resolve_stream_user, short_session
 from automation.scheduler import AutomationScheduler
 from automation.service import ScheduleService
 
@@ -23,6 +24,27 @@ internal_router = APIRouter(prefix="/internal/v1", tags=["internal"])
 
 def _service() -> ScheduleService:
     return ScheduleService()
+
+
+def _dispatch_manual_run(run: Any, *, owner_id: str) -> dict[str, Any]:
+    """Hand a freshly queued manual occurrence to the executor, if this process has one.
+
+    With the executor disabled the occurrence stays queued for an external
+    runner (``automation.cli`` in full mode, or the desktop app) and the caller
+    gets 202 with ``executor_active: false``. Never a 500 for that case.
+    """
+    from automation.run_service import AutomationRunService, executor_enabled
+    from automation.types import FeatureDisabled
+
+    run_id = run.id
+    state = run.state
+    if not executor_enabled():
+        return {"run_id": run_id, "state": state, "executor_active": False}
+    try:
+        AutomationRunService().start_async(run_id, owner_id)
+    except FeatureDisabled:
+        return {"run_id": run_id, "state": state, "executor_active": False}
+    return {"run_id": run_id, "state": state, "executor_active": True}
 
 
 @router.get("/schedules")
@@ -151,8 +173,7 @@ def run_now(
         code = 404 if exc.code == "SCHEDULE_NOT_FOUND" else 409
         raise ApiError(code, exc.code, exc.message) from exc
     session.commit()
-    AutomationRunService().start_async(run.id, user["id"])
-    return {"run_id": run.id, "state": run.state}
+    return _dispatch_manual_run(run, owner_id=user["id"])
 
 
 @router.get("/schedules/{schedule_id}/runs")
@@ -183,27 +204,36 @@ def get_run(
 @router.get("/schedule-runs/{run_id}/events")
 def run_events(
     run_id: str,
-    user: dict[str, Any] = Depends(current_user),
+    request: Request,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     accept: str | None = Header(default=None),
     after: int = 0,
-    session=Depends(get_db),
+    authorization: str | None = Header(default=None),
+    x_device_id: str | None = Header(default=None),
 ):
     """Events with content negotiation.
 
     ``Accept: text/event-stream`` gets the SSE stream (replay via
     ``Last-Event-ID``); anything else gets a JSON page, which is what the SPA
     polls. Same data, same sequence numbers.
+
+    No request-scoped session: every read opens a short-lived one, so a run that
+    stays open for minutes does not pin a database connection.
     """
     from automation.run_service import AutomationRunService
 
+    owner_id = resolve_stream_user(
+        authorization, x_device_id or request.cookies.get(DEVICE_COOKIE)
+    )["id"]
     service = AutomationRunService()
-    if service.get_run(session, owner_id=user["id"], run_id=run_id) is None:
-        raise ApiError(404, "RUN_NOT_FOUND", "Ocorrência inexistente ou de outro dono.")
+    with short_session() as session:
+        if service.get_run(session, owner_id=owner_id, run_id=run_id) is None:
+            raise ApiError(404, "RUN_NOT_FOUND", "Ocorrência inexistente ou de outro dono.")
     cursor = int(last_event_id) if (last_event_id and last_event_id.isdigit()) else int(after)
 
     if not accept or "text/event-stream" not in accept:
-        return {"items": service.events(session, run_id=run_id, after=cursor)}
+        with short_session() as session:
+            return {"items": service.events(session, run_id=run_id, after=cursor)}
     after = cursor
 
     def stream():
@@ -212,7 +242,10 @@ def run_events(
         cursor = after
         idle = 0
         while True:
-            events = service.events(session, run_id=run_id, after=cursor)
+            # One short session per poll; nothing is held while the client reads.
+            with short_session() as session:
+                events = service.events(session, run_id=run_id, after=cursor)
+                run_payload = service.get_run(session, owner_id=owner_id, run_id=run_id)
             for event in events:
                 cursor = event["sequence"]
                 yield (
@@ -220,7 +253,6 @@ def run_events(
                     f"event: {event['type']}\n"
                     f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 )
-            run_payload = service.get_run(session, owner_id=user["id"], run_id=run_id)
             if run_payload is None:
                 break
             if run_payload["state"] in {"succeeded", "partial", "no_changes", "failed", "cancelled", "skipped"} and not events:
@@ -328,6 +360,7 @@ def internal_archive_schedule(
 def internal_schedule_action(
     schedule_id: str,
     action: str,
+    response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     x_owner_id: str | None = Header(default=None),
     session=Depends(get_db),
@@ -343,12 +376,10 @@ def internal_schedule_action(
         session.commit()
         return resumed
     if action == "run-now":
-        from automation.run_service import AutomationRunService
+        from automation.scheduler import ClaimError
 
         key = idempotency_key or "internal-run-now"
         scheduler = AutomationScheduler(worker_id="internal")
-        from automation.scheduler import ClaimError
-
         try:
             run = scheduler.create_manual_occurrence(
                 session, schedule_id=schedule_id, owner_id=owner_id, request_key=key
@@ -357,8 +388,8 @@ def internal_schedule_action(
             code = 404 if exc.code == "SCHEDULE_NOT_FOUND" else 409
             raise ApiError(code, exc.code, exc.message) from exc
         session.commit()
-        AutomationRunService().start_async(run.id, owner_id)
-        return {"run_id": run.id, "state": run.state}
+        response.status_code = 202
+        return _dispatch_manual_run(run, owner_id=owner_id)
     raise ApiError(404, "NOT_FOUND", "Ação desconhecida.")
 
 

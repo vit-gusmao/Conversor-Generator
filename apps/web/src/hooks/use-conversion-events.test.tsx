@@ -126,6 +126,49 @@ describe('useConversionEvents', () => {
     unmount();
   });
 
+  it('ignores a previous run terminal failure after a retry and scopes the stream to the new run', async () => {
+    const previousFailure = {
+      ...makeEvent(1),
+      run_id: 'run-1',
+      type: 'failed',
+      status: 'failed' as const,
+      stage: 'failed',
+      message: 'falhou na primeira tentativa',
+    };
+    const currentQueued = { ...makeEvent(2), run_id: 'run-2', type: 'status', status: 'queued' as const };
+
+    fetchMock.mockResolvedValueOnce(
+      streamResponse([
+        `id: 1
+data: ${JSON.stringify(previousFailure)}
+
+`,
+        `id: 2
+data: ${JSON.stringify(currentQueued)}
+
+`,
+      ]),
+    );
+    fetchMock.mockResolvedValue(openResponse());
+
+    const { result, unmount } = renderHook(() =>
+      useConversionEvents('conv-1', { runId: 'run-2', baseDelayMs: 5, maxDelayMs: 20 }),
+    );
+
+    await waitFor(() => {
+      expect(result.current.events).toHaveLength(1);
+    });
+    expect(result.current.events[0]?.run_id).toBe('run-2');
+    expect(result.current.lastEvent?.status).toBe('queued');
+    // The previous run's terminal event did not close the stream.
+    expect(result.current.connection).not.toBe('closed');
+
+    const [firstUrl] = fetchMock.mock.calls[0]!;
+    expect(String(firstUrl)).toContain('run_id=run-2');
+
+    unmount();
+  });
+
   it('does not open a stream when disabled', async () => {
     renderHook(() => useConversionEvents('conv-1', { enabled: false }));
     expect(fetchMock).not.toHaveBeenCalled();

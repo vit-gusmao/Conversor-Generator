@@ -97,3 +97,21 @@ def test_ambiguous_date_is_kept_as_text_when_invalid_for_locale():
 def test_decimal_with_two_places_is_not_integer():
     assert normalize("150,00", locale=PT).value_type == "decimal"
     assert normalize("1.500,00", locale=PT).value == pytest.approx(1500.0)
+
+
+def test_single_separator_with_non_three_digit_tail_is_decimal():
+    # A lone separator followed by anything other than exactly three digits is
+    # a decimal mark, not a thousands separator (AU2-09).
+    assert normalize("0,0125", locale=PT).value == pytest.approx(0.0125)
+    assert normalize("0,0125", locale=PT).value_type == "decimal"
+    assert normalize("1,2500", locale=PT).value == pytest.approx(1.25)
+    result = normalize("100,0000", locale=PT)
+    assert result.value_type == "decimal"
+    assert result.value == pytest.approx(100.0)
+    assert normalize("0.0125", locale=EN).value == pytest.approx(0.0125)
+
+
+def test_single_separator_with_three_digit_tail_keeps_locale_rule():
+    assert normalize("1.250", locale=PT).value == 1250
+    assert normalize("1.250", locale=PT).value_type == "integer"
+    assert normalize("1,250", locale=PT).value == pytest.approx(1.25)

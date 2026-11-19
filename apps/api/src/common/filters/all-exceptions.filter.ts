@@ -37,6 +37,21 @@ const STATUS_TO_CODE: Record<number, ErrorCode> = {
 };
 
 /**
+ * A client-side body error raised by body-parser: `type` such as
+ * `entity.parse.failed` or `entity.too.large`, a 4xx status and `expose: true`.
+ */
+function bodyParserError(
+  value: unknown,
+): { status: number; type: string } | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const candidate = value as { type?: unknown; status?: unknown; statusCode?: unknown; expose?: unknown };
+  const status = typeof candidate.status === 'number' ? candidate.status : candidate.statusCode;
+  if (typeof candidate.type !== 'string' || typeof status !== 'number') return null;
+  if (candidate.expose !== true || status < 400 || status >= 500) return null;
+  return { status, type: candidate.type };
+}
+
+/**
  * Single exit point for every error: `{ error: { code, message, details } }`.
  * Unexpected failures are logged with the stack and never leaked to clients.
  */
@@ -93,6 +108,30 @@ export class AllExceptionsFilter implements ExceptionFilter {
       return {
         status: HttpStatus.BAD_REQUEST,
         error: { code, message: ERROR_MESSAGES[code], details: { field: exception.field } },
+      };
+    }
+
+    // body-parser (JSON/urlencoded middleware) errors: malformed JSON is a 400,
+    // a body over the configured limit is a 413. Neither is a server fault (S-01).
+    const bodyError = bodyParserError(exception);
+    if (bodyError) {
+      if (bodyError.status === HttpStatus.PAYLOAD_TOO_LARGE) {
+        return {
+          status: bodyError.status,
+          error: {
+            code: ERROR_CODES.FILE_TOO_LARGE,
+            message: ERROR_MESSAGES.FILE_TOO_LARGE,
+            details: { reason: bodyError.type },
+          },
+        };
+      }
+      return {
+        status: bodyError.status,
+        error: {
+          code: ERROR_CODES.VALIDATION_ERROR,
+          message: ERROR_MESSAGES.VALIDATION_ERROR,
+          details: { reason: bodyError.type },
+        },
       };
     }
 

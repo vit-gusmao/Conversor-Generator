@@ -51,26 +51,35 @@ geometria exatos conhecidos, sem binários opacos no repositório.
 | `npm --prefix apps/api test` (ou `npm test` na raiz, que também roda a interface) | API NestJS, testes unitários (Jest) | inclui `options.spec.ts` |
 | `npm --prefix apps/api run test:e2e` | API NestJS, testes e2e (Jest) | inclui `test/e2e/batches.e2e-spec.ts`. **Não roda na CI.** |
 | `npm --prefix apps/web test` | interface (Vitest) | `vitest run` |
-| `npm run test:mcp` (ou `npm --prefix apps/mcp test`) | adaptador MCP | compila antes (`pretest`) e roda `dist-test/tests/*.test.js`. **Não roda na CI.** |
+| `npm run test:mcp` (ou `npm --prefix apps/mcp test`) | adaptador MCP | compila antes (`pretest`) e roda `dist-test/tests/*.test.js`. Roda no job `mcp` da CI. |
+| `npm run test:desktop` (ou `npm --prefix apps/desktop test`) | shell Electron (Vitest) | roda no job `desktop` da CI (Linux, com `ELECTRON_SKIP_BINARY_DOWNLOAD=1`). |
 
 No Windows, use `services/converter/.venv\Scripts\python -m pytest tests -q` a
 partir de `services/converter`.
 
 ### Integração contínua
 
-O workflow `.github/workflows/ci.yml` tem três jobs, em `push` e `pull_request`
-para `main`:
+O workflow `.github/workflows/ci.yml` roda em `push` e `pull_request` para `main`,
+com cinco jobs:
 
 | Job | O que roda |
 | --- | --- |
 | `web` | build dos contratos, build da interface e `npm --prefix apps/web test` |
 | `api` | build dos contratos, `db:generate`, typecheck e `npm --prefix apps/api test` |
 | `converter` | instala Tesseract e `pip install -e ".[test]"`, depois `pytest tests -q` |
+| `desktop` | `npm --prefix apps/desktop ci`, `npm test` e build (tsc), em Linux |
+| `mcp` | `npm --prefix apps/mcp ci` e `npm run test:mcp` |
 
-A CI **não tem job para `apps/mcp`**: `npm run test:mcp` não é executado
-automaticamente. A CI também não roda os testes e2e da API nem o teste de documentos
-grandes (opt-in, veja abaixo). Rode esses comandos localmente antes de mudar
-essas áreas.
+A CI **não roda** os testes e2e da API (`npm --prefix apps/api run test:e2e`) nem o
+teste de documentos grandes (opt-in, veja abaixo). Rode esses comandos localmente
+antes de mudar essas áreas.
+
+O empacotamento Windows não roda no `ci.yml`. Ele fica no workflow separado
+`.github/workflows/desktop.yml` (`windows-latest`, em `workflow_dispatch` e em tags
+`v*`): cria o venv do motor, roda os testes Python, instala o extra `ocr`, roda os
+testes e o build do desktop, executa `scripts/build-desktop.ps1`, executa
+`scripts/smoke-desktop.ps1 -RequireGuard` sobre `apps/desktop/release/win-unpacked` e
+publica o artefato `conversor-generator-windows-x64`.
 
 ## Suítes
 
@@ -348,7 +357,7 @@ os números com OCR vêm apenas da amostra estratificada acima.
 - Os números dependem do corpus local, que não é versionado: reproduzir a
   medição exige o mesmo corpus.
 
-## Upgrade de fontes/planilhas/agendador/desktop
+## Fontes, planilhas, agendador e desktop
 
 ### Suítes determinísticas (CI)
 

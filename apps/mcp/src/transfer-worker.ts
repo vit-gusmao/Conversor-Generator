@@ -21,12 +21,22 @@ import type {
   SubmissionStore,
 } from './submission-store.js';
 
+/**
+ * Waits before each in-process retry of a resumable item failure: three
+ * retries after the first attempt, so at most four attempts in one run.
+ */
+export const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000, 15_000];
+
 export interface TransferWorkerOptions {
   api: ApiClient;
   store: SubmissionStore;
   allowedRoots: readonly string[];
   concurrency: number;
   log?: (message: string) => void;
+  /** Delay before each retry; the length is the number of retries. */
+  retryDelaysMs?: readonly number[];
+  /** Timer used for retry backoff. Injectable so tests need no real waits. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Streams a file through SHA-256 without buffering it. */
@@ -129,6 +139,8 @@ export class TransferWorker {
   private readonly allowedRoots: readonly string[];
   private readonly semaphore: Semaphore;
   private readonly log: (message: string) => void;
+  private readonly retryDelaysMs: readonly number[];
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly running = new Map<string, Promise<void>>();
   private readonly itemLocks = new Set<string>();
 
@@ -138,6 +150,9 @@ export class TransferWorker {
     this.allowedRoots = options.allowedRoots;
     this.semaphore = new Semaphore(options.concurrency);
     this.log = options.log ?? (() => {});
+    this.retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
+    this.sleep =
+      options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   }
 
   /**
@@ -210,8 +225,15 @@ export class TransferWorker {
     const failed = latest.items.filter((item) => item.state === 'failed');
 
     await this.store.update(submissionId, (draft) => {
-      if (draft.items.some((item) => item.state === 'pending' || item.state === 'uploading')) {
+      // The run is over, so nothing is in flight. Items still `pending` are
+      // waiting for a later run or restart; reporting `uploading` would claim
+      // a transfer that is not happening.
+      if (draft.items.some((item) => item.state === 'uploading')) {
         draft.status = 'uploading';
+        return;
+      }
+      if (draft.items.some((item) => item.state === 'pending')) {
+        draft.status = 'pending';
         return;
       }
       if (draft.items.some((item) => !item.accepted) || failed.length > 0) {
@@ -248,21 +270,35 @@ export class TransferWorker {
     }
   }
 
+  /**
+   * Runs one item, retrying resumable failures in-process with backoff. When
+   * the retries are exhausted the item stays `pending` (with its error) so the
+   * next run or restart resumes it; the submission then reports `pending`.
+   */
   private async processItem(submissionId: string, clientItemId: string): Promise<void> {
     const lockKey = `${submissionId}:${clientItemId}`;
     if (this.itemLocks.has(lockKey)) return;
     this.itemLocks.add(lockKey);
     try {
-      await this.processItemUnlocked(submissionId, clientItemId);
+      for (let attempt = 0; ; attempt += 1) {
+        const retryable = await this.processItemUnlocked(submissionId, clientItemId);
+        if (!retryable || attempt >= this.retryDelaysMs.length) return;
+        const delay = this.retryDelaysMs[attempt] ?? 0;
+        this.log(
+          `item ${clientItemId} retry ${attempt + 1} of ${this.retryDelaysMs.length} in ${delay} ms`,
+        );
+        await this.sleep(delay);
+      }
     } finally {
       this.itemLocks.delete(lockKey);
     }
   }
 
-  private async processItemUnlocked(submissionId: string, clientItemId: string): Promise<void> {
+  /** Returns true when the item failed with a resumable error and may be retried. */
+  private async processItemUnlocked(submissionId: string, clientItemId: string): Promise<boolean> {
     const record = this.store.get(submissionId);
     const item = record?.items.find((entry) => entry.client_item_id === clientItemId);
-    if (!record || !item || item.state === 'completed' || item.state === 'cancelled') return;
+    if (!record || !item || item.state === 'completed' || item.state === 'cancelled') return false;
 
     const patch = async (
       mutate: (draftItem: SubmissionItemRecord) => void,
@@ -278,7 +314,7 @@ export class TransferWorker {
     try {
       if (item.source.type === 'upload_id') {
         await this.attachExistingUpload(submissionId, item, patch);
-        return;
+        return false;
       }
 
       const file = await resolveLocalPath(item.source.path, this.allowedRoots);
@@ -314,7 +350,7 @@ export class TransferWorker {
           draft.conversion_id = existing.conversion_id;
           draft.item_id = existing.item_id;
         });
-        return;
+        return false;
       }
       if (!registration.upload_id) {
         throw new ApiClientError(
@@ -358,6 +394,7 @@ export class TransferWorker {
         draft.error = null;
       });
       this.log(`item ${clientItemId} uploaded as conversion ${completed.conversion_id}`);
+      return false;
     } catch (error) {
       const mapped = errorFrom(error);
       const resumable =
@@ -382,6 +419,7 @@ export class TransferWorker {
         if (!resumable) draft.upload_id = null;
       });
       this.log(`item ${clientItemId} failed: ${mapped.code} ${mapped.message}`);
+      return resumable;
     }
   }
 

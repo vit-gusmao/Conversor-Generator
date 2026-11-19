@@ -16,8 +16,9 @@ from fastapi import APIRouter, Body, Depends, Header, Query, Request
 from fastapi.responses import StreamingResponse
 
 from api.batch_service import BatchService
-from api.deps import ApiError, current_user, get_db, resolve_user
+from api.deps import DEVICE_COOKIE, ApiError, current_user
 from api.schemas import BatchRetryRequest, CreateBatchRequest, RegisterBatchItemRequest
+from api.sse import resolve_stream_user, resume_cursor
 
 router = APIRouter(prefix="/api/v1/batches", tags=["batches"])
 service = BatchService()
@@ -104,7 +105,6 @@ def retry_item(
 async def batch_events(
     batch_id: str,
     request: Request,
-    session=Depends(get_db),
     authorization: str | None = Header(default=None),
     x_device_id: str | None = Header(default=None),
     access_token: str | None = Query(default=None),
@@ -112,17 +112,11 @@ async def batch_events(
     last_event_id_query: int | None = Query(default=None, alias="last_event_id"),
 ):
     auth = authorization or (f"Bearer {access_token}" if access_token else None)
-    user, _generated = resolve_user(session, auth, x_device_id)
+    device_id = x_device_id or request.cookies.get(DEVICE_COOKIE)
+    # Resolved with a short-lived session: the stream below can run for minutes.
+    user = await asyncio.to_thread(resolve_stream_user, auth, device_id)
     owner_id = user["id"]
-
-    cursor = 0
-    for candidate in (last_event_id, last_event_id_query):
-        if candidate in (None, ""):
-            continue
-        try:
-            cursor = max(cursor, int(candidate))
-        except (TypeError, ValueError):
-            continue
+    cursor = resume_cursor(last_event_id, last_event_id_query)
 
     # Verify ownership before opening the stream.
     summary = await asyncio.to_thread(service.get_batch, owner_id=owner_id, batch_id=batch_id)

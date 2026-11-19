@@ -21,6 +21,8 @@ import { ApiError } from '../../common/errors/api-error';
 import type { AuthenticatedUser } from '../../common/request-context';
 import { PrismaService } from '../../database/prisma.service';
 
+import { SequencedDelivery } from '../realtime/sequenced-delivery';
+
 import { BatchEventsService } from './batch-events.service';
 import {
   CreateBatchDto,
@@ -161,6 +163,8 @@ export class BatchesController {
       response.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     };
 
+    const TERMINAL = new Set(['completed', 'completed_with_errors', 'cancelled']);
+
     let closed = false;
     let subscription: Subscription | null = null;
     const cleanup = (): void => {
@@ -177,37 +181,49 @@ export class BatchesController {
 
     response.on('close', cleanup);
 
-    const replay = await this.events.listAfter(id, cursor, 500);
-    for (const event of replay) {
-      cursor = Math.max(cursor, event.sequence);
+    const delivery = new SequencedDelivery<BatchEvent>(cursor, (event) => {
+      if (closed) return;
       write(event);
+      if (TERMINAL.has(event.status) && (event.type === 'batch' || event.type === 'completed')) {
+        // Do not close on the first terminal-looking item event; only the
+        // final batch roll-up ends the stream.
+        void this.prisma.batch
+          .findUnique({ where: { id }, select: { status: true } })
+          .then((row) => {
+            if (row && TERMINAL.has(row.status)) cleanup();
+          })
+          .catch(() => undefined);
+      }
+    });
+
+    // Attach to the live stream BEFORE replaying, so an event committed during
+    // the replay query is buffered instead of lost (A-23). The sequencer drops
+    // the overlap between replay and live.
+    subscription = this.events.stream(id).subscribe({
+      next: (event) => delivery.receive(event),
+      error: () => cleanup(),
+      complete: () => cleanup(),
+    });
+
+    let afterSequence = cursor;
+    let replayed = 0;
+    for (;;) {
+      const page = await this.events.listAfter(id, afterSequence, 500);
+      for (const event of page) {
+        afterSequence = event.sequence;
+        replayed += 1;
+        delivery.replay(event);
+        if (closed) return;
+      }
+      if (page.length < 500) break;
     }
 
-    const TERMINAL = new Set(['completed', 'completed_with_errors', 'cancelled']);
     const fresh = await this.prisma.batch.findUnique({ where: { id } });
-    if (replay.length === 0 && fresh && TERMINAL.has(fresh.status)) {
+    if (replayed === 0 && fresh && TERMINAL.has(fresh.status)) {
       cleanup();
       return;
     }
 
-    subscription = this.events.stream(id).subscribe({
-      next: (event) => {
-        if (event.sequence <= cursor) return;
-        cursor = event.sequence;
-        write(event);
-        if (TERMINAL.has(event.status) && (event.type === 'batch' || event.type === 'completed')) {
-          // Do not close on the first terminal-looking item event; only the
-          // final batch roll-up ends the stream.
-          void this.prisma.batch
-            .findUnique({ where: { id }, select: { status: true } })
-            .then((row) => {
-              if (row && TERMINAL.has(row.status)) cleanup();
-            })
-            .catch(() => undefined);
-        }
-      },
-      error: () => cleanup(),
-      complete: () => cleanup(),
-    });
+    delivery.flush();
   }
 }

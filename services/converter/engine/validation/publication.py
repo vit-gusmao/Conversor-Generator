@@ -60,7 +60,9 @@ def publication_report(checks: list[dict[str, Any]], quality: str) -> dict[str, 
         "fatal_checks": [
             {"check": item.get("check"), "details": item.get("details")} for item in fatal
         ],
-        "warning_count": sum(1 for item in checks if item.get("status") == "warn"),
+        "warning_count": sum(
+            1 for item in checks if item.get("status") == "warn" or classify(item) == "warning"
+        ),
         "download_allowed": publication_status(checks=checks, quality=quality) == "approved",
     }
 

@@ -12,7 +12,9 @@
     "test": "npm --prefix apps/api test && npm --prefix apps/web test",
     "install:mcp": "npm --prefix apps/mcp install",
     "build:mcp": "npm --prefix apps/mcp run build",
+    "build:desktop": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
     "test:mcp": "npm --prefix apps/mcp test",
+    "test:desktop": "npm --prefix apps/desktop test",
     "test:py": "python -m pytest services/converter/tests -q",
     "db:generate": "npm --prefix apps/api run db:generate",
     "db:push": "npm --prefix apps/api run db:push"

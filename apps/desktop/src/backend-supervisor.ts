@@ -39,7 +39,14 @@ export interface SupervisorOptions {
   spawnArgs?: string[];
   /** Token shared with the backend (generated per boot when omitted). */
   internalToken?: string;
+  /** Per-install JWT signing secret (persisted by the host; never the dev default). */
+  jwtSecret: string;
 }
+
+/** Bounded stderr kept for diagnostics (a noisy backend must not grow memory). */
+export const STDERR_TAIL_CHARS = 16 * 1024;
+/** Characters of the tail shown inside an error message. */
+const DIAGNOSTIC_CHARS = 800;
 
 export class SupervisorError extends Error {
   readonly code: string;
@@ -52,8 +59,10 @@ export class SupervisorError extends Error {
 }
 
 const READY_PREFIX = 'CONVERTER_READY ';
-/** Documented development default: never acceptable in a shipped app. */
+/** Documented development defaults: never acceptable in a shipped app. */
 const INSECURE_DEFAULT_TOKEN = 'dev-internal-token-change-me';
+const INSECURE_DEFAULT_JWT = 'dev-jwt-secret-change-me';
+const MIN_JWT_SECRET_CHARS = 64;
 
 export class BackendSupervisor extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -61,6 +70,8 @@ export class BackendSupervisor extends EventEmitter {
   private stdoutBuffer = '';
   /** Per-boot internal token used by privileged routes (host ↔ backend). */
   readonly internalToken: string;
+  /** Per-start secret for the desktop host guard; fresh on every spawn. */
+  private bootstrap: string | null = null;
   private readonly options: Required<Pick<SupervisorOptions, 'startupTimeoutMs'>> & SupervisorOptions;
 
   constructor(options: SupervisorOptions) {
@@ -73,6 +84,21 @@ export class BackendSupervisor extends EventEmitter {
         'O backend não pode iniciar com o token interno de desenvolvimento.',
       );
     }
+    const jwt = options.jwtSecret ?? '';
+    if (jwt.length < MIN_JWT_SECRET_CHARS || jwt === INSECURE_DEFAULT_JWT) {
+      throw new SupervisorError(
+        'INSECURE_JWT_SECRET',
+        'O backend não pode iniciar com o segredo de assinatura de desenvolvimento.',
+      );
+    }
+  }
+
+  /**
+   * The header secret of the CURRENT backend process. Electron main injects it
+   * for the backend origin only; it is never sent to the renderer.
+   */
+  get bootstrapSecret(): string | null {
+    return this.bootstrap;
   }
 
   static newToken(): string {
@@ -101,6 +127,9 @@ export class BackendSupervisor extends EventEmitter {
   }
 
   buildEnvironment(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+    if (!this.bootstrap) {
+      this.bootstrap = BackendSupervisor.newToken();
+    }
     return {
       ...process.env,
       APP_DATA_DIR: this.options.appDataDir,
@@ -110,13 +139,15 @@ export class BackendSupervisor extends EventEmitter {
       WEB_DIST_DIR: this.options.webDistDir,
       CONVERTER_HOST: '127.0.0.1',
       CONVERTER_PORT: '0',
-      // The backend enforces this on every internal route; the same value is
-      // what Electron main uses for host-privileged calls. Never the default.
-      CONVERTER_INTERNAL_TOKEN: this.internalToken,
-      DESKTOP_BOOTSTRAP_SECRET: this.internalToken,
       CONVERTER_QUEUE: 'inline',
       ...(this.options.env ?? {}),
       ...extra,
+      // Security values come LAST: neither the profile nor a restart option
+      // can replace them. The backend refuses to start with the dev defaults.
+      CONVERTER_INTERNAL_TOKEN: this.internalToken,
+      DESKTOP_BOOTSTRAP_SECRET: this.bootstrap,
+      JWT_SECRET: this.options.jwtSecret,
+      DESKTOP_HOST_ENABLED: 'true',
     };
   }
 
@@ -127,6 +158,8 @@ export class BackendSupervisor extends EventEmitter {
     }
     const executable = this.resolveExecutable();
     const spawnImpl = this.options.spawnImpl ?? spawn;
+    // A new bootstrap secret for every spawn: the previous process is gone.
+    this.bootstrap = BackendSupervisor.newToken();
     const child = spawnImpl(executable, this.options.spawnArgs ?? [], {
       cwd: this.options.appDataDir,
       env: this.buildEnvironment(extraEnv),
@@ -137,7 +170,11 @@ export class BackendSupervisor extends EventEmitter {
 
     this.child = child;
     this.stdoutBuffer = '';
-    const stderrChunks: string[] = [];
+    // Bounded: only the last STDERR_TAIL_CHARS survive (F18).
+    let stderrTail = '';
+    const appendStderr = (text: string) => {
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_CHARS);
+    };
     const endpoint = await new Promise<RuntimeEndpoint>((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
@@ -146,7 +183,7 @@ export class BackendSupervisor extends EventEmitter {
             'STARTUP_TIMEOUT',
             `O backend não ficou pronto em ${Math.round(
               (this.options.startupTimeoutMs ?? 90_000) / 1000,
-            )} s. Diagnóstico: ${stderrChunks.join('').slice(-800) || 'sem saída de erro'}.`,
+            )} s. Diagnóstico: ${stderrTail.slice(-DIAGNOSTIC_CHARS) || 'sem saída de erro'}.`,
           ),
         );
       }, this.options.startupTimeoutMs);
@@ -194,9 +231,9 @@ export class BackendSupervisor extends EventEmitter {
         reject(
           new SupervisorError(
             'BACKEND_EXITED',
-            `O backend encerrou durante a inicialização (código ${code ?? 'null'}). ${stderrChunks
-              .join('')
-              .slice(-800)}`,
+            `O backend encerrou durante a inicialização (código ${code ?? 'null'}). ${stderrTail.slice(
+              -DIAGNOSTIC_CHARS,
+            )}`,
           ),
         );
       };
@@ -210,8 +247,9 @@ export class BackendSupervisor extends EventEmitter {
 
       child.stdout.on('data', onData);
       child.stderr.on('data', (chunk: Buffer) => {
-        stderrChunks.push(chunk.toString('utf8'));
-        this.emit('log', chunk.toString('utf8'));
+        const text = chunk.toString('utf8');
+        appendStderr(text);
+        this.emit('log', text);
       });
       child.on('error', onError);
       child.on('exit', onExit);

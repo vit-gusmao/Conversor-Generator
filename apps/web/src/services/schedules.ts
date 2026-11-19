@@ -33,8 +33,10 @@ export async function updateSchedule(
   revision: number,
   changes: Partial<ScheduleCreateRequest>,
 ): Promise<ScheduleRecord> {
+  // PUT: the full-mode gateway declares @Put for schedules and the Python
+  // service accepts PUT too. Sources stay on PATCH (see services/sources.ts).
   return apiFetch<ScheduleRecord>(`/schedules/${encodeURIComponent(scheduleId)}`, {
-    method: 'PATCH',
+    method: 'PUT',
     json: { ...changes, revision },
   });
 }
@@ -60,8 +62,8 @@ export async function resumeSchedule(scheduleId: string): Promise<ScheduleRecord
 export async function runNow(
   scheduleId: string,
   idempotencyKey: string,
-): Promise<{ run_id: string; state: string }> {
-  return apiFetch<{ run_id: string; state: string }>(
+): Promise<{ run_id: string; state: string; executor_active: boolean }> {
+  return apiFetch<{ run_id: string; state: string; executor_active: boolean }>(
     `/schedules/${encodeURIComponent(scheduleId)}/run-now`,
     { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey } },
   );

@@ -12,16 +12,12 @@ import type { Response } from 'express';
 import type { AuditSummary, PageAudit } from '@pdf2x/contracts';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { contentDisposition } from '../../common/content-disposition';
 import { ApiError } from '../../common/errors/api-error';
 import type { AuthenticatedUser } from '../../common/request-context';
 import { OptionalJwtGuard } from '../../auth/guards/optional-jwt.guard';
 
 import { AuditService, type AuditExportPayload } from './audit.service';
-
-function contentDisposition(filename: string): string {
-  const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
-}
 
 /**
  * Audit endpoints are a transparent proxy to the engine: the API never stores

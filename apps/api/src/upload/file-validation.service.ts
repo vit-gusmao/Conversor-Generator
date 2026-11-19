@@ -43,8 +43,105 @@ export interface FileInspection {
 
 const PDF_HEADER = '%PDF-';
 const MAGIC_SCAN_BYTES = 1024;
+/**
+ * Junk before the PDF header is tolerated up to this offset, the same rule the
+ * engine applies (`_looks_like_pdf` in engine/inspector/pdf_inspector.py).
+ */
+const PDF_HEADER_MAX_OFFSET = 512;
+/** Two-byte signatures that also match plain text (a CSV may begin with "BM" or "P1"). */
+const WEAK_IMAGE_FORMATS: ReadonlySet<string> = new Set(['BMP', 'PNM']);
 // `/Type /Page` but not `/Type /Pages`, tolerant to any whitespace between.
 const PAGE_TYPE_PATTERN = /\/Type\s*\/Page(?![A-Za-z])/g;
+
+/** Offset of the `%PDF-` header inside the scan window, or -1 when there is none. */
+function findPdfHeader(head: Buffer): number {
+  const slice = head.subarray(0, MAGIC_SCAN_BYTES).toString('latin1');
+  const index = slice.indexOf(PDF_HEADER);
+  return index >= 0 && index <= PDF_HEADER_MAX_OFFSET ? index : -1;
+}
+
+export interface HeaderClassification {
+  kind: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
+  is_pdf: boolean;
+  image_format: string | null;
+  spreadsheet_format: 'xlsx' | 'csv' | null;
+  mime_type: string | null;
+  pdf_version: string | null;
+}
+
+/**
+ * Classifies a document from its first kilobyte only.
+ *
+ * Order matters: a strong image signature at offset 0 wins over a `%PDF-` text
+ * found further in (an image can carry that text in its metadata), and weak
+ * two-byte image signatures are only considered after the PDF and spreadsheet
+ * checks, so a declared CSV that starts with "BM" stays a CSV.
+ */
+function classifyHeader(head: Buffer, declaredKind?: string | null): HeaderClassification {
+  const spreadsheet = declaredKind === 'spreadsheet';
+  const pdfAt = findPdfHeader(head);
+  const image = detectImageFormat(head);
+  const strongImage = image !== null && !WEAK_IMAGE_FORMATS.has(image) ? image : null;
+
+  if (strongImage && pdfAt !== 0 && !spreadsheet) return imageClassification(strongImage);
+  if (pdfAt === 0 || (pdfAt > 0 && !spreadsheet)) return pdfClassification(head, pdfAt);
+
+  if (spreadsheet) {
+    if (head.subarray(0, 4).toString('latin1') === 'PK\x03\x04') {
+      return {
+        kind: 'spreadsheet',
+        is_pdf: false,
+        image_format: null,
+        spreadsheet_format: 'xlsx',
+        mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        pdf_version: null,
+      };
+    }
+    // CSV candidate: decodable text without pdf/image/zip magic. The engine
+    // enforces dialect/encoding (CSV_ENCODING_REQUIRED / CSV_DIALECT_REQUIRED).
+    return {
+      kind: 'spreadsheet',
+      is_pdf: false,
+      image_format: null,
+      spreadsheet_format: 'csv',
+      mime_type: 'text/csv',
+      pdf_version: null,
+    };
+  }
+  if (image) return imageClassification(image);
+  return {
+    kind: 'unknown',
+    is_pdf: false,
+    image_format: null,
+    spreadsheet_format: null,
+    mime_type: null,
+    pdf_version: null,
+  };
+}
+
+function imageClassification(format: string): HeaderClassification {
+  return {
+    kind: 'image',
+    is_pdf: false,
+    image_format: format,
+    spreadsheet_format: null,
+    mime_type: mimeForImageFormat(format),
+    pdf_version: null,
+  };
+}
+
+function pdfClassification(head: Buffer, at: number): HeaderClassification {
+  const window = head.subarray(at, at + 16).toString('latin1');
+  const match = /^%PDF-(\d+\.\d+)/.exec(window);
+  return {
+    kind: 'pdf',
+    is_pdf: true,
+    image_format: null,
+    spreadsheet_format: null,
+    mime_type: 'application/pdf',
+    pdf_version: match ? match[1] : null,
+  };
+}
 
 /**
  * Content-based image detection (signatures), mirroring the engine registry.
@@ -179,11 +276,11 @@ export class FileValidationService {
 
     if (size > this.limits.maxBytes) {
       // Still inspect the header so the caller gets a faithful report.
-      const headerSlice = buffer.subarray(0, MAGIC_SCAN_BYTES).toString('latin1');
+      const classified = classifyHeader(buffer.subarray(0, MAGIC_SCAN_BYTES));
       return {
         ok: false,
-        is_pdf: headerSlice.includes(PDF_HEADER),
-        pdf_version: this.readVersion(buffer),
+        is_pdf: classified.is_pdf,
+        pdf_version: classified.pdf_version,
         page_count: 0,
         page_count_estimated: false,
         encrypted: false,
@@ -199,9 +296,9 @@ export class FileValidationService {
       };
     }
 
-    const head = buffer.subarray(0, MAGIC_SCAN_BYTES).toString('latin1');
-    const isPdf = head.includes(PDF_HEADER);
-    const imageFormat = isPdf ? null : detectImageFormat(buffer);
+    const classified = classifyHeader(buffer.subarray(0, MAGIC_SCAN_BYTES));
+    const isPdf = classified.is_pdf;
+    const imageFormat = classified.image_format;
     if (!isPdf && !imageFormat) errors.push('invalid_header');
 
     const body = buffer.toString('latin1');
@@ -223,7 +320,7 @@ export class FileValidationService {
         : imageFormat
           ? mimeForImageFormat(imageFormat)
           : 'application/octet-stream',
-      pdf_version: isPdf ? this.readVersion(buffer) : null,
+      pdf_version: classified.pdf_version,
       page_count: pageCount,
       page_count_estimated: pageCount > 0,
       encrypted,
@@ -255,72 +352,8 @@ export class FileValidationService {
    * ZIP magic here (OOXML markers live in the central directory, checked by
    * the engine) and CSV is declared text — the engine validates both fully.
    */
-  inspectHeader(
-    head: Buffer,
-    declaredKind?: string | null,
-  ): {
-    kind: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
-    is_pdf: boolean;
-    image_format: string | null;
-    spreadsheet_format: 'xlsx' | 'csv' | null;
-    mime_type: string | null;
-    pdf_version: string | null;
-  } {
-    const slice = head.subarray(0, MAGIC_SCAN_BYTES).toString('latin1');
-    const isPdf = slice.includes(PDF_HEADER);
-    if (isPdf) {
-      const match = /%PDF-(\d+\.\d+)/.exec(slice);
-      return {
-        kind: 'pdf',
-        is_pdf: true,
-        image_format: null,
-        spreadsheet_format: null,
-        mime_type: 'application/pdf',
-        pdf_version: match ? match[1] : null,
-      };
-    }
-    const isZip = head.subarray(0, 4).toString('latin1') === 'PK\x03\x04';
-    if (isZip && declaredKind === 'spreadsheet') {
-      return {
-        kind: 'spreadsheet',
-        is_pdf: false,
-        image_format: null,
-        spreadsheet_format: 'xlsx',
-        mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        pdf_version: null,
-      };
-    }
-    if (declaredKind === 'spreadsheet') {
-      // CSV candidate: decodable text without pdf/image/zip magic. The engine
-      // enforces dialect/encoding (CSV_ENCODING_REQUIRED / CSV_DIALECT_REQUIRED).
-      return {
-        kind: 'spreadsheet',
-        is_pdf: false,
-        image_format: null,
-        spreadsheet_format: 'csv',
-        mime_type: 'text/csv',
-        pdf_version: null,
-      };
-    }
-    const imageFormat = detectImageFormat(head);
-    if (!imageFormat) {
-      return {
-        kind: 'unknown',
-        is_pdf: false,
-        image_format: null,
-        spreadsheet_format: null,
-        mime_type: null,
-        pdf_version: null,
-      };
-    }
-    return {
-      kind: 'image',
-      is_pdf: false,
-      image_format: imageFormat,
-      spreadsheet_format: null,
-      mime_type: mimeForImageFormat(imageFormat),
-      pdf_version: null,
-    };
+  inspectHeader(head: Buffer, declaredKind?: string | null): HeaderClassification {
+    return classifyHeader(head, declaredKind);
   }
 
   /**
@@ -351,13 +384,5 @@ export class FileValidationService {
   countPages(body: string): number {
     const matches = body.match(PAGE_TYPE_PATTERN);
     return matches ? matches.length : 0;
-  }
-
-  private readVersion(buffer: Buffer): string | null {
-    const head = buffer.subarray(0, MAGIC_SCAN_BYTES).toString('latin1');
-    const index = head.indexOf(PDF_HEADER);
-    if (index < 0) return null;
-    const match = /^%PDF-(\d\.\d)/.exec(head.slice(index, index + 16));
-    return match ? match[1] : null;
   }
 }

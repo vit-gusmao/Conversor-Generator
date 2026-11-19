@@ -7,8 +7,10 @@ Re-execution after a crash therefore converges instead of duplicating data.
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,11 +20,32 @@ from config import settings
 from engine.pipeline import ConversionError, ConversionPipeline, PipelineOptions
 from engine.streaming.source import DocumentSource, head_bytes, sha256_file
 from ingestion.registry import InputProbe, probe_input_path
-from repositories.conversion_repository import ConversionRepository, RunCancelled
+from repositories.conversion_repository import ConversionRepository, LeaseLost, RunCancelled
 from storage import get_storage
 from version import ENGINE_VERSION
 
 logger = logging.getLogger(__name__)
+
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off", ""})
+
+
+def _flag(value: Any, default: bool = False) -> bool:
+    """Reads a boolean option. A string such as "false" must stay False."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_TOKENS:
+            return True
+        if token in _FALSE_TOKENS:
+            return False
+        return default
+    return bool(value)
 
 
 def _notify_node(run_id: str, conversion_id: str, payload: dict[str, Any]) -> None:
@@ -54,6 +77,53 @@ def execute_run(
     job_id: int | None = None,
     fence: int | None = None,
     resume: bool = False,
+) -> None:
+    """Runs one document unit; the result is published only under the job fence.
+
+    A worker that lost its lease gets `LeaseLost` from the publication step; the
+    new owner's state is left untouched and nothing is raised to the caller.
+    The materialized work copies are removed on every path, including early
+    returns and failures.
+    """
+    try:
+        _execute_run(
+            run_id=run_id,
+            conversion_id=conversion_id,
+            storage_key=storage_key,
+            filename=filename,
+            options=options,
+            cancel_check=cancel_check,
+            job_id=job_id,
+            fence=fence,
+            resume=resume,
+        )
+    except LeaseLost:
+        logger.warning("run %s: lease lost before publication; result discarded", run_id)
+    finally:
+        _remove_work_copies(run_id)
+
+
+def _remove_work_copies(run_id: str) -> None:
+    """Deletes `work/<run_id>.*`: our copies only, never the storage object."""
+    work_dir = Path(os.environ.get("WORK_DIR") or (settings.data_dir / "work"))
+    try:
+        for leftover in work_dir.glob(glob.escape(run_id) + ".*"):
+            leftover.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _execute_run(
+    *,
+    run_id: str,
+    conversion_id: str,
+    storage_key: str,
+    filename: str,
+    options: dict[str, Any] | None,
+    cancel_check: Callable[[], bool] | None,
+    job_id: int | None,
+    fence: int | None,
+    resume: bool,
 ) -> None:
     repo = ConversionRepository()
     logger.info(
@@ -91,6 +161,8 @@ def execute_run(
             validation=None,
             error_code="STORAGE_READ_FAILED",
             error_message="O arquivo original não pôde ser recuperado do armazenamento.",
+            job_id=job_id,
+            fence=fence,
         )
         _notify_node(run_id, conversion_id, {"status": "failed", "message": "Falha de armazenamento"})
         return
@@ -108,18 +180,23 @@ def execute_run(
             validation=None,
             error_code="INVALID_FILE",
             error_message="O arquivo não é um PDF nem uma imagem suportada.",
+            job_id=job_id,
+            fence=fence,
         )
         _notify_node(run_id, conversion_id, {"status": "failed", "message": "Arquivo inválido"})
         return
     suffix = _suffix_for(probe)
     if pdf_path.suffix.lower() != suffix:
-        # Keep the parser's extension hint aligned with the real content.
+        # Keep the parser's extension hint aligned with the real content. The
+        # storage backend may hand back its own object: only a copy under
+        # `work/` may be moved; a stored object is copied, never moved.
         renamed = work_dir / f"{run_id}{suffix}"
-        try:
-            pdf_path.replace(renamed)
-        except OSError:
-            import shutil
-
+        if pdf_path.resolve().parent == work_dir.resolve():
+            try:
+                pdf_path.replace(renamed)
+            except OSError:
+                shutil.copyfile(pdf_path, renamed)
+        else:
             shutil.copyfile(pdf_path, renamed)
         pdf_path = renamed
 
@@ -164,7 +241,7 @@ def execute_run(
                 resume=resume,
             )
         result = pipeline.run()
-        repo.persist(result, recorder)
+        repo.persist(result, recorder, job_id=job_id, fence=fence)
         stats = result.stats
         status = result.status
         if result.error and result.error.code == "CANCELLED":
@@ -178,6 +255,8 @@ def execute_run(
             validation=result.validation,
             error_code=result.error.code if result.error else None,
             error_message=result.error.message if result.error else None,
+            job_id=job_id,
+            fence=fence,
         )
         _notify_node(
             run_id,
@@ -196,6 +275,9 @@ def execute_run(
                 ),
             },
         )
+    except LeaseLost:
+        # Not ours any more: the new owner publishes; no failure is recorded.
+        raise
     except ConversionError as exc:
         repo.finish_run(
             run_id,
@@ -205,6 +287,8 @@ def execute_run(
             validation=None,
             error_code=exc.code,
             error_message=exc.message,
+            job_id=job_id,
+            fence=fence,
         )
         _notify_node(run_id, conversion_id, {"status": "failed", "message": exc.message})
     except Exception as exc:  # noqa: BLE001
@@ -217,13 +301,15 @@ def execute_run(
             validation=None,
             error_code="INTERNAL_ERROR",
             error_message="Falha interna durante a conversão.",
+            job_id=job_id,
+            fence=fence,
         )
         _notify_node(run_id, conversion_id, {"status": "failed", "message": str(exc)})
     finally:
         # Never delete an object the storage layer owns; only a materialized
-        # copy under `work/` is ours to remove.
+        # copy under `work/` is ours to remove (see `_remove_work_copies`).
         try:
-            if pdf_path.parent == work_dir:
+            if pdf_path.resolve().parent == work_dir.resolve():
                 pdf_path.unlink(missing_ok=True)
         except OSError:
             pass
@@ -248,10 +334,10 @@ def _options_from(raw: dict[str, Any] | None, probe: InputProbe | None = None) -
 
     ocr = raw.get("ocr")
     if isinstance(ocr, dict):
-        ocr_enabled = bool(ocr.get("enabled", settings.converter_ocr_enabled))
+        ocr_enabled = _flag(ocr.get("enabled", settings.converter_ocr_enabled))
         dpi = ocr.get("dpi") or settings.converter_render_dpi
     else:
-        ocr_enabled = bool(raw.get("ocr", raw.get("ocr_enabled", settings.converter_ocr_enabled)))
+        ocr_enabled = _flag(raw.get("ocr", raw.get("ocr_enabled", settings.converter_ocr_enabled)))
         dpi = raw.get("dpi") or settings.converter_render_dpi
 
     text = raw.get("text") if isinstance(raw.get("text"), dict) else {}
@@ -264,8 +350,8 @@ def _options_from(raw: dict[str, Any] | None, probe: InputProbe | None = None) -
         target_formats=target,
         text_newline=str(text.get("newline") or raw.get("text_newline") or "lf"),
         page_separator=str(text.get("page_separator") or raw.get("page_separator") or "form_feed"),
-        include_table_text=bool(
-            text.get("include_table_text", raw.get("include_table_text", True))
+        include_table_text=_flag(
+            text.get("include_table_text", raw.get("include_table_text", True)), default=True
         ),
         csv_profile=str(csv_options.get("profile") or raw.get("csv_profile") or "interoperable"),
         csv_delimiter=csv_options.get("delimiter") or raw.get("csv_delimiter"),

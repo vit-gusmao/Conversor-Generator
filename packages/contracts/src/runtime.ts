@@ -43,6 +43,9 @@ export interface RedactedProfile {
   ocr_model: string | null;
   assistant_enabled: boolean;
   assistant_model: string | null;
+  /** True when a Ollama executable path is saved; the path itself is never sent. */
+  ollama_path_configured: boolean;
+  /** True when a models directory is saved; the path itself is never sent. */
   models_dir_configured: boolean;
 }
 
@@ -75,9 +78,22 @@ export type ApplyProfileResultStatus = 'applied' | 'deferred' | 'rolled_back';
 
 export interface ApplyProfileResult {
   status: ApplyProfileResultStatus;
-  /** Non-terminal work that prevented immediate application. */
+  /** Non-terminal work that prevented immediate application (human-readable). */
   blockers: string[];
   applied_version: number | null;
+  /** Set when status is `rolled_back`: why the new profile was reverted. */
+  error?: string | null;
+}
+
+/** Non-terminal work counted by the backend (`GET /internal/v1/runtime/activity`). */
+export interface RuntimeActivity {
+  queued: number;
+  running: number;
+  waiting_children: number;
+  automation_running: number;
+  active_imports: number;
+  indexing: number;
+  total: number;
 }
 
 export interface RuntimeStatus {

@@ -13,29 +13,9 @@ import { useScheduleActions, useSchedules } from '@/hooks/use-schedules';
 import { useSources } from '@/hooks/use-sources';
 import { explainError } from '@/lib/errors';
 import { formatDateTime } from '@/lib/format';
+import { MISFIRE_LABELS, OVERLAP_LABELS, RUN_STATE_LABELS, ruleLabel } from '@/lib/schedule-labels';
+import { createIntentKeys } from '@/lib/intent-keys';
 import { toast } from '@/stores/ui';
-
-const RUN_STATE_LABELS: Record<string, string> = {
-  queued: 'na fila',
-  running: 'executando',
-  waiting_children: 'aguardando conversões',
-  cancelling: 'cancelando',
-  succeeded: 'sucesso',
-  partial: 'parcial',
-  no_changes: 'sem novidades',
-  failed: 'falhou',
-  cancelled: 'cancelada',
-  skipped: 'ignorada',
-};
-
-function ruleLabel(schedule: ScheduleRecord): string {
-  const rule = schedule.rule;
-  if (rule.kind === 'daily') return `todo dia às ${rule.local_time}`;
-  const seconds = Number(rule.every_seconds ?? 0);
-  if (seconds % 3600 === 0) return `a cada ${seconds / 3600} h`;
-  if (seconds % 60 === 0) return `a cada ${seconds / 60} min`;
-  return `a cada ${seconds} s`;
-}
 
 export function SchedulesPage() {
   useEnsureSession();
@@ -43,6 +23,7 @@ export function SchedulesPage() {
   const sources = useSources();
   const actions = useScheduleActions();
   const [pendingArchive, setPendingArchive] = useState<ScheduleRecord | null>(null);
+  const [runKeys] = useState(() => createIntentKeys());
 
   const sourceName = (sourceId: string) =>
     (sources.data ?? []).find((source) => source.id === sourceId)?.name ?? sourceId;
@@ -98,16 +79,26 @@ export function SchedulesPage() {
                 <Button
                   variant="outline"
                   size="sm"
+                  disabled={actions.runNow.isPending}
                   onClick={() =>
                     actions.runNow.mutate(
-                      { scheduleId: schedule.id, idempotencyKey: `${schedule.id}:${Date.now()}` },
+                      { scheduleId: schedule.id, idempotencyKey: runKeys.keyFor(schedule.id) },
                       {
-                        onSuccess: (result) =>
+                        onSuccess: (result) => {
+                          runKeys.settle(schedule.id);
+                          if (result.executor_active === false) {
+                            toast({
+                              title: 'Agendado; será executado quando o executor estiver ativo',
+                              variant: 'success',
+                            });
+                            return;
+                          }
                           toast({
                             title: 'Execução iniciada',
                             description: `Ocorrência ${result.state}.`,
                             variant: 'success',
-                          }),
+                          });
+                        },
                         onError: (error) =>
                           toast({ title: 'Falha', description: explainError(error), variant: 'error' }),
                       },
@@ -175,15 +166,18 @@ export function SchedulesPage() {
                 </span>
               </p>
               <p className="text-muted">
-                Políticas: <span className="text-foreground">{schedule.misfire_policy}</span> /{' '}
-                <span className="text-foreground">{schedule.overlap_policy}</span>
+                Políticas:{' '}
+                <span className="text-foreground">{MISFIRE_LABELS[schedule.misfire_policy]}</span> ·{' '}
+                <span className="text-foreground">{OVERLAP_LABELS[schedule.overlap_policy]}</span>
               </p>
-              <Link
-                to={`/schedules/${schedule.id}`}
-                className="text-xs text-accent hover:underline sm:col-span-2"
-              >
-                Ver histórico de execuções
-              </Link>
+              <p className="flex flex-wrap gap-4 text-xs sm:col-span-2">
+                <Link to={`/schedules/${schedule.id}`} className="text-accent hover:underline">
+                  Ver agenda e histórico de execuções
+                </Link>
+                <Link to={`/schedules/${schedule.id}/edit`} className="text-accent hover:underline">
+                  Editar
+                </Link>
+              </p>
             </CardContent>
           </Card>
         ))}

@@ -16,26 +16,32 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from api.deps import ApiError
 from models.db import (
     PublicConversionRow,
+    SourceFileVersionRow,
     SourceImportItemRow,
     SourceImportRow,
     get_session_factory,
 )
+from sources.gateway_submission import GatewaySubmissionError
+from sources.path_policy import PathPolicyError, resolve_source_path
 from sources.repository import SourceRepository
 from sources.scanner import SourceUnavailable, scan_source
 from sources.service import SourceService
 from sources.snapshot import SnapshotError, capture_snapshot
 from sources.submission import StandaloneSubmissionPort
-from sources.types import ImportRequest, SourceDefinitionSnapshot
+from sources.types import ImportRequest, SourceCandidate, SourceDefinitionSnapshot
 
 ACTIVE_IMPORT_STATUSES = {"pending", "scanning", "submitting", "converting", "indexing"}
 SOURCE_LEASE_SECONDS = 120
 MAX_SNAPSHOTS_IN_FLIGHT = 2
 MAX_TRANSIENT_RETRIES = 3
+#: Failed-import codes that ``run()`` resumes instead of returning as final.
+GATEWAY_UNAVAILABLE_CODE = "IMPORT_GATEWAY_UNAVAILABLE"
+RESUMABLE_ERROR_CODES = frozenset({"IMPORT_INCOMPLETE", GATEWAY_UNAVAILABLE_CODE})
 
 # Module-level lock map: in-process serialization per source (standalone runs
 # one runtime per profile; the lease column covers cross-process safety).
@@ -56,6 +62,19 @@ def canonical_request_hash(request: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _is_transient_submission(exc: BaseException) -> bool:
+    """Transient gateway/network failure that a later attempt can clear.
+
+    Delegates to the executor's rule so the importer and the occurrence retry
+    schedule always agree on what is retryable.
+    """
+    if not isinstance(exc, (GatewaySubmissionError, ConnectionError, TimeoutError)):
+        return False
+    from automation.executor import _is_transient  # same rule as the retry scheduler
+
+    return _is_transient(exc)
+
+
 class ImportService:
     def __init__(self, submission: StandaloneSubmissionPort | None = None) -> None:
         self.repository = SourceRepository()
@@ -72,16 +91,9 @@ class ImportService:
         idempotency_key: str,
         schedule_run_id: str | None = None,
     ) -> dict[str, Any]:
+        self._assert_imports_enabled()
         session = get_session_factory()()
         try:
-            from config import settings as runtime_settings
-
-            if not getattr(runtime_settings, "source_imports_enabled", True):
-                raise ApiError(
-                    409,
-                    "FEATURE_DISABLED",
-                    "Importações por caminho estão desabilitadas neste runtime.",
-                )
             source = self.repository.get_source(session, source_id=source_id, owner_id=owner_id)
             if source is None:
                 raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
@@ -91,17 +103,8 @@ class ImportService:
             if root is None or root.revoked_at is not None:
                 raise ApiError(409, "ROOT_REVOKED", "A concessão da raiz foi revogada.")
 
-            request_hash = canonical_request_hash(request)
             definition = self.sources.definition_for(source, root)
-
-            active = session.execute(
-                select(SourceImportRow).where(
-                    SourceImportRow.source_id == source_id,
-                    SourceImportRow.status.in_(ACTIVE_IMPORT_STATUSES),
-                    SourceImportRow.lease_until > datetime.now(UTC),
-                    SourceImportRow.idempotency_key != idempotency_key,
-                )
-            ).scalar_one_or_none()
+            active = self._active_import_for_source(session, source_id, idempotency_key)
             if active is not None:
                 raise ApiError(
                     409,
@@ -114,7 +117,10 @@ class ImportService:
             # Options are normalized with the kind the source actually holds:
             # a PDF from a source must not adopt v3 spreadsheet semantics.
             normalized = self._normalize_for_source(options, definition)
+            # The source is part of the payload: the same key on another
+            # source is a conflict, never a replay of someone else's import.
             payload = {
+                "source_id": source_id,
                 "options": normalized,
                 "force": bool(request.get("force")),
                 "collection_id": request.get("collection_id"),
@@ -160,6 +166,7 @@ class ImportService:
         an older occurrence processes. The root grant is still checked before
         any file is opened (revocation wins over the snapshot).
         """
+        self._assert_imports_enabled()
         session = get_session_factory()()
         try:
             root = self.repository.get_root(
@@ -168,8 +175,10 @@ class ImportService:
             if root is None or root.revoked_at is not None:
                 raise ApiError(409, "ROOT_REVOKED", "A concessão da raiz foi revogada.")
 
-            options = self._normalize(request.get("options") or {}, "spreadsheet")
+            # Same rule as start(): the frozen definition decides the kind.
+            options = self._normalize_for_source(request.get("options") or {}, definition)
             payload = {
+                "source_id": definition.source_id,
                 "options": options,
                 "force": bool(request.get("force")),
                 "collection_id": request.get("collection_id"),
@@ -209,12 +218,14 @@ class ImportService:
                 if record is None:
                     raise ApiError(404, "IMPORT_NOT_FOUND", "Importação inexistente.")
                 if record.status in {"completed", "partial", "failed", "cancelled"}:
-                    # A `partial` caused by children still converting stays
-                    # resumable: re-running reconciles those items instead of
-                    # leaving the import stuck forever.
+                    # An import left with items still in flight (`partial`, or
+                    # `failed` when nothing finished yet) stays resumable:
+                    # re-running reconciles those items instead of leaving the
+                    # import stuck forever. A transient gateway outage is also
+                    # resumable: the same keys make the replay idempotent.
                     resumable = (
-                        record.status == "partial"
-                        and record.error_code == "IMPORT_INCOMPLETE"
+                        record.status in {"partial", "failed"}
+                        and record.error_code in RESUMABLE_ERROR_CODES
                     )
                     if not resumable:
                         return self.import_payload(record)
@@ -226,6 +237,8 @@ class ImportService:
                 definition = SourceDefinitionSnapshot.from_json(record.definition_json)
                 options = record.options_json or {}
                 options_hash = self._options_hash(options)
+                # Automation occurrences let the executor own the retry schedule.
+                automation = record.schedule_run_id is not None
             finally:
                 session.close()
 
@@ -242,14 +255,23 @@ class ImportService:
             except SourceUnavailable as exc:
                 self._fail(import_id, owner_id, exc.code, exc.message)
             except Exception as exc:  # noqa: BLE001 - daemon threads never die silently
-                import traceback
+                if _is_transient_submission(exc):
+                    message = getattr(exc, "message", None) or str(exc)
+                    self._fail(import_id, owner_id, GATEWAY_UNAVAILABLE_CODE, message)
+                    if automation:
+                        # Re-raised unchanged: the executor classifies it as
+                        # transient and reschedules; the next advance() resumes
+                        # this import (status failed + resumable code).
+                        raise
+                else:
+                    import traceback
 
-                self._fail(
-                    import_id,
-                    owner_id,
-                    "IMPORT_INTERNAL_ERROR",
-                    f"{exc}\n{traceback.format_exc(limit=6)}",
-                )
+                    self._fail(
+                        import_id,
+                        owner_id,
+                        "IMPORT_INTERNAL_ERROR",
+                        f"{exc}\n{traceback.format_exc(limit=6)}",
+                    )
 
             session = get_session_factory()()
             try:
@@ -347,8 +369,10 @@ class ImportService:
         captured: list[tuple[Any, Any]] = []
         in_flight: list[Any] = []
         batch: list[SourceCandidate] = []
+        scanned: set[str] = set()
         for candidate in scan_source(definition):
             self._assert_not_cancelled(import_id, owner_id)
+            scanned.add(candidate.relative_path)
             batch.append(candidate)
             if len(batch) >= 50:
                 self._capture_batch(
@@ -361,15 +385,37 @@ class ImportService:
                 import_id, owner_id, definition, batch, options, options_hash,
                 force=force, staging_dir=staging_dir, captured=captured,
             )
+        # Reaching this line means the walk completed: an unavailable root
+        # raised before any candidate, and a cancel raised inside the loop.
+        self._flag_vanished_origins(owner_id, definition.source_id, scanned)
         self._mark_status(import_id, owner_id, "submitting", total=len(captured))
+
+    def _flag_vanished_origins(self, owner_id: str, source_id: str, scanned: set[str]) -> None:
+        """Flag heads whose origin was imported before but is absent from this full scan."""
+        from knowledge.repository import KnowledgeRepository
+
+        session = get_session_factory()()
+        try:
+            imported = set(
+                session.execute(
+                    select(SourceFileVersionRow.relative_path).where(
+                        SourceFileVersionRow.owner_id == owner_id,
+                        SourceFileVersionRow.source_id == source_id,
+                    ).distinct()
+                ).scalars().all()
+            )
+        finally:
+            session.close()
+        vanished = sorted(imported - scanned)
+        if vanished:
+            KnowledgeRepository().mark_source_missing(owner_id, source_id, vanished)
 
     def _capture_batch(
         self, import_id, owner_id, definition, batch, options, options_hash, *,
         force, staging_dir, captured,
     ) -> None:
-        from sources.path_policy import resolve_source_path
-
         session = get_session_factory()()
+        missing: list[str] = []
         try:
             from config import settings as runtime_settings
 
@@ -378,19 +424,21 @@ class ImportService:
                 self._assert_not_cancelled(import_id, owner_id)
                 if max_bytes and candidate.size_bytes > max_bytes:
                     # Never copy a file the admission path would reject anyway.
-                    item = self.repository.add_import_item(
-                        session,
-                        import_id=import_id,
-                        relative_path=candidate.relative_path,
-                        client_item_id=f"big:{candidate.relative_path}:{candidate.size_bytes}",
-                        size_bytes=candidate.size_bytes,
-                        mtime_ns=candidate.mtime_ns,
-                    )
-                    item.status = "failed"
-                    item.error_code = "FILE_TOO_LARGE"
-                    item.error_message = (
-                        f"O arquivo excede o limite de {max_bytes // (1024 * 1024)} MiB."
-                    )
+                    client_item_id = f"big:{candidate.relative_path}:{candidate.size_bytes}"
+                    if not self._has_item(session, import_id, client_item_id):
+                        item = self.repository.add_import_item(
+                            session,
+                            import_id=import_id,
+                            relative_path=candidate.relative_path,
+                            client_item_id=client_item_id,
+                            size_bytes=candidate.size_bytes,
+                            mtime_ns=candidate.mtime_ns,
+                        )
+                        item.status = "failed"
+                        item.error_code = "FILE_TOO_LARGE"
+                        item.error_message = (
+                            f"O arquivo excede o limite de {max_bytes // (1024 * 1024)} MiB."
+                        )
                     continue
                 known_sha, known_hash = self.repository.latest_processed_sha256(
                     session,
@@ -403,11 +451,15 @@ class ImportService:
                 while ref is None:
                     attempts += 1
                     try:
-                        path = resolve_source_path(
-                            definition.root_canonical_path,
-                            candidate.relative_path,
-                            allow_empty=True,
-                        )
+                        try:
+                            path = resolve_source_path(
+                                definition.root_canonical_path,
+                                candidate.relative_path,
+                                allow_empty=True,
+                            )
+                        except PathPolicyError as exc:
+                            # A refused name is an item fact, never an aborted import.
+                            raise SnapshotError.from_policy(exc) from exc
                         ref = capture_snapshot(
                             candidate,
                             definition.root_canonical_path,
@@ -422,18 +474,23 @@ class ImportService:
                         if exc.code in {"SOURCE_CHANGED", "SOURCE_BUSY"} and attempts < MAX_TRANSIENT_RETRIES:
                             time.sleep(0.2)
                             continue
-                        item = self.repository.add_import_item(
-                            session,
-                            import_id=import_id,
-                            relative_path=candidate.relative_path,
-                            client_item_id=f"err:{candidate.relative_path}:{attempts}",
-                            size_bytes=candidate.size_bytes,
-                            mtime_ns=candidate.mtime_ns,
-                        )
-                        item.status = "failed"
-                        item.error_code = exc.code
-                        item.error_message = exc.message
-                        item.attempts = attempts
+                        if exc.code == "SOURCE_MISSING":
+                            # Flagged after this batch's session closes (no lock contention).
+                            missing.append(candidate.relative_path)
+                        client_item_id = f"err:{candidate.relative_path}:{attempts}"
+                        if not self._has_item(session, import_id, client_item_id):
+                            item = self.repository.add_import_item(
+                                session,
+                                import_id=import_id,
+                                relative_path=candidate.relative_path,
+                                client_item_id=client_item_id,
+                                size_bytes=candidate.size_bytes,
+                                mtime_ns=candidate.mtime_ns,
+                            )
+                            item.status = "failed"
+                            item.error_code = exc.code
+                            item.error_message = exc.message
+                            item.attempts = attempts
                         break
                 if ref is None:
                     continue
@@ -446,16 +503,18 @@ class ImportService:
                         (staging_dir / ref.key).unlink(missing_ok=True)
                     except OSError:
                         pass
-                    item = self.repository.add_import_item(
-                        session,
-                        import_id=import_id,
-                        relative_path=candidate.relative_path,
-                        client_item_id=f"skip:{candidate.relative_path}:{ref.sha256[:12]}",
-                        size_bytes=ref.size_bytes,
-                        mtime_ns=ref.mtime_ns,
-                        sha256=ref.sha256,
-                    )
-                    item.status = "skipped"
+                    client_item_id = f"skip:{candidate.relative_path}:{ref.sha256[:12]}"
+                    if not self._has_item(session, import_id, client_item_id):
+                        item = self.repository.add_import_item(
+                            session,
+                            import_id=import_id,
+                            relative_path=candidate.relative_path,
+                            client_item_id=client_item_id,
+                            size_bytes=ref.size_bytes,
+                            mtime_ns=ref.mtime_ns,
+                            sha256=ref.sha256,
+                        )
+                        item.status = "skipped"
                     continue
                 client_item_id = f"item:{candidate.relative_path}:{ref.sha256[:12]}"
                 existing = self.repository.get_import_item(
@@ -481,6 +540,10 @@ class ImportService:
             session.commit()
         finally:
             session.close()
+        if missing:
+            from knowledge.repository import KnowledgeRepository
+
+            KnowledgeRepository().mark_source_missing(owner_id, definition.source_id, missing)
 
     def _submit_and_wait(
         self,
@@ -501,15 +564,38 @@ class ImportService:
                 )
                 .order_by(SourceImportItemRow.id)
             ).scalars().all()
+            record = self.repository.get_import(session, import_id=import_id, owner_id=owner_id)
+            batch_id = record.batch_id if record is not None else None
         finally:
             session.close()
 
-        if not items:
-            return
+        # A resumed run may have nothing left to submit (every item already
+        # submitted before a crash). It must still wait for the conversions
+        # and record versions, so only the submit loop is skipped.
+        if items:
+            batch_id = self.submission.ensure_batch(owner_id, import_id)
+            self._set_batch(import_id, owner_id, batch_id)
+            self._submit_items(import_id, owner_id, batch_id, items, options)
+            self.submission.seal_batch(owner_id, batch_id)
+        self._mark_status(import_id, owner_id, "converting")
 
-        batch_id = self.submission.ensure_batch(owner_id, import_id)
-        self._set_batch(import_id, owner_id, batch_id)
+        # Wait for terminal conversions (inline queue executes quickly; the
+        # poll keeps the executor thread small and resumable).
+        deadline = _time.monotonic() + 120
+        while _time.monotonic() < deadline:
+            if self._cancelled(import_id, owner_id):
+                if batch_id is not None:
+                    self.submission.cancel(owner_id, batch_id)
+                self._mark_status(import_id, owner_id, "cancelled")
+                return
+            progress = self._conversion_progress(import_id, owner_id)
+            if progress["pending"] == 0:
+                break
+            _time.sleep(0.2)
+        self._mark_status(import_id, owner_id, "converting")
+        self._record_versions(import_id, owner_id, definition, options)
 
+    def _submit_items(self, import_id, owner_id, batch_id, items, options) -> None:
         storage = self._staging_dir()
         for item in items:
             self._assert_not_cancelled(import_id, owner_id)
@@ -546,24 +632,6 @@ class ImportService:
                 snapshot_path.unlink(missing_ok=True)
             except OSError:
                 pass
-
-        self.submission.seal_batch(owner_id, batch_id)
-        self._mark_status(import_id, owner_id, "converting")
-
-        # Wait for terminal conversions (inline queue executes quickly; the
-        # poll keeps the executor thread small and resumable).
-        deadline = _time.monotonic() + 120
-        while _time.monotonic() < deadline:
-            if self._cancelled(import_id, owner_id):
-                self.submission.cancel(owner_id, batch_id)
-                self._mark_status(import_id, owner_id, "cancelled")
-                return
-            progress = self._conversion_progress(import_id, owner_id)
-            if progress["pending"] == 0:
-                break
-            _time.sleep(0.2)
-        self._mark_status(import_id, owner_id, "finalize")
-        self._record_versions(import_id, owner_id, definition, options)
 
     def _record_versions(
         self, import_id: str, owner_id: str, definition: SourceDefinitionSnapshot, options: dict[str, Any]
@@ -604,6 +672,50 @@ class ImportService:
             session.close()
 
     # ------------------------------------------------------------- helpers
+    def _has_item(self, session, import_id: str, client_item_id: str) -> bool:
+        """Deterministic item keys make a re-run hit the same row: reuse it."""
+        return self.repository.get_import_item(
+            session, import_id=import_id, client_item_id=client_item_id
+        ) is not None
+
+    @staticmethod
+    def _assert_imports_enabled() -> None:
+        from config import settings as runtime_settings
+
+        if not getattr(runtime_settings, "source_imports_enabled", True):
+            raise ApiError(
+                409,
+                "FEATURE_DISABLED",
+                "Importações por caminho estão desabilitadas neste runtime.",
+            )
+
+    @staticmethod
+    def _active_import_for_source(session, source_id: str, idempotency_key: str):
+        """An import holds the source while it is running, or while it is queued.
+
+        A ``pending`` row has no lease yet, so it counts as active for one
+        lease window after creation: a queued import is never overlapped, and
+        an abandoned one cannot block the source forever.
+        """
+        now = datetime.now(UTC)
+        pending_window = now - timedelta(seconds=SOURCE_LEASE_SECONDS)
+        return session.execute(
+            select(SourceImportRow)
+            .where(
+                SourceImportRow.source_id == source_id,
+                SourceImportRow.idempotency_key != idempotency_key,
+                SourceImportRow.status.in_(ACTIVE_IMPORT_STATUSES),
+                or_(
+                    SourceImportRow.lease_until > now,
+                    and_(
+                        SourceImportRow.status == "pending",
+                        SourceImportRow.created_at > pending_window,
+                    ),
+                ),
+            )
+            .limit(1)
+        ).scalars().first()
+
     def _conversion_progress(self, import_id: str, owner_id: str) -> dict[str, int]:
         session = get_session_factory()()
         try:

@@ -98,7 +98,10 @@ def search_knowledge(
     if not query:
         raise ApiError(400, "INVALID_QUERY", "Informe o texto da consulta.")
     collection_id = body.get("collection_id")
-    top_k = int(body.get("top_k") or 8)
+    try:
+        top_k = int(body.get("top_k") or 8)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(400, "INVALID_OPTION", "top_k deve ser um número inteiro.") from exc
     citations = retrieve(
         owner_id=user["id"],
         query=query,

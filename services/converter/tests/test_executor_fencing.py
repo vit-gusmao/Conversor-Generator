@@ -15,6 +15,14 @@ INTERNAL = {"x-internal-token": "test-internal-token"}
 
 
 @pytest.fixture(autouse=True)
+def _executor_enabled(monkeypatch):
+    """Run-now is refused when AUTOMATION_EXECUTOR_ENABLED is off (AU1-13)."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "automation_executor_enabled", True)
+
+
+@pytest.fixture(autouse=True)
 def _clean_automation_tables():
     """Shared test DB: reset automation rows so claims are deterministic."""
     from sqlalchemy import delete as _delete

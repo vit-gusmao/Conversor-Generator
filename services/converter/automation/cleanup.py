@@ -16,6 +16,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from automation.calendar import as_utc
 from automation.models import AutomationEventRow, AutomationRunRow
 from config import settings
 from models.db import SourceImportItemRow, SourceImportRow, get_session_factory
@@ -24,6 +25,8 @@ logger = logging.getLogger("automation.cleanup")
 
 TERMINAL_RUN_STATES = ("succeeded", "partial", "no_changes", "failed", "cancelled", "skipped")
 UPLOADED_ITEM_STATES = ("submitted", "completed", "failed", "skipped")
+#: A snapshot still `captured` under an import that ended this way is never resumed.
+DEAD_IMPORT_STATES = ("failed", "cancelled")
 
 
 def cleanup_snapshots(*, now: datetime | None = None) -> dict[str, int]:
@@ -44,6 +47,12 @@ def cleanup_snapshots(*, now: datetime | None = None) -> dict[str, int]:
                 )
             ).scalars()
         }
+        dead_imports = {
+            row
+            for row in session.execute(
+                select(SourceImportRow.id).where(SourceImportRow.status.in_(DEAD_IMPORT_STATES))
+            ).scalars()
+        }
         items = list(
             session.execute(
                 select(SourceImportItemRow).where(SourceImportItemRow.snapshot_key.is_not(None))
@@ -53,7 +62,9 @@ def cleanup_snapshots(*, now: datetime | None = None) -> dict[str, int]:
             if item.import_id in active_imports:
                 kept += 1
                 continue
-            if item.status not in UPLOADED_ITEM_STATES:
+            uploaded = item.status in UPLOADED_ITEM_STATES
+            abandoned = item.status == "captured" and item.import_id in dead_imports
+            if not (uploaded or abandoned):
                 kept += 1
                 continue
             path = staging / item.snapshot_key
@@ -72,7 +83,7 @@ def cleanup_snapshots(*, now: datetime | None = None) -> dict[str, int]:
 
 def cleanup_history(*, now: datetime | None = None) -> dict[str, int]:
     """Delete automation history past its retention window (never artifacts)."""
-    now = now or datetime.now(UTC)
+    now = as_utc(now or datetime.now(UTC))
     history_days = int(getattr(settings, "automation_history_retention_days", 90))
     failure_days = int(getattr(settings, "automation_failure_retention_days", 7))
     history_cutoff = now - timedelta(days=history_days)
@@ -90,6 +101,8 @@ def cleanup_history(*, now: datetime | None = None) -> dict[str, int]:
             finished = run.finished_at or run.updated_at or run.created_at
             if finished is None:
                 continue
+            # SQLite returns naive values; compare on the same (UTC) footing.
+            finished = as_utc(finished)
             cutoff = failure_cutoff if run.state == "failed" else history_cutoff
             if finished >= cutoff:
                 continue

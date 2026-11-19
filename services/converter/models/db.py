@@ -14,6 +14,7 @@ separate and Node never touches converter tables.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -444,6 +445,12 @@ class KnowledgeIndexJobRow(Base):
     stats_json = Column(JSON, nullable=True)
     error_code = Column(String(64), nullable=True)
     error_message = Column(Text, nullable=True)
+    #: Lease/fence (WP-C1-T8): a claim bumps ``fence`` and sets the lease; a
+    #: stale worker's writes are rejected by fence mismatch.
+    attempt = Column(Integer, nullable=False, default=0, server_default="0")
+    fence = Column(Integer, nullable=False, default=0, server_default="0")
+    lease_owner = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
@@ -883,16 +890,17 @@ def get_session_factory():
     return _SessionFactory
 
 
-def init_db() -> None:
+def init_db(engine=None) -> None:
     """Create tables when they do not exist and apply additive upgrades.
 
     Alembic migrations are shipped for real deployments; this keeps the
-    standalone mode zero-setup.  ``create_all`` never alters an existing table,
-    so a new additive column is applied explicitly and only when missing.
+    standalone mode zero-setup. ``create_all`` never alters an existing table,
+    so missing columns and indexes are added by ``_ensure_additive_columns``.
+    ``engine`` defaults to the process-wide engine; startup code passes its own.
     """
     from sqlalchemy import text
 
-    engine = get_engine()
+    engine = engine if engine is not None else get_engine()
     if engine.dialect.name == "sqlite":
         with engine.connect() as conn:
             conn.execute(text("PRAGMA journal_mode=WAL"))
@@ -902,35 +910,115 @@ def init_db() -> None:
     _ensure_additive_columns(engine)
 
 
-def _ensure_additive_columns(engine) -> None:
-    """Apply additive columns introduced after the first release.
+def schema_gaps(engine) -> list[str]:
+    """Tables and columns the models declare but the database lacks.
 
-    These are safe by construction: nullable/defaulted columns that old readers
-    ignore.  Destructive migrations remain the responsibility of Alembic.
+    Entries are ``table`` for a missing table and ``table.column`` for a missing
+    column. An empty list means the additive upgrade has nothing to do.
     """
-    from sqlalchemy import text
+    from sqlalchemy import inspect as sa_inspect
 
-    if engine.dialect.name == "sqlite":
-        with engine.connect() as conn:
-            columns = {
-                row[1]
-                for row in conn.exec_driver_sql("PRAGMA table_info(public_conversions)")
-            }
-            if columns and "options_json" not in columns:
-                conn.exec_driver_sql(
-                    "ALTER TABLE public_conversions ADD COLUMN options_json JSON DEFAULT '{}'"
-                )
-                conn.commit()
-        return
-    if engine.dialect.name == "postgresql":
-        with engine.connect() as conn:
-            conn.execute(
-                text(
-                    "ALTER TABLE public_conversions "
-                    "ADD COLUMN IF NOT EXISTS options_json JSON DEFAULT '{}'::json"
-                )
-            )
-            conn.commit()
+    inspector = sa_inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    gaps: list[str] = []
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            gaps.append(table.name)
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table.name)}
+        gaps.extend(f"{table.name}.{col.name}" for col in table.columns if col.name not in existing)
+    return gaps
+
+
+def _ensure_additive_columns(engine) -> None:
+    """Adds every column and index the models declare that an existing table lacks.
+
+    The rule is generic, so a new model column needs no hand-written DDL:
+
+    * a nullable column is added as is;
+    * a NOT NULL column with a server default, or with a scalar/constant Python
+      default (``0``, ``"x"``, ``dict``), is added with that DEFAULT so existing
+      rows receive a value;
+    * a NOT NULL column with no backfillable default (e.g. a timestamp factory)
+      is added as nullable: the database cannot invent a safe value for old rows,
+      and the ORM always supplies it on insert.
+
+    Indexes the models declare are created when missing. Destructive changes stay
+    the responsibility of Alembic. Safe to run repeatedly.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    dialect = engine.dialect
+    preparer = dialect.identifier_preparer
+    with engine.begin() as conn:
+        inspector = sa_inspect(conn)
+        existing_tables = set(inspector.get_table_names())
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue  # create_all owns new tables
+            existing_cols = {col["name"] for col in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing_cols or column.primary_key:
+                    continue
+                conn.exec_driver_sql(_add_column_sql(dialect, preparer, table, column))
+            existing_indexes = {idx["name"] for idx in inspector.get_indexes(table.name)}
+            for index in table.indexes:
+                if index.name and index.name not in existing_indexes:
+                    index.create(bind=conn, checkfirst=False)
+
+
+def _add_column_sql(dialect, preparer, table, column) -> str:
+    """ALTER TABLE ... ADD COLUMN for one model column, per the rule above."""
+    default_sql = _server_default_sql(dialect, column) or _backfill_default_sql(dialect, column)
+    ddl = (
+        f"ALTER TABLE {preparer.quote(table.name)} ADD COLUMN {preparer.quote(column.name)} "
+        f"{column.type.compile(dialect=dialect)}"
+    )
+    if default_sql is not None:
+        ddl += f" DEFAULT {default_sql}"
+        if not column.nullable:
+            ddl += " NOT NULL"
+    return ddl
+
+
+def _server_default_sql(dialect, column) -> str | None:
+    server = column.server_default
+    if server is None:
+        return None
+    arg = server.arg
+    if isinstance(arg, str):
+        return "'" + arg.replace("'", "''") + "'"
+    return str(arg.compile(dialect=dialect, compile_kwargs={"literal_binds": True}))
+
+
+def _backfill_default_sql(dialect, column) -> str | None:
+    """A literal for the Python-side default, when it is a simple constant.
+
+    Only a NOT NULL column needs one: nullable columns stay NULL for old rows.
+    Timestamp factories (callables returning datetimes) return None, so the
+    column is added as nullable instead.
+    """
+    if column.nullable or column.default is None:
+        return None
+    default = column.default
+    if default.is_scalar:
+        value = default.arg
+    elif default.is_callable:
+        try:
+            value = default.arg(None)
+        except Exception:  # noqa: BLE001 - a factory that needs the ORM context
+            return None
+    else:
+        return None
+    if isinstance(value, (dict, list)):
+        return "'" + json.dumps(value).replace("'", "''") + "'"
+    if isinstance(value, (bool, int, float)) or (isinstance(value, str)):
+        from sqlalchemy import literal
+
+        return str(
+            literal(value).compile(dialect=dialect, compile_kwargs={"literal_binds": True})
+        )
+    return None
 
 
 def reset_engine() -> None:

@@ -51,3 +51,6 @@ npm-debug.log*
 /work/
 /study/
 /stress/
+
+# desktop packaging output (electron-builder / staging)
+/apps/desktop/release*/

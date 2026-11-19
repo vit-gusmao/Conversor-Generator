@@ -98,10 +98,22 @@ def next_occurrences(
     return occurrences
 
 
+def as_utc(value: datetime) -> datetime:
+    """Aware UTC for any instant.
+
+    SQLite returns naive datetimes for timestamps written in UTC, and calling
+    ``astimezone`` on a naive value interprets it as *host-local* time. A naive
+    value is therefore read as UTC by contract; aware values are converted.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def occurrence_key(schedule_id: str, revision: int, scheduled_for_utc: datetime) -> str:
-    """Globally unique identity: schedule + revision + instant."""
-    instant = scheduled_for_utc.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    """Globally unique identity: schedule + revision + instant (always UTC)."""
+    instant = as_utc(scheduled_for_utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{schedule_id}:{revision}:{instant}"
 
 
-__all__ = ["Calendar", "next_occurrences", "occurrence_key"]
+__all__ = ["Calendar", "as_utc", "next_occurrences", "occurrence_key"]

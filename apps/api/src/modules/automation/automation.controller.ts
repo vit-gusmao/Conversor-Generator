@@ -1,4 +1,18 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Post, Put, Query, Req } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Headers,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Patch,
+  Post,
+  Put,
+  Query,
+  Req,
+} from '@nestjs/common';
 import type { Request } from 'express';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -60,6 +74,16 @@ export class AutomationController {
   ): Promise<unknown> {
     const owner = this.requireUser(user);
     return this.automation.patchSource(owner, id, body);
+  }
+
+  /** PATCH alias of PUT: the web client may send either verb. */
+  @Patch('sources/:id')
+  updateSourcePatch(
+    @Param('id') id: string,
+    @CurrentUser() user?: AuthenticatedUser,
+    @Body() body?: unknown,
+  ): Promise<unknown> {
+    return this.patchSource(id, user, body);
   }
 
   @Delete('sources/:id')
@@ -144,6 +168,16 @@ export class AutomationController {
     return this.automation.patchSchedule(owner, id, body);
   }
 
+  /** PATCH alias of PUT: the web client may send either verb. */
+  @Patch('schedules/:id')
+  updateSchedulePatch(
+    @Param('id') id: string,
+    @CurrentUser() user?: AuthenticatedUser,
+    @Body() body?: unknown,
+  ): Promise<unknown> {
+    return this.patchSchedule(id, user, body);
+  }
+
   @Delete('schedules/:id')
   deleteSchedule(
     @Param('id') id: string,
@@ -185,9 +219,18 @@ export class AutomationController {
   }
 
   @Get('schedule-runs/:id/events')
-  runEvents(@Param('id') id: string, @CurrentUser() user?: AuthenticatedUser): Promise<unknown> {
+  runEvents(
+    @Param('id') id: string,
+    @CurrentUser() user?: AuthenticatedUser,
+    @Query('after') after?: string,
+    @Query('last_event_id') lastEventIdQuery?: string,
+    @Headers('last-event-id') lastEventIdHeader?: string,
+  ): Promise<unknown> {
     const owner = this.requireUser(user);
-    return this.automation.runEvents(owner.id, id);
+    // The cursor is forwarded to the engine instead of being dropped (the
+    // engine reads it from Last-Event-ID; `after` is passed as well).
+    const cursor = firstCursor([after, lastEventIdQuery, lastEventIdHeader]);
+    return this.automation.runEvents(owner.id, id, cursor);
   }
 
   @Post('schedule-runs/:id/cancel')
@@ -196,5 +239,15 @@ export class AutomationController {
     const owner = this.requireUser(user);
     return this.automation.cancelRun(owner.id, id);
   }
+}
+
+/** First non-negative integer among the candidates (query before header). */
+function firstCursor(candidates: Array<string | string[] | undefined>): number | null {
+  for (const candidate of candidates) {
+    const raw = Array.isArray(candidate) ? candidate[0] : candidate;
+    if (raw === undefined || !/^\d+$/.test(raw.trim())) continue;
+    return Number.parseInt(raw.trim(), 10);
+  }
+  return null;
 }
 

@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
+from bisect import bisect_right
 from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Header, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import or_, select
 
 from api.deps import (
     DEVICE_COOKIE,
@@ -27,11 +30,19 @@ from api.deps import (
     user_dict,
 )
 from api.schemas import ExportRequest
+from api.serialization import content_disposition
 from api.service import ConversionService
+from api.sse import resolve_stream_user, resume_cursor
 from config import settings
 from engine.ocr.engines import ocr_capability
 from jobqueue import get_queue
-from models.db import PublicUserRow
+from models.db import (
+    PublicConversionRow,
+    PublicEventRow,
+    PublicUserRow,
+    Run,
+    get_session_factory,
+)
 from storage import get_storage
 from version import ENGINE_VERSION
 
@@ -237,7 +248,7 @@ def conversion_download(conversion_id: str, user: dict[str, Any] = Depends(curre
         iter(lambda: stream.read(1024 * 1024), b""),
         media_type=media,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": content_disposition(filename),
             "X-Content-Type-Options": "nosniff",
         },
     )
@@ -285,7 +296,7 @@ def download_conversion_export(
         content=data,
         media_type=media,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": content_disposition(filename),
             "X-Content-Type-Options": "nosniff",
         },
     )
@@ -313,37 +324,139 @@ def conversion_text(
 # --------------------------------------------------------------------------- #
 
 TERMINAL = {"completed", "completed_with_warnings", "failed", "cancelled"}
+#: Quiet polls, with the followed run already terminal, before the stream closes
+#: even though no terminal event was seen (covers a terminal row whose event is
+#: not written). A terminal event is normally delivered in the same poll.
+_SETTLED_POLLS = 3
+_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _parse_run_id(raw: str | None) -> str | None:
+    """Optional `run_id` filter. Absent or blank means the conversion as a whole."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if not _RUN_ID_PATTERN.fullmatch(value):
+        raise ApiError(400, "INVALID_OPTION", "run_id inválido.")
+    return value
+
+
+class _RunLedger:
+    """Which run each event of a conversion belongs to.
+
+    Standalone events carry no run column. A run opens with a queued status event
+    whose payload names its attempt (`ConversionService._stage_run`), so an event
+    belongs to the latest run opened at or before its sequence. Events before the
+    first opening belong to the first run.
+    """
+
+    def __init__(self, conversion_id: str) -> None:
+        session = get_session_factory()()
+        try:
+            conversion = session.get(PublicConversionRow, conversion_id)
+            self.active_run_id: str | None = conversion.active_run_id if conversion else None
+            self.conversion_status: str | None = conversion.status if conversion else None
+            runs = session.execute(
+                select(Run.id, Run.attempt, Run.status)
+                .where(Run.conversion_id == conversion_id)
+                .order_by(Run.attempt)
+            ).all()
+            events = session.execute(
+                select(
+                    PublicEventRow.sequence,
+                    PublicEventRow.type,
+                    PublicEventRow.status,
+                    PublicEventRow.payload_json,
+                )
+                .where(
+                    PublicEventRow.conversion_id == conversion_id,
+                    or_(
+                        PublicEventRow.type == "status",
+                        PublicEventRow.status.in_(sorted(TERMINAL)),
+                    ),
+                )
+                .order_by(PublicEventRow.sequence)
+            ).all()
+        finally:
+            session.close()
+
+        self.run_status: dict[str, str] = {row.id: row.status for row in runs}
+        attempts = {int(row.attempt): row.id for row in runs}
+        opened: list[tuple[int, str | None]] = []
+        terminal_sequences: list[int] = []
+        for row in events:
+            payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+            attempt = payload.get("attempt")
+            if row.type == "status" and isinstance(attempt, int):
+                opened.append((int(row.sequence), attempts.get(attempt)))
+            if row.status in TERMINAL:
+                terminal_sequences.append(int(row.sequence))
+        self._open_seqs = [seq for seq, _ in opened]
+        self._open_runs = [run for _, run in opened]
+        self._first_run = runs[0].id if runs else None
+        self._terminal = [(seq, self.run_of(seq)) for seq in terminal_sequences]
+
+    def run_of(self, sequence: int) -> str | None:
+        index = bisect_right(self._open_seqs, sequence) - 1
+        return self._first_run if index < 0 else self._open_runs[index]
+
+    def has_terminal_up_to(self, run_id: str | None, cursor: int) -> bool:
+        """True once a terminal event of `run_id` is at or before the cursor (sent)."""
+        return run_id is not None and any(
+            seq <= cursor and owner == run_id for seq, owner in self._terminal
+        )
+
+    def status_of_target(self, run_id: str | None) -> str | None:
+        return self.conversion_status if run_id is None else self.run_status.get(run_id)
+
+
+def _open_stream_scope(owner_id: str, conversion_id: str, raw_run_id: str | None) -> str | None:
+    """Checks ownership and the optional run before any byte is streamed.
+
+    Runs before the response starts so a bad `run_id` or a run from another
+    conversion is a real HTTP 400/404, not an error event inside the stream.
+    """
+    service.status_of(owner_id=owner_id, conversion_id=conversion_id)
+    run_filter = _parse_run_id(raw_run_id)
+    if run_filter and run_filter not in _RunLedger(conversion_id).run_status:
+        raise ApiError(404, "NOT_FOUND", "Execução não encontrada nesta conversão.")
+    return run_filter
 
 
 @router.get("/conversions/{conversion_id}/events")
 async def conversion_events(
     conversion_id: str,
     request: Request,
-    session=Depends(get_db),
     authorization: str | None = Header(default=None),
     x_device_id: str | None = Header(default=None),
     access_token: str | None = Query(default=None),
     last_event_id: str | None = Header(default=None),
     last_event_id_query: int | None = Query(default=None, alias="last_event_id"),
+    run_id: str | None = Query(default=None),
 ):
-    auth = authorization or (f"Bearer {access_token}" if access_token else None)
-    user, _generated = resolve_user(session, auth, x_device_id)
-    owner_id = user["id"]
+    """Conversion progress as text/event-stream, with resume support.
 
-    cursor = 0
-    for candidate in (last_event_id, last_event_id_query):
-        if candidate in (None, ""):
-            continue
-        try:
-            cursor = max(cursor, int(candidate))
-        except (TypeError, ValueError):
-            continue
+    `?run_id=` follows one run only: its events are replayed and streamed, and
+    the stream ends on that run's terminal event. Without it, the stream follows
+    the whole conversion and ends only on a terminal event of the CURRENT run, so
+    an older run's failure does not close it after a retry. Same contract as the
+    gateway (`apps/api` conversion-events controller).
+    """
+    auth = authorization or (f"Bearer {access_token}" if access_token else None)
+    # The device cookie counts as an identity, as it does for every other route.
+    device_id = x_device_id or request.cookies.get(DEVICE_COOKIE)
+    # Resolved with a short-lived session: the stream below can run for minutes.
+    user = await asyncio.to_thread(resolve_stream_user, auth, device_id)
+    owner_id = user["id"]
+    run_filter = await asyncio.to_thread(_open_stream_scope, owner_id, conversion_id, run_id)
+    cursor = resume_cursor(last_event_id, last_event_id_query)
 
     async def stream() -> AsyncIterator[bytes]:
         nonlocal cursor
         yield b": connected\n\n"
         deadline = time.monotonic() + 1800
         idle = 0
+        settled = 0
         while time.monotonic() < deadline:
             if await request.is_disconnected():
                 break
@@ -351,20 +464,30 @@ async def conversion_events(
                 items = await asyncio.to_thread(
                     service.events, owner_id=owner_id, conversion_id=conversion_id, since=cursor
                 )
-                status = await asyncio.to_thread(
-                    service.status_of, owner_id=owner_id, conversion_id=conversion_id
-                )
+                ledger = await asyncio.to_thread(_RunLedger, conversion_id)
             except ApiError:
                 yield b"event: error\ndata: {\"message\":\"conversao indisponivel\"}\n\n"
                 break
             for item in items:
                 cursor = int(item["sequence"])
+                if run_filter and ledger.run_of(cursor) != run_filter:
+                    continue
                 yield (
                     f"id: {cursor}\nevent: {item['type']}\n"
                     f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
                 ).encode()
-            if status in TERMINAL and not items:
+
+            target = run_filter or ledger.active_run_id
+            if ledger.has_terminal_up_to(target, cursor):
                 break
+            if items:
+                settled = 0
+            elif ledger.status_of_target(target) in TERMINAL:
+                settled += 1
+                if settled >= _SETTLED_POLLS:
+                    break
+            else:
+                settled = 0
             idle += 1
             if idle % 30 == 0:
                 yield b": heartbeat\n\n"
@@ -451,7 +574,7 @@ def audit_export(
         owner_id=user["id"], conversion_id=conversion_id, fmt=format
     )
     return Response(
-        content=data, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        content=data, media_type=media, headers={"Content-Disposition": content_disposition(filename)}
     )
 
 

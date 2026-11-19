@@ -133,9 +133,16 @@ def chunk_text_plan(
                         )
                     )
                     index += 1
+                # Nothing is carried across a long block: its tail would
+                # otherwise come out later as a chunk of overlap alone.
+                buffer = []
+                buffer_tokens = 0
                 continue
             if buffer and buffer_tokens + tokens > max_tokens:
                 flush()
+                # The carried tail is only an overlap: drop it rather than exceed the budget.
+                while buffer and buffer_tokens + tokens > max_tokens:
+                    buffer_tokens -= count_tokens(buffer.pop(0).text)
             buffer.append(segment)
             buffer_tokens += tokens
         flush()
@@ -154,7 +161,8 @@ def chunk_study_text(
     overlap: int = 80,
 ) -> list[ChunkDraft]:
     """Chunk an explicitly selected engineering study file."""
-    paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
+    normalized = text.replace("\r\n", "\n")
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", normalized) if part.strip()]
     drafts: list[ChunkDraft] = []
     buffer: list[str] = []
     buffer_tokens = 0
@@ -295,6 +303,8 @@ def _split_text(text: str, *, max_tokens: int, overlap: int) -> Iterable[str]:
                 tail_tokens += candidate_tokens
             buffer = tail
             buffer_tokens = tail_tokens
+            while buffer and buffer_tokens + tokens > max_tokens:
+                buffer_tokens -= count_tokens(buffer.pop(0))
         buffer.append(line)
         buffer_tokens += tokens
     if buffer:

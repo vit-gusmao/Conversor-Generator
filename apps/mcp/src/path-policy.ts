@@ -11,7 +11,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { expandPath } from './config.js';
+import { expandHome, expandPath } from './config.js';
 
 export class PathPolicyError extends Error {
   readonly code: string;
@@ -95,6 +95,25 @@ function assertNoTraversal(requested: string): void {
   }
 }
 
+/**
+ * Tool inputs must be absolute (after `~` expansion). Checked on the raw value
+ * before any resolution: `path.resolve` would otherwise anchor a relative path
+ * to the server's working directory without telling the caller. On Windows a
+ * rooted path without a drive (`\folder\file.pdf`) is also refused, because it
+ * resolves against the current drive.
+ */
+function assertAbsoluteInput(expanded: string, requested: string): void {
+  const absolute =
+    process.platform === 'win32'
+      ? /^[A-Za-z]:[\\/]/.test(expanded)
+      : path.isAbsolute(expanded);
+  if (!absolute) {
+    throw new PathPolicyError('INVALID_PATH', 'The path must be absolute (or start with ~).', {
+      path: requested,
+    });
+  }
+}
+
 function assertNotRemotePath(requested: string): void {
   // `\\server\share` (UNC) and `\\.\` / `\\?\` (device namespace) are both
   // rejected: they reach another machine or a device, never a local document.
@@ -172,18 +191,14 @@ export async function resolveLocalPath(
   assertNoTraversal(trimmed);
   assertNotRemotePath(trimmed);
 
-  const expanded = expandPath(trimmed);
-  if (!path.isAbsolute(expanded)) {
-    throw new PathPolicyError('INVALID_PATH', 'The path must be absolute (or start with ~).', {
-      path: requested,
-    });
-  }
+  const expanded = expandHome(trimmed);
+  assertAbsoluteInput(expanded, requested);
 
   const roots = await canonicalRoots(allowedRoots);
 
   let realPath: string;
   try {
-    realPath = stripExtendedPrefix(await fs.realpath(expanded));
+    realPath = stripExtendedPrefix(await fs.realpath(path.resolve(expanded)));
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') {
@@ -226,12 +241,13 @@ export async function resolveAllowedDirectory(
   assertNoTraversal(trimmed);
   assertNotRemotePath(trimmed);
 
-  const expanded = expandPath(trimmed);
+  const expanded = expandHome(trimmed);
+  assertAbsoluteInput(expanded, directory);
   const roots = await canonicalRoots(allowedRoots);
 
   let realDir: string;
   try {
-    realDir = stripExtendedPrefix(await fs.realpath(expanded));
+    realDir = stripExtendedPrefix(await fs.realpath(path.resolve(expanded)));
   } catch {
     throw new PathPolicyError('DESTINATION_NOT_FOUND', 'The destination directory does not exist.', {
       path: directory,
@@ -254,7 +270,9 @@ export function sanitizeFilename(filename: string, fallback = 'artifact'): strin
   name = name.replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_').trim();
   name = name.replace(/^[.\s]+/, '');
   if (name.length === 0) name = fallback;
-  const stem = name.replace(/\.[^.]*$/, '').toLowerCase();
+  // Windows reserves the name before the FIRST dot: `CON.tar.gz` is as
+  // unusable as `CON.txt`, so the stem is not the name without its last extension.
+  const stem = (name.split('.', 1)[0] ?? '').toLowerCase();
   if (WINDOWS_RESERVED.has(stem)) name = `_${name}`;
   if (name.length > 180) {
     const extension = path.extname(name).slice(0, 20);
