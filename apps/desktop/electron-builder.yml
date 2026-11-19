@@ -11,8 +11,11 @@ files:
   - package.json
 # O backend congelado (PyInstaller) e o SPA são recursos EXTERNOS ao ASAR:
 # nunca executar um binário de dentro do arquivo empacotado.
+# Caminhos relativos ao diretório do app (apps/desktop):
+#   ../../services/converter/dist/converter  (saída do PyInstaller onedir)
+#   ../web/dist                              (SPA compilada)
 extraResources:
-  - from: ../converter/dist/converter
+  - from: ../../services/converter/dist/converter
     to: backend
     filter: ["**/*"]
   - from: ../web/dist

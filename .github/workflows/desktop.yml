@@ -80,14 +80,17 @@ jobs:
           npm --prefix apps/desktop run build
 
       - name: Package installer
-        run: npx --prefix apps/desktop electron-builder --config apps/desktop/electron-builder.yml --win nsis --x64
+        working-directory: apps/desktop
+        # electron-builder resolves extraResources relative to this directory.
+        run: npx electron-builder --win nsis --x64
 
       - name: Verify executable name and artifacts
         shell: pwsh
         run: |
-          $exe = Get-ChildItem apps/desktop/release -Recurse -Filter "conversor-generator.exe" | Select-Object -First 1
+          $release = Join-Path $env:GITHUB_WORKSPACE "apps/desktop/release"
+          $exe = Get-ChildItem $release -Recurse -Filter "conversor-generator.exe" | Select-Object -First 1
           if (-not $exe) { throw "conversor-generator.exe ausente" }
-          $setup = Get-ChildItem apps/desktop/release -Filter "conversor-generator-setup-*.exe" | Select-Object -First 1
+          $setup = Get-ChildItem $release -Filter "conversor-generator-setup-*.exe" | Select-Object -First 1
           if (-not $setup) { throw "instalador ausente" }
           Write-Host "EXE:" $exe.FullName
           Write-Host "SETUP:" $setup.FullName
