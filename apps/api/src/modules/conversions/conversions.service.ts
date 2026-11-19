@@ -6,6 +6,7 @@ import {
   normalizeConversionOptions,
   type ConversionListItem,
   type ConversionOptionsV2,
+  type ConversionOptionsV3,
   type Paginated,
   type Preview,
   type ResultOverview,
@@ -138,7 +139,7 @@ export class ConversionsService {
   async createStoredConversion(
     user: AuthenticatedUser,
     source: StoredSource,
-    options: ConversionOptionsV2,
+    options: ConversionOptionsV2 | ConversionOptionsV3,
     meta: { idempotencyKey?: string; documentId?: string } = {},
   ): Promise<CreateConversionResponse> {
     const { storageKey, sha256, sizeBytes, filename, mimeType } = source;
@@ -565,7 +566,10 @@ export class ConversionsService {
   /**
    * Normalises user options, mapping contract errors onto the HTTP envelope.
    */
-  normalizeOptions(rawOptions: unknown, kind: 'pdf' | 'image'): ConversionOptionsV2 {
+  normalizeOptions(
+    rawOptions: unknown,
+    kind: 'pdf' | 'image' | 'spreadsheet',
+  ): ConversionOptionsV2 | ConversionOptionsV3 {
     try {
       return normalizeConversionOptions(rawOptions, { kind, allowLegacy: true });
     } catch (error) {
@@ -584,11 +588,16 @@ export class ConversionsService {
    * inferred from the document kind for conversions created before options
    * were persisted.
    */
-  optionsForRow(row: ConversionWithRelations): ConversionOptionsV2 {
+  optionsForRow(row: ConversionWithRelations): ConversionOptionsV2 | ConversionOptionsV3 {
     const stored = row.optionsJson;
     if (stored) {
       try {
-        return normalizeConversionOptions(JSON.parse(stored), { kind: 'pdf', allowLegacy: false });
+        const parsed = JSON.parse(stored) as Record<string, unknown>;
+        const kind =
+          parsed && typeof parsed === 'object' && Array.isArray((parsed as {spreadsheet?: unknown}).spreadsheet)
+            ? 'spreadsheet'
+            : 'pdf';
+        return normalizeConversionOptions(parsed, { kind, allowLegacy: false, allowStamped: true });
       } catch {
         // fall through to defaults
       }

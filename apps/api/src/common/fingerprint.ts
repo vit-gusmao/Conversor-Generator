@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 
-import { canonicalOptionsJson, type ConversionOptionsV2 } from '@pdf2x/contracts';
+import {
+  canonicalOptionsJson,
+  type ConversionOptionsV2,
+  type NormalizedConversionOptions,
+} from '@pdf2x/contracts';
 
 /** SHA-256 of a buffer, hex-encoded. */
 export function sha256Hex(data: Buffer | string): string {
@@ -16,7 +20,7 @@ export function sha256Hex(data: Buffer | string): string {
  */
 export function requestFingerprint(
   contentSha256: string,
-  options: ConversionOptionsV2,
+  options: NormalizedConversionOptions,
 ): string {
   return sha256Hex(`${contentSha256}\u0000${canonicalOptionsJson(options)}`);
 }

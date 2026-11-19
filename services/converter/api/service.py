@@ -23,7 +23,7 @@ from config import settings
 from exports.base import ExportError, ExportOptions
 from exports.registry import run_export
 from exports.text_plan import plan_from_payload
-from ingestion.registry import probe_input
+from ingestion.registry import probe_input_bytes
 from jobqueue import get_queue
 from models.db import (
     IdempotencyKeyRow,
@@ -56,6 +56,8 @@ def _safe_filename(name: str | None, *, default_ext: str | None = None) -> str:
 
 
 def _extension_for(probe) -> str:
+    if probe.kind == "spreadsheet":
+        return ".csv" if (probe.format or "").upper() == "CSV" else ".xlsx"
     if probe.kind == "pdf":
         return ".pdf"
     fmt = (probe.format or "img").lower()
@@ -151,7 +153,15 @@ def _from_legacy_options(raw: dict[str, Any]) -> dict[str, Any]:
     return nested
 
 
-def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
+def _normalize_options(
+    raw: dict[str, Any] | None,
+    kind: str,
+    *,
+    allow_stamped: bool = False,
+) -> dict[str, Any]:
+    """Normalize options; ``allow_stamped`` re-accepts stored (server-stamped)
+    payloads whose ``spreadsheet.reader_version`` was filled by this server.
+    Client input never carries the stamp — that stays a rejection."""
     raw = dict(raw or {})
 
     for key in _CEILING_KEYS:
@@ -279,7 +289,9 @@ def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
         return normalized
 
     normalized["schema_version"] = 3
-    normalized["spreadsheet"] = _normalize_spreadsheet_options(raw.get("spreadsheet") or {})
+    normalized["spreadsheet"] = _normalize_spreadsheet_options(
+        raw.get("spreadsheet") or {}, allow_stamped=allow_stamped
+    )
     return normalized
 
 
@@ -289,8 +301,14 @@ SPREADSHEET_READER_VERSION = "spreadsheet-reader-v1"
 _ALLOWED_SPREADSHEET = {"sheet_names", "header_row", "csv_encoding", "csv_delimiter", "formula_mode"}
 
 
-def _normalize_spreadsheet_options(section: dict[str, Any]) -> dict[str, Any]:
-    extra = set(section) - _ALLOWED_SPREADSHEET
+def _normalize_spreadsheet_options(
+    section: dict[str, Any], *, allow_stamped: bool = False
+) -> dict[str, Any]:
+    allowed_keys = set(_ALLOWED_SPREADSHEET)
+    if allow_stamped:
+        # Stored payloads carry the server's own stamp; re-canonicalize it.
+        allowed_keys = allowed_keys | {"reader_version"}
+    extra = set(section) - allowed_keys
     if extra:
         raise ApiError(
             400,
@@ -416,9 +434,20 @@ class ConversionService:
                 "FILE_TOO_LARGE",
                 f"O arquivo excede o limite de {settings.max_bytes() // (1024 * 1024)} MiB.",
             )
-        probe = probe_input(data)
+        probe = probe_input_bytes(data, filename)
         if probe.kind == "unknown":
-            raise ApiError(400, "INVALID_FILE", "O arquivo enviado não é um PDF nem uma imagem válida.")
+            raise ApiError(
+                400,
+                "INVALID_FILE",
+                "O arquivo enviado não é um PDF, imagem ou planilha reconhecida.",
+            )
+        if probe.kind == "spreadsheet" and not probe.supported:
+            raise ApiError(
+                400,
+                "INVALID_FILE",
+                probe.reason or "Planilha inválida.",
+                details={"format": probe.format},
+            )
         if probe.kind == "image" and not probe.supported:
             raise ApiError(
                 415,

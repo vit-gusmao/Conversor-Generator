@@ -95,3 +95,43 @@ describe('FileValidationService', () => {
     expect(result.warnings).toContain('page_count_unavailable');
   });
 });
+
+describe('FileValidationService — spreadsheet admission (upgrade T3)', () => {
+  const service = new FileValidationService({ maxBytes: 2048, maxPages: 5 });
+  const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+  it('admits a ZIP-magic payload when the item declares spreadsheet kind', () => {
+    // A minimal ZIP local-header magic; the engine owns the OOXML verdict.
+    const zip = Buffer.concat([
+      Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+      Buffer.alloc(64, 0),
+    ]);
+    const inspection = service.inspectHeader(zip, 'spreadsheet');
+    expect(inspection.kind).toBe('spreadsheet');
+    expect(inspection.spreadsheet_format).toBe('xlsx');
+    expect(inspection.mime_type).toBe(XLSX_MIME);
+  });
+
+  it('admits declared CSV by declaration and leaves dialect to the engine', () => {
+    const csv = Buffer.from('Nome;Valor\nAna;10\n', 'utf8');
+    const inspection = service.inspectHeader(csv, 'spreadsheet');
+    expect(inspection.kind).toBe('spreadsheet');
+    expect(inspection.spreadsheet_format).toBe('csv');
+    expect(inspection.mime_type).toBe('text/csv');
+  });
+
+  it('keeps rejecting a generic ZIP when the kind is not spreadsheet', () => {
+    const zip = Buffer.concat([
+      Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+      Buffer.alloc(16, 0),
+    ]);
+    const inspection = service.inspectHeader(zip, 'pdf');
+    expect(inspection.kind).toBe('unknown');
+  });
+
+  it('keeps rejecting text files without a spreadsheet declaration', () => {
+    const csv = Buffer.from('Nome;Valor\nAna;10\n', 'utf8');
+    expect(service.inspectHeader(csv, 'pdf').kind).toBe('unknown');
+    expect(service.inspectHeader(csv).kind).toBe('unknown');
+  });
+});

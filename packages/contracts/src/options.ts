@@ -237,16 +237,25 @@ const spreadsheetSchema = z
   })
   .strict();
 
-const optionsSchema = z
-  .object({
-    schema_version: z.union([z.literal(2), z.literal(3)]).optional(),
-    target_formats: z.array(z.enum(OUTPUT_FORMATS)).min(1).max(OUTPUT_FORMATS.length).optional(),
-    ocr: ocrSchema.optional(),
-    text: textSchema.optional(),
-    csv: csvSchema.optional(),
-    spreadsheet: spreadsheetSchema.optional(),
-  })
-  .strict();
+/** Stored payloads carry the server stamp; it is re-canonicalized on read. */
+const stampedSpreadsheetSchema = spreadsheetSchema.extend({
+  reader_version: z.string().min(1).max(64),
+});
+
+function buildOptionsSchema(allowStamped: boolean) {
+  return z
+    .object({
+      schema_version: z.union([z.literal(2), z.literal(3)]).optional(),
+      target_formats: z.array(z.enum(OUTPUT_FORMATS)).min(1).max(OUTPUT_FORMATS.length).optional(),
+      ocr: ocrSchema.optional(),
+      text: textSchema.optional(),
+      csv: csvSchema.optional(),
+      spreadsheet: (allowStamped ? stampedSpreadsheetSchema : spreadsheetSchema).optional(),
+    })
+    .strict();
+}
+
+const optionsSchema = buildOptionsSchema(false);
 
 /** Keys that used to cap the document. Their presence is always an error. */
 const CEILING_KEYS = ['max_pages', 'maxPages', 'max_pages_per_document', 'page_limit'] as const;
@@ -331,6 +340,12 @@ export interface NormalizeOptionsInput {
   kind?: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
   /** When false, the presence of unknown keys is an error (default: true). */
   allowLegacy?: boolean;
+  /**
+   * Re-normalization of stored payloads: the server's own
+   * 'spreadsheet.reader_version' stamp is accepted and re-canonicalized.
+   * Client input never carries the stamp — that stays a rejection.
+   */
+  allowStamped?: boolean;
 }
 
 /**
@@ -393,7 +408,7 @@ export function normalizeConversionOptions(
   }
 
   const normalised = allowLegacy ? fromLegacy(input) : (input as Record<string, unknown>);
-  const parsed = optionsSchema.safeParse(normalised);
+  const parsed = buildOptionsSchema(options.allowStamped === true).safeParse(normalised);
 
   if (!parsed.success) {
     throw new ConversionOptionsError('INVALID_OPTION', 'Opções inválidas.', {

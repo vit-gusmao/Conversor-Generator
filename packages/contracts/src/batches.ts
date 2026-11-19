@@ -6,7 +6,7 @@
  * merges documents into a single spreadsheet.
  */
 
-import type { ConversionOptionsV2, OutputFormat } from './options';
+import type { ConversionOptionsV2, NormalizedConversionOptions, OutputFormat } from './options';
 
 /** Lifecycle of the container itself. */
 export const BATCH_STATUSES = [
@@ -111,9 +111,9 @@ export interface BatchItem {
   filename: string;
   size_bytes: number;
   /** Declared kind; the server re-detects the real content before accepting. */
-  kind: 'pdf' | 'image' | 'unknown';
+  kind: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
   status: BatchItemStatus;
-  options: ConversionOptionsV2;
+  options: NormalizedConversionOptions;
   available_formats: OutputFormat[];
   upload_id: string | null;
   conversion_id: string | null;

@@ -109,6 +109,10 @@ def declared_kind(filename: str) -> str:
         return "pdf"
     if suffix in _IMAGE_SUFFIXES:
         return "image"
+    if suffix in {"xlsx", "csv"}:
+        # Declared spreadsheet: real content validation happens at admission
+        # (XLSX by OOXML markers; CSV by parsed dialect/encoding).
+        return "spreadsheet"
     return "unknown"
 
 

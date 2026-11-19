@@ -22,7 +22,8 @@ export interface UploadFileMeta {
 export interface FileInspection {
   ok: boolean;
   is_pdf: boolean;
-  kind?: 'pdf' | 'image' | 'unknown';
+  kind?: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
+  spreadsheet_format?: 'xlsx' | 'csv' | null;
   image_format?: string | null;
   mime_type?: string;
   pdf_version: string | null;
@@ -249,10 +250,19 @@ export class FileValidationService {
    * buffers it: only the first kilobyte decides PDF vs image. The engine
    * re-validates the whole file and owns the authoritative page count.
    */
-  inspectHeader(head: Buffer): {
-    kind: 'pdf' | 'image' | 'unknown';
+  /**
+   * Header-only detection. `declaredKind` admits spreadsheet items: XLSX is
+   * ZIP magic here (OOXML markers live in the central directory, checked by
+   * the engine) and CSV is declared text — the engine validates both fully.
+   */
+  inspectHeader(
+    head: Buffer,
+    declaredKind?: string | null,
+  ): {
+    kind: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
     is_pdf: boolean;
     image_format: string | null;
+    spreadsheet_format: 'xlsx' | 'csv' | null;
     mime_type: string | null;
     pdf_version: string | null;
   } {
@@ -264,18 +274,50 @@ export class FileValidationService {
         kind: 'pdf',
         is_pdf: true,
         image_format: null,
+        spreadsheet_format: null,
         mime_type: 'application/pdf',
         pdf_version: match ? match[1] : null,
       };
     }
+    const isZip = head.subarray(0, 4).toString('latin1') === 'PK\x03\x04';
+    if (isZip && declaredKind === 'spreadsheet') {
+      return {
+        kind: 'spreadsheet',
+        is_pdf: false,
+        image_format: null,
+        spreadsheet_format: 'xlsx',
+        mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        pdf_version: null,
+      };
+    }
+    if (declaredKind === 'spreadsheet') {
+      // CSV candidate: decodable text without pdf/image/zip magic. The engine
+      // enforces dialect/encoding (CSV_ENCODING_REQUIRED / CSV_DIALECT_REQUIRED).
+      return {
+        kind: 'spreadsheet',
+        is_pdf: false,
+        image_format: null,
+        spreadsheet_format: 'csv',
+        mime_type: 'text/csv',
+        pdf_version: null,
+      };
+    }
     const imageFormat = detectImageFormat(head);
     if (!imageFormat) {
-      return { kind: 'unknown', is_pdf: false, image_format: null, mime_type: null, pdf_version: null };
+      return {
+        kind: 'unknown',
+        is_pdf: false,
+        image_format: null,
+        spreadsheet_format: null,
+        mime_type: null,
+        pdf_version: null,
+      };
     }
     return {
       kind: 'image',
       is_pdf: false,
       image_format: imageFormat,
+      spreadsheet_format: null,
       mime_type: mimeForImageFormat(imageFormat),
       pdf_version: null,
     };

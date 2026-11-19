@@ -409,9 +409,11 @@ export class UploadsService {
     }
 
     // Content detection from the header only: a `.pdf` name never decides.
+    // Declared spreadsheet items (xlsx/csv) are admitted by declaration here
+    // and fully validated by the engine (OOXML markers / parsed dialect).
     const headStream = await this.storage.openRead(stagingKey);
     const head = await readHead(headStream, 1024);
-    const inspection = this.validation.inspectHeader(head);
+    const inspection = this.validation.inspectHeader(head, item.kind);
     if (inspection.kind === 'unknown') {
       await this.storage.delete(stagingKey).catch(() => undefined);
       throw ApiError.badRequest(ERROR_CODES.INVALID_FILE, { reason: 'invalid_magic_bytes' });
@@ -423,7 +425,11 @@ export class UploadsService {
     const extension =
       inspection.kind === 'pdf'
         ? 'pdf'
-        : (EXTENSION_FOR_IMAGE[inspection.image_format ?? ''] ?? 'img');
+        : inspection.kind === 'spreadsheet'
+          ? (inspection.spreadsheet_format ?? 'xlsx') === 'csv'
+            ? 'csv'
+            : 'xlsx'
+          : (EXTENSION_FOR_IMAGE[inspection.image_format ?? ''] ?? 'img');
     const finalKey = storageKeyForSha256(expected, extension, user.id);
     if (await this.storage.exists(finalKey)) {
       await this.storage.delete(stagingKey).catch(() => undefined);
@@ -432,8 +438,14 @@ export class UploadsService {
     }
 
     const options = normalizeConversionOptions(JSON.parse(item.optionsJson) as unknown, {
-      kind: inspection.kind === 'image' ? 'image' : 'pdf',
+      kind:
+        inspection.kind === 'image'
+          ? 'image'
+          : inspection.kind === 'spreadsheet'
+            ? 'spreadsheet'
+            : 'pdf',
       allowLegacy: false,
+      allowStamped: true,
     });
 
     const accepted = await this.conversions.createStoredConversion(

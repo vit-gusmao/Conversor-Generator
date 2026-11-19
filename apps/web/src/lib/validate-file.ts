@@ -8,7 +8,7 @@ export interface FileValidationResult {
   ok: boolean;
   code: FileValidationCode | null;
   message: string | null;
-  kind?: 'pdf' | 'image' | null;
+  kind?: 'pdf' | 'image' | 'spreadsheet' | null;
   format?: string | null;
 }
 
@@ -40,11 +40,17 @@ export const IMAGE_EXTENSIONS = [
   'heif',
 ] as const;
 
+export const SPREADSHEET_EXTENSIONS = ['xlsx', 'csv'] as const;
+
 export const ACCEPTED_DOCUMENT_ACCEPT = [
   'application/pdf',
   '.pdf',
   ...IMAGE_EXTENSIONS.map((extension) => `.${extension}`),
   'image/*',
+  '.xlsx',
+  '.csv',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'text/csv',
 ].join(',');
 
 function extensionOf(name: string): string {
@@ -84,11 +90,12 @@ export function validateDocumentFile(
   const extension = extensionOf(file.name);
   const isPdf = extension === 'pdf';
   const imageFormat = isPdf ? null : imageFormatFor(extension);
-  if (!isPdf && !imageFormat) {
+  const isSpreadsheet = !isPdf && imageFormat === null && (SPREADSHEET_EXTENSIONS as readonly string[]).includes(extension);
+  if (!isPdf && !imageFormat && !isSpreadsheet) {
     return {
       ok: false,
       code: 'UNSUPPORTED',
-      message: 'Selecione um PDF ou uma imagem (PNG, JPEG, TIFF, GIF, BMP, WebP…).',
+      message: 'Selecione um PDF, uma imagem (PNG, JPEG, TIFF, GIF, BMP, WebP…) ou uma planilha (.xlsx/.csv).',
     };
   }
 
@@ -100,7 +107,14 @@ export function validateDocumentFile(
       message: 'O arquivo selecionado não é um PDF válido.',
     };
   }
-  if (!isPdf && type && !type.startsWith('image/') && type !== 'application/octet-stream') {
+  if (isSpreadsheet && type && !['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv', 'application/csv', 'text/plain', 'application/octet-stream', ''].includes(type)) {
+    return {
+      ok: false,
+      code: 'MIME',
+      message: 'O arquivo selecionado não parece ser uma planilha.',
+    };
+  }
+  if (!isPdf && !isSpreadsheet && type && !type.startsWith('image/') && type !== 'application/octet-stream') {
     return {
       ok: false,
       code: 'MIME',
@@ -116,7 +130,14 @@ export function validateDocumentFile(
     };
   }
 
-  return { ok: true, code: null, message: null, kind: isPdf ? 'pdf' : 'image', format: imageFormat };
+  const kind = isPdf ? 'pdf' : isSpreadsheet ? 'spreadsheet' : 'image';
+  return {
+    ok: true,
+    code: null,
+    message: null,
+    kind,
+    format: imageFormat ?? (isSpreadsheet ? extension.toUpperCase() : null),
+  };
 }
 
 /** Backwards-compatible PDF-only gate used by older screens/tests. */

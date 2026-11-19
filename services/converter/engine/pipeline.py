@@ -146,6 +146,9 @@ class PipelineOptions:
     csv_table_ids: list[str] | None = None
     csv_formula_policy: str = "safe"
     csv_value_mode: str = "original"
+    #: Normalized v3 ``spreadsheet`` section (sheet selection, CSV dialect,
+    #: formula policy). Only the spreadsheet pipeline consumes it.
+    spreadsheet: dict | None = None
 
 
 @dataclass(slots=True)

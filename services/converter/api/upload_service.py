@@ -19,7 +19,7 @@ from api.batch_service import TERMINAL_ITEM_STATUSES, emit_event, now
 from api.deps import ApiError
 from api.service import ConversionService, _normalize_options, _safe_filename
 from config import settings
-from ingestion.registry import probe_input
+from ingestion.registry import probe_input_path
 from models.db import (
     PublicBatchItemRow,
     PublicBatchRow,
@@ -51,6 +51,8 @@ def expected_parts(expected_bytes: int, part_size: int) -> int:
 
 
 def _extension_for_probe(probe) -> str:
+    if probe.kind == "spreadsheet":
+        return ".csv" if (probe.format or "").upper() == "CSV" else ".xlsx"
     if probe.kind != "image":
         return ".pdf"
     fmt = (probe.format or "img").lower()
@@ -383,16 +385,19 @@ class UploadService:
                 )
 
             # Detect the real content: a `.pdf` extension never decides the kind.
-            with storage.open_read(staged_key) as probe_stream:
-                head = probe_stream.read(1024)
-            probe = probe_input(head)
+            # The path probe reads the whole file so XLSX (ZIP directory at the
+            # end) and CSV (declared suffix + validated dialect) are recognized.
+            probe = probe_input_path(storage.local_path(staged_key), filename=item.filename)
             if probe.kind == "unknown":
                 storage.delete(staged_key)
                 raise ApiError(
                     400,
                     "INVALID_FILE",
-                    "O arquivo enviado não é um PDF nem uma imagem válida.",
+                    "O arquivo enviado não é um PDF, imagem ou planilha válida.",
                 )
+            if probe.kind == "spreadsheet" and not probe.supported:
+                storage.delete(staged_key)
+                raise ApiError(400, probe.reason_code or "INVALID_FILE", probe.reason or "Planilha inválida.")
             if probe.kind == "image" and not probe.supported:
                 storage.delete(staged_key)
                 raise ApiError(
@@ -402,7 +407,7 @@ class UploadService:
                     details={"format": probe.format},
                 )
 
-            normalized = _normalize_options(item.options_json or {}, probe.kind)
+            normalized = _normalize_options(item.options_json or {}, probe.kind, allow_stamped=True)
             filename = _safe_filename(item.filename, default_ext=probe.format)
             extension = _extension_for_probe(probe)
             final_key = f"documents/{owner_id}/{expected_sha}{extension}"

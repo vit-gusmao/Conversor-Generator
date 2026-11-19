@@ -12,6 +12,7 @@ import {
   type BatchStatus,
   type BatchSummary,
   type ConversionOptionsV2,
+  type ConversionOptionsV3,
   type CursorPage,
 } from '@pdf2x/contracts';
 import type { Prisma } from '@prisma/client';
@@ -96,12 +97,17 @@ interface BatchItemRow {
   conversion?: { status: string } | null;
 }
 
-function declaredKind(filename: string): 'pdf' | 'image' | 'unknown' {
+function declaredKind(filename: string): 'pdf' | 'image' | 'spreadsheet' | 'unknown' {
   const index = filename.lastIndexOf('.');
   if (index < 0) return 'unknown';
   const suffix = filename.slice(index + 1).toLowerCase();
   if (suffix === 'pdf') return 'pdf';
   if (IMAGE_EXTENSIONS.has(suffix)) return 'image';
+  if (suffix === 'xlsx' || suffix === 'csv') {
+    // Declared spreadsheet: content validation is the engine's authority
+    // (OOXML markers for XLSX, parsed dialect/encoding for CSV).
+    return 'spreadsheet';
+  }
   return 'unknown';
 }
 
@@ -563,7 +569,10 @@ export class BatchesService {
   itemPayload(row: BatchItemRow): BatchItem {
     const options = this.optionsOf(row);
     const status = effectiveStatus(row);
-    const kind = row.kind === 'pdf' || row.kind === 'image' ? row.kind : 'unknown';
+    const kind =
+      row.kind === 'pdf' || row.kind === 'image' || row.kind === 'spreadsheet'
+        ? row.kind
+        : 'unknown';
     return {
       item_id: row.id,
       batch_id: row.batchId,
@@ -592,24 +601,29 @@ export class BatchesService {
     };
   }
 
-  private optionsOf(row: BatchItemRow): ConversionOptionsV2 {
-    const parsed = parseJson<ConversionOptionsV2>(row.optionsJson);
+  private optionsOf(row: BatchItemRow): ConversionOptionsV2 | ConversionOptionsV3 {
+    const parsed = parseJson<ConversionOptionsV2 | ConversionOptionsV3>(row.optionsJson);
     if (parsed) {
       try {
+        // Stored payloads carry the server stamp; re-canonicalize it.
         return normalizeConversionOptions(parsed, {
-          kind: row.kind === 'image' ? 'image' : 'pdf',
+          kind: row.kind === 'image' ? 'image' : row.kind === 'spreadsheet' ? 'spreadsheet' : 'pdf',
           allowLegacy: false,
+          allowStamped: true,
         });
       } catch {
         // fall through to the defaults
       }
     }
     return normalizeConversionOptions(undefined, {
-      kind: row.kind === 'image' ? 'image' : 'pdf',
+      kind: row.kind === 'image' ? 'image' : row.kind === 'spreadsheet' ? 'spreadsheet' : 'pdf',
     });
   }
 
-  private normalizeOptions(raw: unknown, kind: 'pdf' | 'image'): ConversionOptionsV2 {
+  private normalizeOptions(
+    raw: unknown,
+    kind: 'pdf' | 'image' | 'spreadsheet',
+  ): ConversionOptionsV2 | ConversionOptionsV3 {
     return this.conversions.normalizeOptions(raw, kind);
   }
 
@@ -850,7 +864,7 @@ export class BatchesService {
   }
 
   private itemFingerprint(
-    options: ConversionOptionsV2,
+    options: ConversionOptionsV2 | ConversionOptionsV3,
     filename: string,
     sizeBytes: number,
   ): string {

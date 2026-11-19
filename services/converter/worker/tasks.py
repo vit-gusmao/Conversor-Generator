@@ -15,7 +15,7 @@ from audit.events import EVT_RUN_CANCELLED, AuditRecorder
 from config import settings
 from engine.pipeline import ConversionError, ConversionPipeline, PipelineOptions
 from engine.streaming.source import DocumentSource, head_bytes, sha256_file
-from ingestion.registry import InputProbe, probe_input
+from ingestion.registry import InputProbe, probe_input_path
 from repositories.conversion_repository import ConversionRepository, RunCancelled
 from storage import get_storage
 from version import ENGINE_VERSION
@@ -96,7 +96,7 @@ def execute_run(
     # Content-based detection, never the file name: a PNG named `.pdf` is an
     # image, and unknown bytes fail before any pipeline starts. Only the head
     # of the file is read here.
-    probe = probe_input(head_bytes(pdf_path, 1024))
+    probe = probe_input_path(pdf_path, filename=filename)
     if probe.kind == "unknown":
         repo.finish_run(
             run_id,
@@ -125,7 +125,19 @@ def execute_run(
     try:
         pipeline_options = _options_from(options, probe)
         pipeline_options.source_name = filename
-        if probe.kind == "image":
+        if probe.kind == "spreadsheet":
+            from ingestion.spreadsheet_pipeline import SpreadsheetConversionPipeline
+
+            pipeline = SpreadsheetConversionPipeline(
+                spreadsheet_path=pdf_path,
+                run_id=run_id,
+                conversion_id=conversion_id,
+                recorder=recorder,
+                sink=repo.progress_sink(run_id),
+                options=pipeline_options,
+                cancel_check=cancel_check,
+            )
+        elif probe.kind == "image":
             from ingestion.image_pipeline import ImageConversionPipeline
 
             pipeline = ImageConversionPipeline(
@@ -227,6 +239,11 @@ def _options_from(raw: dict[str, Any] | None, probe: InputProbe | None = None) -
         # by the API, and the worker does not silently produce a fake XLSX.
         target = [item for item in target if item == "txt"] or ["txt"]
 
+    spreadsheet_section = raw.get("spreadsheet")
+    spreadsheet_section = (
+        spreadsheet_section if isinstance(spreadsheet_section, dict) else None
+    )
+
     ocr = raw.get("ocr")
     if isinstance(ocr, dict):
         ocr_enabled = bool(ocr.get("enabled", settings.converter_ocr_enabled))
@@ -255,10 +272,13 @@ def _options_from(raw: dict[str, Any] | None, probe: InputProbe | None = None) -
             csv_options.get("formula_policy") or raw.get("csv_formula_policy") or "safe"
         ),
         csv_value_mode=str(csv_options.get("value_mode") or raw.get("csv_value_mode") or "original"),
+        spreadsheet=spreadsheet_section,
     )
 
 
 def _suffix_for(probe: InputProbe) -> str:
+    if probe.kind == "spreadsheet":
+        return ".csv" if (probe.format or "").upper() == "CSV" else ".xlsx"
     if probe.kind == "image":
         fmt = (probe.format or "img").lower()
         return {
