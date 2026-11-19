@@ -43,6 +43,16 @@ def capabilities_payload() -> dict[str, Any]:
             "model": settings.assistant_model,
             "local": settings.assistant_host in {"127.0.0.1", "localhost", "::1"},
         },
+        # Effective flags, not just the env var's existence.
+        "features": {
+            "source_imports": bool(getattr(settings, "source_imports_enabled", True)),
+            "spreadsheet_input": bool(getattr(settings, "spreadsheet_input_enabled", True)),
+            "automation_executor": bool(
+                getattr(settings, "automation_executor_enabled", False)
+            ),
+            "desktop_host": bool(getattr(settings, "desktop_host_enabled", False)),
+            "runtime_mode": settings.runtime_mode,
+        },
     }
 
 

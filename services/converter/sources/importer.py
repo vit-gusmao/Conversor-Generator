@@ -133,6 +133,61 @@ class ImportService:
         finally:
             session.close()
 
+    def start_from_snapshot(
+        self,
+        *,
+        owner_id: str,
+        definition: SourceDefinitionSnapshot,
+        request: dict[str, Any],
+        idempotency_key: str,
+        schedule_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Occurrence path: the frozen definition is the authority.
+
+        The executor never re-reads mutable source rows to decide which files
+        an older occurrence processes. The root grant is still checked before
+        any file is opened (revocation wins over the snapshot).
+        """
+        session = get_session_factory()()
+        try:
+            root = self.repository.get_root(
+                session, root_id=definition.root_id, owner_id=owner_id
+            )
+            if root is None or root.revoked_at is not None:
+                raise ApiError(409, "ROOT_REVOKED", "A concessão da raiz foi revogada.")
+
+            options = self._normalize(request.get("options") or {}, "spreadsheet")
+            payload = {
+                "options": options,
+                "force": bool(request.get("force")),
+                "collection_id": request.get("collection_id"),
+            }
+            request_hash = canonical_request_hash(payload)
+            record = self.repository.record_import(
+                session,
+                owner_id=owner_id,
+                source_id=definition.source_id,
+                source_version=definition.version,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                definition=definition.to_json(),
+                options=options,
+                force=bool(request.get("force")),
+                collection_id=request.get("collection_id"),
+                schedule_run_id=schedule_run_id,
+            )
+            if record.request_hash != request_hash:
+                raise ApiError(
+                    409,
+                    "IDEMPOTENCY_KEY_REUSED",
+                    "A mesma chave foi usada com outro corpo.",
+                    details={"import_id": record.id},
+                )
+            session.commit()
+            return self.import_payload(record, replayed=True)
+        finally:
+            session.close()
+
     def run(self, import_id: str, owner_id: str) -> dict[str, Any]:
         """Execute (or resume) an import to a terminal state."""
         with _lock_for(owner_id):
@@ -257,6 +312,16 @@ class ImportService:
         from api.service import _normalize_options
 
         self._assert_not_cancelled(import_id, owner_id)
+        # Revocation wins over the frozen snapshot: no reads without a grant.
+        check = get_session_factory()()
+        try:
+            root = self.repository.get_root(
+                check, root_id=definition.root_id, owner_id=owner_id
+            )
+            if root is None or root.revoked_at is not None:
+                raise ApiError(409, "ROOT_REVOKED", "A concessão da raiz foi revogada.")
+        finally:
+            check.close()
         staging_dir = self._staging_dir()
 
         captured: list[tuple[Any, Any]] = []

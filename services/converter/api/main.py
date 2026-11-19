@@ -55,7 +55,26 @@ async def lifespan(app: FastAPI):
         logger.info("converter ready: queue=%s storage=%s ocr=%s", queue.name, settings.storage_backend, settings.converter_ocr_enabled)
     except Exception:  # noqa: BLE001
         logger.exception("queue initialisation failed")
+
+    # Calendar/executor loop: standalone/local desktop runtime only. The full
+    # deployment runs `python -m automation.cli` as its own service instead.
+    automation_loop = None
+    if getattr(settings, "automation_executor_enabled", False) and settings.runtime_mode == "standalone":
+        try:
+            from automation.loop import AutomationLoop
+
+            automation_loop = AutomationLoop(poll_seconds=settings.automation_poll_seconds)
+            automation_loop.start()
+            logger.info("automation executor enabled (poll=%ss)", settings.automation_poll_seconds)
+        except Exception:  # noqa: BLE001
+            logger.exception("automation loop failed to start")
+
     yield
+    if automation_loop is not None:
+        try:
+            automation_loop.stop()
+        except Exception:  # noqa: BLE001
+            pass
     try:
         from jobqueue import get_queue
 
@@ -137,11 +156,15 @@ def create_app() -> FastAPI:
     app.include_router(batch_router)
     app.include_router(upload_router)
     app.include_router(knowledge_router)
+    from api.schedule_routes import internal_router as schedule_internal_router
+    from api.schedule_routes import router as schedule_router
     from api.source_routes import internal_router as source_internal_router
     from api.source_routes import router as source_router
 
     app.include_router(source_router)
     app.include_router(source_internal_router)
+    app.include_router(schedule_router)
+    app.include_router(schedule_internal_router)
     app.include_router(internal_router)
 
     @app.get("/health", tags=["system"], include_in_schema=False)

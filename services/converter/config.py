@@ -117,6 +117,23 @@ class Settings(BaseSettings):
     )
 
     # -- assistant (local Qwen3.5-4B via Ollama) --------------------------
+    # --- Upgrade feature flags (published through /capabilities) ------------
+    # Enabling/disabling never deletes definitions or history; disabled
+    # features reject new work and explain the state.
+    source_imports_enabled: bool = Field(default=True, alias="SOURCE_IMPORTS_ENABLED")
+    spreadsheet_input_enabled: bool = Field(default=True, alias="SPREADSHEET_INPUT_ENABLED")
+    automation_executor_enabled: bool = Field(
+        default=False, alias="AUTOMATION_EXECUTOR_ENABLED"
+    )
+    desktop_host_enabled: bool = Field(default=False, alias="DESKTOP_HOST_ENABLED")
+    automation_poll_seconds: float = Field(default=5.0, alias="AUTOMATION_POLL_SECONDS")
+    automation_history_retention_days: int = Field(
+        default=90, alias="AUTOMATION_HISTORY_RETENTION_DAYS"
+    )
+    automation_failure_retention_days: int = Field(
+        default=7, alias="AUTOMATION_FAILURE_RETENTION_DAYS"
+    )
+
     assistant_enabled: bool = Field(default=False, alias="ASSISTANT_ENABLED")
     assistant_provider: str = Field(default="ollama", alias="ASSISTANT_PROVIDER")
     assistant_host: str = Field(default="127.0.0.1", alias="ASSISTANT_HOST")
