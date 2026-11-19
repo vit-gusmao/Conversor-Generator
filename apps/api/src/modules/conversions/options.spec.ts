@@ -126,3 +126,119 @@ describe('normalizeConversionOptions', () => {
     expect(producesSpreadsheet(defaultConversionOptions('image'))).toBe(false);
   });
 });
+
+/* ------------------------------------------------------------------------- */
+/* Upgrade plan (T1): shared fixtures with the Python engine                  */
+/* ------------------------------------------------------------------------- */
+
+import upgradeContracts from '../../../../../packages/contracts/fixtures/upgrade-contracts.json';
+import upgradeSources from '../../../../../packages/contracts/fixtures/upgrade-sources.json';
+import { ContractError, parseScheduleCreate, parseSourceCreate } from '@pdf2x/contracts';
+import type { ConversionOptionsV3 } from '@pdf2x/contracts';
+
+type OptionsCase = {
+  id: string;
+  kind: 'pdf' | 'image' | 'spreadsheet';
+  input: Record<string, unknown>;
+  expected?: Record<string, unknown>;
+  expected_error?: { ts: string; py: string };
+};
+
+describe('upgrade-contracts fixtures (parity with Python)', () => {
+  const cases = upgradeContracts.cases as OptionsCase[];
+
+  it.each(cases.map((c) => [c.id, c]))('%s', (_id, fixture) => {
+    if (fixture.expected_error) {
+      expect(() => normalizeConversionOptions(fixture.input, { kind: fixture.kind })).toThrow(
+        ConversionOptionsError,
+      );
+      try {
+        normalizeConversionOptions(fixture.input, { kind: fixture.kind });
+      } catch (error) {
+        expect((error as ConversionOptionsError).code).toBe(fixture.expected_error.ts);
+      }
+      return;
+    }
+    const normalized = normalizeConversionOptions(fixture.input, {
+      kind: fixture.kind,
+    }) as unknown as Record<string, unknown>;
+    expect(normalized).toEqual(fixture.expected);
+  });
+
+  it('keeps the v2 canonical hash byte-identical', () => {
+    const v2 = normalizeConversionOptions(
+      {
+        schema_version: 2,
+        target_formats: ['xlsx'],
+        ocr: { enabled: false },
+        text: { newline: 'crlf' },
+        csv: { profile: 'excel_br' },
+      },
+      { kind: 'pdf' },
+    );
+    expect(v2.schema_version).toBe(2);
+    expect('spreadsheet' in v2).toBe(false);
+  });
+
+  it('stamps the reader version into v3 for fingerprints', () => {
+    const v3 = normalizeConversionOptions({ schema_version: 3 }, {
+      kind: 'spreadsheet',
+    }) as ConversionOptionsV3;
+    expect(v3.spreadsheet.reader_version).toBe('spreadsheet-reader-v1');
+    expect(v3.spreadsheet.formula_mode).toBe('cached_or_text');
+  });
+});
+
+type SourceCase = {
+  id: string;
+  kind: 'source_create' | 'schedule_create';
+  input: Record<string, unknown>;
+  expected?: Record<string, unknown>;
+  expected_error?: { ts: string; py: string };
+};
+
+describe('upgrade-sources fixtures (parity with Python)', () => {
+  const cases = upgradeSources.cases as SourceCase[];
+
+  it.each(cases.map((c) => [c.id, c]))('%s', (_id, fixture) => {
+    if (fixture.kind === 'source_create') {
+      if (fixture.expected_error) {
+        try {
+          parseSourceCreate(fixture.input);
+          fail('expected a ContractError');
+        } catch (error) {
+          expect(error).toBeInstanceOf(ContractError);
+          expect((error as ContractError).code).toBe(fixture.expected_error.ts);
+        }
+        return;
+      }
+      const parsed = parseSourceCreate(fixture.input);
+      for (const [key, value] of Object.entries(fixture.expected ?? {})) {
+        expect((parsed as unknown as Record<string, unknown>)[key]).toEqual(value);
+      }
+      expect('owner_id' in parsed).toBe(false);
+      return;
+    }
+
+    if (fixture.expected_error) {
+      try {
+        parseScheduleCreate(fixture.input);
+        fail('expected a ContractError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(ContractError);
+        expect((error as ContractError).code).toBe(fixture.expected_error.ts);
+      }
+      return;
+    }
+    const parsed = parseScheduleCreate(fixture.input);
+    for (const [key, value] of Object.entries(fixture.expected ?? {})) {
+      const actual = (parsed as unknown as Record<string, unknown>)[key];
+      if (typeof actual === 'object' && actual !== null) {
+        expect(actual).toEqual(value);
+      } else {
+        expect(actual).toEqual(value);
+      }
+    }
+    expect('owner_id' in parsed).toBe(false);
+  });
+});

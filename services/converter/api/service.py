@@ -144,6 +144,10 @@ def _from_legacy_options(raw: dict[str, Any]) -> dict[str, Any]:
     if csv:
         nested["csv"] = csv
 
+    # v3 section travels through the legacy rewrite untouched.
+    if isinstance(raw.get("spreadsheet"), dict):
+        nested["spreadsheet"] = raw["spreadsheet"]
+
     return nested
 
 
@@ -160,9 +164,23 @@ def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
                 details={"option": key},
             )
 
+    declared_version = raw.get("schema_version")
+    if declared_version is not None and declared_version not in (2, 3):
+        raise ApiError(
+            400,
+            "INVALID_OPTION",
+            "schema_version aceita 2 (legado) ou 3 (entrada de planilha).",
+            details={"schema_version": declared_version},
+        )
+
+    # v3 is opt-in by content: a spreadsheet input or an explicit spreadsheet
+    # section upgrades the payload; anything else keeps the legacy v2 shape
+    # byte-for-byte so existing fingerprints stay stable.
+    is_v3 = kind == "spreadsheet" or isinstance(raw.get("spreadsheet"), dict)
+
     unknown = (
         set(raw)
-        - {"schema_version", "target_formats", "ocr", "text", "csv"}
+        - {"schema_version", "target_formats", "ocr", "text", "csv", "spreadsheet"}
         - _LEGACY_KEYS
         - set(_CEILING_KEYS)
     )
@@ -172,7 +190,7 @@ def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
             "INVALID_OPTION",
             f"Opções desconhecidas: {sorted(unknown)}.",
             details={
-                "allowed": ["schema_version", "target_formats", "ocr", "text", "csv"],
+                "allowed": ["schema_version", "target_formats", "ocr", "text", "csv", "spreadsheet"],
             },
         )
 
@@ -234,7 +252,7 @@ def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
     if csv.get("value_mode") not in {None, "original", "canonical"}:
         raise ApiError(400, "INVALID_OPTION", "csv.value_mode deve ser 'original' ou 'canonical'.")
 
-    return {
+    normalized = {
         "schema_version": 2,
         "target_formats": target,
         "ocr": {
@@ -255,6 +273,100 @@ def _normalize_options(raw: dict[str, Any] | None, kind: str) -> dict[str, Any]:
             "table_ids": csv.get("table_ids"),
             "value_mode": csv.get("value_mode") or "original",
         },
+    }
+
+    if not is_v3:
+        return normalized
+
+    normalized["schema_version"] = 3
+    normalized["spreadsheet"] = _normalize_spreadsheet_options(raw.get("spreadsheet") or {})
+    return normalized
+
+
+# `reader_version` is stamped by the server, never accepted from the client:
+# it must reflect the engine that actually reads the file, not a client claim.
+SPREADSHEET_READER_VERSION = "spreadsheet-reader-v1"
+_ALLOWED_SPREADSHEET = {"sheet_names", "header_row", "csv_encoding", "csv_delimiter", "formula_mode"}
+
+
+def _normalize_spreadsheet_options(section: dict[str, Any]) -> dict[str, Any]:
+    extra = set(section) - _ALLOWED_SPREADSHEET
+    if extra:
+        raise ApiError(
+            400,
+            "INVALID_OPTION",
+            f"Opções desconhecidas em spreadsheet: {sorted(extra)}.",
+            details={"allowed": sorted(_ALLOWED_SPREADSHEET)},
+        )
+
+    sheet_names = section.get("sheet_names")
+    if sheet_names is not None:
+        if (
+            not isinstance(sheet_names, list)
+            or not sheet_names
+            or len(sheet_names) > 1024
+            or any(not isinstance(name, str) or not name or len(name) > 255 for name in sheet_names)
+        ):
+            raise ApiError(
+                400,
+                "INVALID_OPTION",
+                "spreadsheet.sheet_names deve ser uma lista de 1 a 1024 nomes de abas.",
+                details={"sheet_names": sheet_names},
+            )
+        sheet_names = list(sheet_names)
+
+    header_row = section.get("header_row")
+    if header_row is not None and not isinstance(header_row, bool):
+        raise ApiError(400, "INVALID_OPTION", "spreadsheet.header_row deve ser booleano ou nulo.")
+
+    csv_encoding = section.get("csv_encoding")
+    if csv_encoding is not None:
+        if not isinstance(csv_encoding, str) or not (2 <= len(csv_encoding) <= 40):
+            raise ApiError(
+                400,
+                "INVALID_OPTION",
+                "spreadsheet.csv_encoding deve ser um nome de encoding (2–40 caracteres).",
+                details={"csv_encoding": csv_encoding},
+            )
+        try:
+            import codecs
+
+            codecs.lookup(csv_encoding)
+        except LookupError as exc:
+            raise ApiError(
+                400,
+                "INVALID_OPTION",
+                f"Encoding desconhecido: {csv_encoding}.",
+                details={"csv_encoding": csv_encoding},
+            ) from exc
+
+    csv_delimiter = section.get("csv_delimiter")
+    if csv_delimiter is not None:
+        if not isinstance(csv_delimiter, str) or len(csv_delimiter) != 1 or ord(csv_delimiter) > 127:
+            raise ApiError(
+                400,
+                "INVALID_OPTION",
+                "spreadsheet.csv_delimiter deve ser um único caractere ASCII.",
+                details={"csv_delimiter": csv_delimiter},
+            )
+
+    formula_mode = section.get("formula_mode") or "cached_or_text"
+    if formula_mode != "cached_or_text":
+        raise ApiError(
+            400,
+            "INVALID_OPTION",
+            "spreadsheet.formula_mode aceita apenas 'cached_or_text': fórmulas nunca são "
+            "recalculadas; sem cache em Texto, viram texto com aviso.",
+            details={"formula_mode": formula_mode},
+        )
+
+    return {
+        "sheet_names": sheet_names,
+        "header_row": header_row,
+        "csv_encoding": csv_encoding,
+        "csv_delimiter": csv_delimiter,
+        "formula_mode": formula_mode,
+        "reader_version": SPREADSHEET_READER_VERSION,
     }
 
 

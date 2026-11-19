@@ -65,11 +65,50 @@ export interface ConversionOptionsV2 {
   csv: CsvOptionsV2;
 }
 
+/* ------------------------------------------------------------------------- */
+/* v3: spreadsheet inputs (upgrade plan T1)                                   */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Reader stamped by the server into every normalized v3 payload. Clients
+ * cannot send it — it must reflect the engine that actually reads the file,
+ * and it participates in the idempotency fingerprint.
+ */
+export const SPREADSHEET_READER_VERSION = 'spreadsheet-reader-v1';
+
+/** Fixed in this contract version: formulas are never recalculated. */
+export const SPREADSHEET_FORMULA_MODES = ['cached_or_text'] as const;
+export type SpreadsheetFormulaMode = (typeof SPREADSHEET_FORMULA_MODES)[number];
+
+export interface SpreadsheetOptionsV3 {
+  /** Explicit sheet selection; `null` reads every sheet (hidden included, with a warning). */
+  sheet_names: string[] | null;
+  /** `true` first row is data header, `false` technical headers, `null` lets the reader record its decision. */
+  header_row: boolean | null;
+  /** Explicit CSV encoding; `null` means UTF-8/BOM with no silent substitution. */
+  csv_encoding: string | null;
+  /** Explicit single-character CSV delimiter; `null` allows controlled detection. */
+  csv_delimiter: string | null;
+  formula_mode: SpreadsheetFormulaMode;
+  /** Server-stamped reader version; part of the options fingerprint. */
+  reader_version: string;
+}
+
+export interface ConversionOptionsV3 extends Omit<ConversionOptionsV2, 'schema_version'> {
+  schema_version: 3;
+  spreadsheet: SpreadsheetOptionsV3;
+}
+
+/** What the normalizer returns: legacy v2 or spreadsheet-aware v3. */
+export type NormalizedConversionOptions = ConversionOptionsV2 | ConversionOptionsV3;
+
 /** Error codes surfaced to the HTTP envelope. */
 export type OptionsErrorCode =
   | 'INVALID_OPTION'
   | 'UNSUPPORTED_TARGET_FORMAT'
-  | 'INCOMPATIBLE_OUTPUT_FORMAT';
+  | 'INCOMPATIBLE_OUTPUT_FORMAT'
+  | 'UNSUPPORTED_TARGET'
+  | 'UNSUPPORTED_FORMAT';
 
 export class ConversionOptionsError extends Error {
   readonly code: OptionsErrorCode;
@@ -107,17 +146,42 @@ const DEFAULT_CSV: CsvOptionsV2 = {
 /**
  * Defaults when nothing is sent. `kind === 'image'` yields TXT only, because
  * the conversion matrix defines image → TXT and the engine has no spreadsheet
- * writer for raster input.
+ * writer for raster input. `kind === 'spreadsheet'` yields the v3 shape.
  */
+export function defaultConversionOptions(kind?: 'pdf' | 'image' | 'unknown'): ConversionOptionsV2;
+export function defaultConversionOptions(kind: 'spreadsheet'): ConversionOptionsV3;
 export function defaultConversionOptions(
-  kind: 'pdf' | 'image' | 'unknown' = 'pdf',
-): ConversionOptionsV2 {
+  kind: 'pdf' | 'image' | 'spreadsheet' | 'unknown' = 'pdf',
+): ConversionOptionsV2 | ConversionOptionsV3 {
+  if (kind === 'spreadsheet') {
+    return defaultSpreadsheetOptions();
+  }
   return {
     schema_version: 2,
     target_formats: kind === 'image' ? ['txt'] : ['xlsx', 'txt', 'csv'],
     ocr: { ...DEFAULT_OCR, languages: [...DEFAULT_OCR.languages] },
     text: { ...DEFAULT_TEXT },
     csv: { ...DEFAULT_CSV },
+  };
+}
+
+const DEFAULT_SPREADSHEET: SpreadsheetOptionsV3 = {
+  sheet_names: null,
+  header_row: null,
+  csv_encoding: null,
+  csv_delimiter: null,
+  formula_mode: 'cached_or_text',
+  reader_version: SPREADSHEET_READER_VERSION,
+};
+
+export function defaultSpreadsheetOptions(targetFormats: OutputFormat[] = ['xlsx', 'txt', 'csv']): ConversionOptionsV3 {
+  return {
+    schema_version: 3,
+    target_formats: [...targetFormats],
+    ocr: { ...DEFAULT_OCR, languages: [...DEFAULT_OCR.languages] },
+    text: { ...DEFAULT_TEXT },
+    csv: { ...DEFAULT_CSV },
+    spreadsheet: { ...DEFAULT_SPREADSHEET },
   };
 }
 
@@ -153,13 +217,34 @@ const csvSchema = z
   })
   .strict();
 
+/**
+ * Client-facing spreadsheet section. `reader_version` is deliberately absent:
+ * the server stamps it after normalization (see `SPREADSHEET_READER_VERSION`).
+ */
+const spreadsheetSchema = z
+  .object({
+    sheet_names: z.array(z.string().min(1).max(255)).min(1).max(1024).nullable().optional(),
+    header_row: z.boolean().nullable().optional(),
+    csv_encoding: z.string().min(2).max(40).nullable().optional(),
+    csv_delimiter: z
+      .string()
+      .min(1)
+      .max(1)
+      .regex(/^[\x20-\x7e]$/, 'spreadsheet.csv_delimiter deve ser um único caractere ASCII.')
+      .nullable()
+      .optional(),
+    formula_mode: z.enum(SPREADSHEET_FORMULA_MODES).optional(),
+  })
+  .strict();
+
 const optionsSchema = z
   .object({
-    schema_version: z.literal(2).optional(),
+    schema_version: z.union([z.literal(2), z.literal(3)]).optional(),
     target_formats: z.array(z.enum(OUTPUT_FORMATS)).min(1).max(OUTPUT_FORMATS.length).optional(),
     ocr: ocrSchema.optional(),
     text: textSchema.optional(),
     csv: csvSchema.optional(),
+    spreadsheet: spreadsheetSchema.optional(),
   })
   .strict();
 
@@ -226,6 +311,9 @@ function fromLegacy(input: Record<string, unknown>): Record<string, unknown> {
   if (isPlainObject(input.csv)) Object.assign(csv, input.csv);
   if (Object.keys(csv).length > 0) nested.csv = csv;
 
+  // v3 section travels through the legacy rewrite untouched.
+  if (isPlainObject(input.spreadsheet)) nested.spreadsheet = input.spreadsheet;
+
   return nested;
 }
 
@@ -240,24 +328,35 @@ function fromNestedOcr(value: Record<string, unknown>): Record<string, unknown> 
 
 export interface NormalizeOptionsInput {
   /** Content kind detected by the caller. Drives the default target formats. */
-  kind?: 'pdf' | 'image' | 'unknown';
+  kind?: 'pdf' | 'image' | 'spreadsheet' | 'unknown';
   /** When false, the presence of unknown keys is an error (default: true). */
   allowLegacy?: boolean;
 }
 
 /**
- * Normalizes any accepted options payload into `ConversionOptionsV2`.
+ * Normalizes any accepted options payload into v2 or v3.
+ *
+ * v3 is opt-in by content: a `spreadsheet` input kind or an explicit
+ * `spreadsheet` section upgrades the payload; anything else keeps the legacy
+ * v2 shape byte-for-byte so existing fingerprints stay stable.
+ *
+ * Overloads keep historical callers typed: pdf/image calls still receive a
+ * `ConversionOptionsV2`.
  *
  * @throws ConversionOptionsError with `INVALID_OPTION` or
  *         `INCOMPATIBLE_OUTPUT_FORMAT` on invalid input.
  */
+export function normalizeConversionOptions(input: unknown, options?: NormalizeOptionsInput & { kind?: 'pdf' | 'image' | 'unknown' }): ConversionOptionsV2;
+export function normalizeConversionOptions(input: unknown, options: NormalizeOptionsInput & { kind: 'spreadsheet' }): ConversionOptionsV3;
+export function normalizeConversionOptions(input: unknown, options?: NormalizeOptionsInput): NormalizedConversionOptions;
 export function normalizeConversionOptions(
   input: unknown,
   options: NormalizeOptionsInput = {},
-): ConversionOptionsV2 {
+): NormalizedConversionOptions {
   const kind = options.kind ?? 'pdf';
   const allowLegacy = options.allowLegacy ?? true;
-  const base = defaultConversionOptions(kind);
+  const base: ConversionOptionsV2 | ConversionOptionsV3 =
+    kind === 'spreadsheet' ? defaultSpreadsheetOptions() : defaultConversionOptions(kind);
 
   if (input === undefined || input === null) return base;
 
@@ -269,11 +368,23 @@ export function normalizeConversionOptions(
 
   rejectCeilings(input);
 
+  const declaredVersion = input.schema_version;
+  if (declaredVersion !== undefined && declaredVersion !== 2 && declaredVersion !== 3) {
+    throw new ConversionOptionsError(
+      'INVALID_OPTION',
+      'schema_version aceita 2 (legado) ou 3 (entrada de planilha).',
+      { schema_version: declaredVersion },
+    );
+  }
+
+  // v3 is opt-in by content; `schema_version: 3` alone does not upgrade a PDF.
+  const isV3 = kind === 'spreadsheet' || isPlainObject(input.spreadsheet);
+
   const unknownKeys = Object.keys(input).filter(
     (key) =>
       !LEGACY_KEYS.has(key) &&
       !(CEILING_KEYS as readonly string[]).includes(key) &&
-      !['schema_version', 'ocr', 'text', 'csv'].includes(key),
+      !['schema_version', 'ocr', 'text', 'csv', 'spreadsheet'].includes(key),
   );
   if (unknownKeys.length > 0) {
     throw new ConversionOptionsError('INVALID_OPTION', 'Opção desconhecida.', {
@@ -310,9 +421,8 @@ export function normalizeConversionOptions(
     }
   }
 
-  return {
-    schema_version: 2,
-    target_formats: kind === 'image' ? ['txt'] : targetFormats,
+  const common = {
+    target_formats: kind === 'image' ? (['txt'] as OutputFormat[]) : targetFormats,
     ocr: {
       enabled: data.ocr?.enabled ?? base.ocr.enabled,
       languages: data.ocr?.languages ? [...data.ocr.languages] : base.ocr.languages,
@@ -332,14 +442,37 @@ export function normalizeConversionOptions(
       value_mode: data.csv?.value_mode ?? base.csv.value_mode,
     },
   };
+
+  if (!isV3) {
+    return { schema_version: 2, ...common };
+  }
+
+  const spreadsheet = data.spreadsheet ?? {};
+  const v3: ConversionOptionsV3 = {
+    schema_version: 3,
+    ...common,
+    spreadsheet: {
+      sheet_names: spreadsheet.sheet_names !== undefined && spreadsheet.sheet_names !== null
+        ? [...spreadsheet.sheet_names]
+        : null,
+      header_row: spreadsheet.header_row !== undefined ? spreadsheet.header_row : null,
+      csv_encoding: spreadsheet.csv_encoding !== undefined ? spreadsheet.csv_encoding : null,
+      csv_delimiter: spreadsheet.csv_delimiter !== undefined ? spreadsheet.csv_delimiter : null,
+      formula_mode: spreadsheet.formula_mode ?? 'cached_or_text',
+      reader_version: SPREADSHEET_READER_VERSION,
+    },
+  };
+  return v3;
 }
 
 /**
  * Deterministic JSON for hashing (idempotency fingerprints).
  * Keys are emitted in a fixed order so equal options always produce equal text.
+ * v3 payloads append the spreadsheet section; v2 output stays byte-identical
+ * to the pre-v3 contract.
  */
-export function canonicalOptionsJson(options: ConversionOptionsV2): string {
-  return JSON.stringify({
+export function canonicalOptionsJson(options: NormalizedConversionOptions): string {
+  const base: Record<string, unknown> = {
     schema_version: options.schema_version,
     target_formats: [...options.target_formats].sort(),
     ocr: {
@@ -360,10 +493,23 @@ export function canonicalOptionsJson(options: ConversionOptionsV2): string {
       table_ids: options.csv.table_ids ? [...options.csv.table_ids] : null,
       value_mode: options.csv.value_mode,
     },
-  });
+  };
+  if (options.schema_version === 3) {
+    base.spreadsheet = {
+      sheet_names: options.spreadsheet.sheet_names
+        ? [...options.spreadsheet.sheet_names]
+        : null,
+      header_row: options.spreadsheet.header_row,
+      csv_encoding: options.spreadsheet.csv_encoding,
+      csv_delimiter: options.spreadsheet.csv_delimiter,
+      formula_mode: options.spreadsheet.formula_mode,
+      reader_version: options.spreadsheet.reader_version,
+    };
+  }
+  return JSON.stringify(base);
 }
 
 /** True when the options can produce a spreadsheet artifact. */
-export function producesSpreadsheet(options: ConversionOptionsV2): boolean {
+export function producesSpreadsheet(options: NormalizedConversionOptions): boolean {
   return options.target_formats.includes('xlsx');
 }

@@ -308,6 +308,281 @@ paths:
                   services:
                     type: object
                     additionalProperties: { type: string }
+
+  # -------------------------------------------------------------------------
+  # Upgrade plan (docs 02/04/05): sources, imports, schedules, occurrences.
+  # Rotas novas; envelope de erro e identidade por sessão já existentes.
+  # -------------------------------------------------------------------------
+
+  /source-roots:
+    get:
+      tags: [Sources]
+      summary: Concessões de raiz visíveis ao dono
+      description: |
+        Lista somente concessões do dono atual. O caminho absoluto nunca é
+        exposto a outros donos; a resposta traz rótulo, runtime e disponibilidade.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SourceRoot' }
+  /sources:
+    get:
+      tags: [Sources]
+      summary: Lista fontes do dono
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Sources]
+      summary: Cria fonte dentro de raiz concedida
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceCreate' }
+      responses:
+        '201':
+          description: Fonte criada (nenhuma conversão é iniciada ao salvar)
+        '400':
+          description: |
+            UNKNOWN_FIELD: campo desconhecido (ex.: owner_id — a identidade vem
+            da sessão). INVALID_SOURCE: caminho relativo inválido.
+            INVALID_PAYLOAD: corpo inválido.
+          content:
+            application/json:
+              schema: { $ref: '#/components/responses/Error' }
+        '404': { description: Raiz inexistente ou de outro dono }
+  /sources/{id}:
+    get:
+      tags: [Sources]
+      summary: Consulta fonte
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      responses:
+        '200': { description: OK }
+        '404': { description: Fonte inexistente ou de outro dono }
+    patch:
+      tags: [Sources]
+      summary: Edita fonte com controle de versão
+      description: |
+        Edição otimista por `version`: conflito retorna 409 sem sobrescrever
+        silenciosamente. Desativação é lógica.
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      responses:
+        '200': { description: Atualizada }
+        '409': { $ref: '#/components/responses/RevisionConflict' }
+    delete:
+      tags: [Sources]
+      summary: Arquiva fonte (histórico preservado)
+      description: Conflito se houver agenda ativa usando a fonte.
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      responses:
+        '200': { description: Arquivada }
+        '409': { $ref: '#/components/responses/Error' }
+  /sources/{id}/validate:
+    post:
+      tags: [Sources]
+      summary: Valida acesso e formatos (amostra limitada)
+      description: Não inicia conversão. Pasta inexistente/sem acesso é indisponível, não vazia.
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      responses:
+        '200': { description: Relatório de validação com amostra }
+  /sources/{id}/imports:
+    post:
+      tags: [Sources]
+      summary: Inicia importação (202)
+      description: |
+        Exige `Idempotency-Key`. A mesma chave com corpo igual devolve a mesma
+        importação; corpo diferente devolve 409 IDEMPOTENCY_KEY_REUSED.
+        Captura a definição vigente da fonte em transação (snapshot).
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        '202':
+          description: Importação aceita
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportRecord' }
+        '409':
+          description: IDEMPOTENCY_KEY_REUSED ou raiz revogada
+          content:
+            application/json:
+              schema: { $ref: '#/components/responses/Error' }
+  /imports/{id}:
+    get:
+      tags: [Sources]
+      summary: Progresso da importação
+      parameters:
+        - $ref: '#/components/parameters/ImportId'
+      responses:
+        '200': { description: OK }
+  /imports/{id}/items:
+    get:
+      tags: [Sources]
+      summary: Itens da importação (cursor)
+      parameters:
+        - $ref: '#/components/parameters/ImportId'
+      responses:
+        '200': { description: Página com erros por arquivo }
+  /imports/{id}/cancel:
+    post:
+      tags: [Sources]
+      summary: Pedido durável de cancelamento (idempotente)
+      parameters:
+        - $ref: '#/components/parameters/ImportId'
+      responses:
+        '202': { description: Aceito }
+
+  /schedules:
+    get:
+      tags: [Schedules]
+      summary: Lista agendas do dono
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Schedules]
+      summary: Cria agenda
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleCreate' }
+            examples:
+              daily:
+                value:
+                  name: Importação diária
+                  source_id: src_1
+                  rule: { kind: daily, local_time: '08:00' }
+                  timezone: America/Sao_Paulo
+                  misfire_policy: run_once_latest
+                  overlap_policy: skip
+                  options: { target_formats: [xlsx, txt, csv] }
+                  index_collection_id: null
+              interval:
+                value:
+                  name: A cada hora
+                  source_id: src_1
+                  rule: { kind: interval, every_seconds: 3600, anchor_at: '2026-11-19T11:00:00Z' }
+                  timezone: UTC
+      responses:
+        '201': { description: Criada }
+        '400':
+          description: 'INVALID_SCHEDULE_RULE (ex.: intervalo < 60s ou > 365 dias), INVALID_TIMEZONE, UNKNOWN_FIELD'
+          content:
+            application/json:
+              schema: { $ref: '#/components/responses/Error' }
+  /schedules/preview:
+    post:
+      tags: [Schedules]
+      summary: Próximas cinco ocorrências sem executar
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+  /schedules/{id}:
+    get:
+      tags: [Schedules]
+      summary: Consulta agenda
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200': { description: OK }
+    patch:
+      tags: [Schedules]
+      summary: Edição otimista por revisão
+      description: |
+        Editar regra/opções incrementa `revision` e recalcula o futuro a partir
+        da edição. Ocorrências já criadas usam o snapshot antigo completo.
+        Conflito de revisão → 409 REVISION_CONFLICT, sem sobrescrever.
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200': { description: Atualizada }
+        '409': { $ref: '#/components/responses/RevisionConflict' }
+    delete:
+      tags: [Schedules]
+      summary: Arquiva agenda (pausa e preserva histórico)
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200': { description: Arquivada }
+  /schedules/{id}/pause:
+    post:
+      tags: [Schedules]
+      summary: Pausa novas ocorrências (idempotente)
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200': { description: Pausada }
+  /schedules/{id}/resume:
+    post:
+      tags: [Schedules]
+      summary: Retoma do próximo horário futuro (idempotente)
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200': { description: Retomada }
+  /schedules/{id}/run-now:
+    post:
+      tags: [Schedules]
+      summary: Executa agora (202)
+      description: |
+        Cria ocorrência manual com chave idempotente própria, sem deslocar o
+        próximo disparo do calendário; aplica a mesma política de concorrência.
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string }
+      responses:
+        '202': { description: Ocorrência manual criada }
+  /schedules/{id}/runs:
+    get:
+      tags: [Schedules]
+      summary: Histórico de ocorrências (paginado)
+      parameters:
+        - $ref: '#/components/parameters/ScheduleId'
+      responses:
+        '200': { description: OK }
+  /schedule-runs/{id}:
+    get:
+      tags: [Schedules]
+      summary: Detalhe da ocorrência
+      parameters:
+        - $ref: '#/components/parameters/ScheduleRunId'
+      responses:
+        '200': { description: OK }
+  /schedule-runs/{id}/events:
+    get:
+      tags: [Schedules]
+      summary: Eventos da ocorrência (SSE com Last-Event-ID)
+      parameters:
+        - $ref: '#/components/parameters/ScheduleRunId'
+      responses:
+        '200': { description: Fluxo retomável }
+  /schedule-runs/{id}/cancel:
+    post:
+      tags: [Schedules]
+      summary: Cancela ocorrência e propaga aos trabalhos filhos
+      description: Idempotente; resultado já publicado permanece histórico.
+      parameters:
+        - $ref: '#/components/parameters/ScheduleRunId'
+      responses:
+        '202': { description: Aceito }
+
 components:
   securitySchemes:
     bearer:
@@ -339,6 +614,32 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/AuthSession' }
+    RevisionConflict:
+      description: Conflito de revisão/versão (REVISION_CONFLICT) — releia o estado e reaplique
+      content:
+        application/json:
+          schema: { $ref: '#/components/responses/Error' }
+  parameters:
+    SourceId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    ImportId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    ScheduleId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    ScheduleRunId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
   schemas:
     RegisterRequest:
       type: object
@@ -552,3 +853,138 @@ components:
         capabilities:
           type: object
           additionalProperties: { type: boolean }
+    # ------------------------------------------------------------------
+    # Upgrade plan (T1): fontes, agendas e ocorrências
+    # ------------------------------------------------------------------
+    SourceRoot:
+      type: object
+      required: [id, runtime_id, runtime_available, granted_by, created_at]
+      properties:
+        id: { type: string }
+        label: { type: string, nullable: true }
+        runtime_id: { type: string }
+        runtime_available: { type: boolean }
+        granted_by: { type: string }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: string, format: date-time, nullable: true }
+    SourceCreate:
+      type: object
+      required: [root_id, relative_path, kind, name]
+      additionalProperties: false
+      properties:
+        root_id: { type: string }
+        relative_path: { type: string, minLength: 1 }
+        kind: { type: string, enum: [file, directory] }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        recursive: { type: boolean, default: false }
+        include_patterns:
+          type: array
+          items: { type: string }
+          nullable: true
+        exclude_patterns:
+          type: array
+          items: { type: string }
+          nullable: true
+    ImportRecord:
+      type: object
+      required: [id, source_id, status]
+      properties:
+        id: { type: string }
+        owner_id: { type: string }
+        source_id: { type: string }
+        source_version: { type: integer }
+        status:
+          type: string
+          enum: [pending, scanning, submitting, converting, indexing, completed, partial, failed, cancelled]
+        definition: { type: object }
+        batch_id: { type: string, nullable: true }
+        counts:
+          type: object
+          properties:
+            total: { type: integer }
+            imported: { type: integer }
+            skipped: { type: integer }
+            failed: { type: integer }
+        error:
+          type: object
+          nullable: true
+          properties:
+            code: { type: string }
+            message: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ScheduleRule:
+      oneOf:
+        - type: object
+          required: [kind, local_time]
+          additionalProperties: false
+          properties:
+            kind: { type: string, enum: [daily] }
+            local_time: { type: string, pattern: '^([01]\d|2[0-3]):([0-5]\d)$' }
+        - type: object
+          required: [kind, every_seconds]
+          additionalProperties: false
+          properties:
+            kind: { type: string, enum: [interval] }
+            every_seconds: { type: integer, minimum: 60, maximum: 31536000 }
+            anchor_at: { type: string, format: date-time, nullable: true }
+    ScheduleCreate:
+      type: object
+      required: [name, source_id, rule, timezone]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        source_id: { type: string }
+        rule: { $ref: '#/components/schemas/ScheduleRule' }
+        timezone: { type: string, minLength: 1, maxLength: 100 }
+        misfire_policy: { type: string, enum: [run_once_latest, skip], default: run_once_latest }
+        overlap_policy: { type: string, enum: [skip, queue_one], default: skip }
+        options: { type: object, nullable: true }
+        index_collection_id: { type: string, nullable: true }
+    ScheduleRecord:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleCreate'
+        - type: object
+          required: [id, owner_id, revision]
+          properties:
+            id: { type: string }
+            owner_id: { type: string }
+            enabled: { type: boolean }
+            archived: { type: boolean }
+            revision: { type: integer, minimum: 1 }
+            next_run_at: { type: string, format: date-time, nullable: true }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+    AutomationRun:
+      type: object
+      required: [id, schedule_id, scheduled_for, trigger, occurrence_key, state]
+      properties:
+        id: { type: string }
+        owner_id: { type: string }
+        schedule_id: { type: string }
+        schedule_revision: { type: integer }
+        scheduled_for: { type: string, format: date-time }
+        trigger: { type: string, enum: [schedule, manual, recovery] }
+        occurrence_key: { type: string }
+        state:
+          type: string
+          enum: [queued, running, waiting_children, cancelling, succeeded, partial, no_changes, failed, cancelled, skipped]
+        phase: { type: string, enum: [scan, snapshot, submit, convert, index, finalize], nullable: true }
+        import_id: { type: string, nullable: true }
+        index_job_id: { type: string, nullable: true }
+        attempt: { type: integer }
+        error:
+          type: object
+          nullable: true
+          properties:
+            code: { type: string }
+            message: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ConversionOptions:
+      description: |
+        v2 (legado, PDF/imagem) ou v3 (entrada de planilha). v3 acrescenta a
+        seção `spreadsheet` { sheet_names, header_row, csv_encoding,
+        csv_delimiter, formula_mode, reader_version }; `reader_version` é
+        estampado pelo servidor e participa do fingerprint de idempotência.
+      type: object

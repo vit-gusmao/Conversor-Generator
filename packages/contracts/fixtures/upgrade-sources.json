@@ -1,0 +1,172 @@
+{
+  "comment": "Shared source/schedule contract fixtures for the upgrade plan (T1). Loaded by services/converter/tests/test_upgrade_contracts.py and apps/api/src/modules/conversions/options.spec.ts. Owner identity always comes from the session, never from the payload: a create request carrying owner_id must be rejected on both sides.",
+  "cases": [
+    {
+      "id": "source_create_accepted",
+      "kind": "source_create",
+      "input": {
+        "root_id": "root_1",
+        "relative_path": "financeiro",
+        "kind": "directory",
+        "recursive": false,
+        "include_patterns": ["*.xlsx", "*.csv"],
+        "exclude_patterns": ["~$*", "*.tmp"],
+        "name": "Financeiro"
+      },
+      "expected": {
+        "root_id": "root_1",
+        "relative_path": "financeiro",
+        "kind": "directory",
+        "recursive": false,
+        "include_patterns": ["*.xlsx", "*.csv"],
+        "exclude_patterns": ["~$*", "*.tmp"],
+        "name": "Financeiro"
+      }
+    },
+    {
+      "id": "source_create_defaults",
+      "kind": "source_create",
+      "input": { "root_id": "root_1", "relative_path": "docs/planilhas.xlsx", "kind": "file", "name": "Planilha" },
+      "expected": {
+        "root_id": "root_1",
+        "relative_path": "docs/planilhas.xlsx",
+        "kind": "file",
+        "recursive": false,
+        "include_patterns": null,
+        "exclude_patterns": null,
+        "name": "Planilha"
+      }
+    },
+    {
+      "id": "foreign_owner_ignored",
+      "kind": "source_create",
+      "input": {
+        "root_id": "root_1",
+        "relative_path": "docs",
+        "kind": "directory",
+        "name": "Docs",
+        "owner_id": "attacker-owner"
+      },
+      "expected_error": { "ts": "UNKNOWN_FIELD", "py": "UNKNOWN_FIELD" },
+      "comment": "owner_id is never client input; a strict DTO rejects it on both sides."
+    },
+    {
+      "id": "source_kind_rejected",
+      "kind": "source_create",
+      "input": { "root_id": "root_1", "relative_path": "docs", "kind": "symlink", "name": "Docs" },
+      "expected_error": { "ts": "INVALID_SOURCE", "py": "INVALID_SOURCE" }
+    },
+    {
+      "id": "schedule_daily_accepted",
+      "kind": "schedule_create",
+      "input": {
+        "name": "Importação diária",
+        "source_id": "src_1",
+        "rule": { "kind": "daily", "local_time": "08:00" },
+        "timezone": "America/Sao_Paulo",
+        "misfire_policy": "run_once_latest",
+        "overlap_policy": "skip",
+        "options": { "target_formats": ["xlsx", "txt", "csv"] },
+        "index_collection_id": null
+      },
+      "expected": {
+        "name": "Importação diária",
+        "source_id": "src_1",
+        "rule": { "kind": "daily", "local_time": "08:00" },
+        "timezone": "America/Sao_Paulo",
+        "misfire_policy": "run_once_latest",
+        "overlap_policy": "skip",
+        "index_collection_id": null
+      }
+    },
+    {
+      "id": "schedule_interval_accepted",
+      "kind": "schedule_create",
+      "input": {
+        "name": "A cada hora",
+        "source_id": "src_1",
+        "rule": { "kind": "interval", "every_seconds": 3600, "anchor_at": "2026-11-19T11:00:00Z" },
+        "timezone": "UTC"
+      },
+      "expected": {
+        "name": "A cada hora",
+        "source_id": "src_1",
+        "rule": { "kind": "interval", "every_seconds": 3600, "anchor_at": "2026-11-19T11:00:00Z" },
+        "timezone": "UTC",
+        "misfire_policy": "run_once_latest",
+        "overlap_policy": "skip",
+        "index_collection_id": null
+      }
+    },
+    {
+      "id": "invalid_interval_rejected",
+      "kind": "schedule_create",
+      "input": {
+        "name": "Muito rápido",
+        "source_id": "src_1",
+        "rule": { "kind": "interval", "every_seconds": 30 },
+        "timezone": "UTC"
+      },
+      "expected_error": { "ts": "INVALID_SCHEDULE_RULE", "py": "INVALID_SCHEDULE_RULE" },
+      "comment": "below the 60-second minimum"
+    },
+    {
+      "id": "invalid_interval_zero_rejected",
+      "kind": "schedule_create",
+      "input": {
+        "name": "Zero",
+        "source_id": "src_1",
+        "rule": { "kind": "interval", "every_seconds": 0 },
+        "timezone": "UTC"
+      },
+      "expected_error": { "ts": "INVALID_SCHEDULE_RULE", "py": "INVALID_SCHEDULE_RULE" }
+    },
+    {
+      "id": "invalid_interval_overflow_rejected",
+      "kind": "schedule_create",
+      "input": {
+        "name": "Estouro",
+        "source_id": "src_1",
+        "rule": { "kind": "interval", "every_seconds": 31536001 },
+        "timezone": "UTC"
+      },
+      "expected_error": { "ts": "INVALID_SCHEDULE_RULE", "py": "INVALID_SCHEDULE_RULE" },
+      "comment": "above the 365-day maximum (31_536_000)"
+    },
+    {
+      "id": "invalid_daily_time_rejected",
+      "kind": "schedule_create",
+      "input": {
+        "name": "Hora inválida",
+        "source_id": "src_1",
+        "rule": { "kind": "daily", "local_time": "24:61" },
+        "timezone": "UTC"
+      },
+      "expected_error": { "ts": "INVALID_SCHEDULE_RULE", "py": "INVALID_SCHEDULE_RULE" }
+    },
+    {
+      "id": "invalid_timezone_rejected",
+      "kind": "schedule_create",
+      "input": {
+        "name": "Fuso inválido",
+        "source_id": "src_1",
+        "rule": { "kind": "daily", "local_time": "08:00" },
+        "timezone": "Marte/Olympus"
+      },
+      "expected_error": { "ts": "INVALID_TIMEZONE", "py": "INVALID_TIMEZONE" }
+    },
+    {
+      "id": "schedule_unknown_field_rejected",
+      "kind": "schedule_create",
+      "input": {
+        "name": "X",
+        "source_id": "src_1",
+        "rule": { "kind": "daily", "local_time": "08:00" },
+        "timezone": "UTC",
+        "shell_command": "rm -rf /"
+      },
+      "expected_error": { "ts": "UNKNOWN_FIELD", "py": "UNKNOWN_FIELD" },
+      "comment": "no automation accepts arbitrary commands"
+    }
+  ]
+}

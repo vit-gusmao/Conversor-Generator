@@ -15,6 +15,10 @@
 export * from './options';
 export * from './batches';
 export * from './uploads';
+export * from './contract-errors';
+export * from './sources';
+export * from './schedules';
+export * from './runtime';
 
 /* ------------------------------------------------------------------------- */
 /* Status and pipeline                                                        */

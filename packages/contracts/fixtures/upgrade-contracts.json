@@ -1,0 +1,381 @@
+{
+  "comment": "Shared conversion-options fixtures for the upgrade plan (T1). Loaded by services/converter/tests/test_upgrade_contracts.py and apps/api/src/modules/conversions/options.spec.ts. Both implementations must accept and reject exactly the same cases. `expected_error` carries per-language codes when the historical codes diverge (image/xlsx: TS INCOMPATIBLE_OUTPUT_FORMAT, Python UNSUPPORTED_TARGET).",
+  "cases": [
+    {
+      "id": "v2_pdf_unchanged",
+      "kind": "pdf",
+      "input": {
+        "schema_version": 2,
+        "target_formats": [
+          "xlsx",
+          "txt",
+          "csv"
+        ],
+        "ocr": {
+          "enabled": false
+        },
+        "text": {
+          "newline": "crlf"
+        }
+      },
+      "expected": {
+        "schema_version": 2,
+        "target_formats": [
+          "xlsx",
+          "txt",
+          "csv"
+        ],
+        "ocr": {
+          "enabled": false,
+          "languages": [
+            "por",
+            "eng"
+          ],
+          "dpi": null,
+          "strategy": "auto"
+        },
+        "text": {
+          "newline": "crlf",
+          "page_separator": "form_feed",
+          "include_table_text": true
+        },
+        "csv": {
+          "profile": "interoperable",
+          "delimiter": null,
+          "formula_policy": "safe",
+          "table_ids": null,
+          "value_mode": "original"
+        }
+      }
+    },
+    {
+      "id": "v2_image_txt_only",
+      "kind": "image",
+      "input": {
+        "target_formats": [
+          "txt"
+        ],
+        "ocr": {
+          "enabled": false
+        }
+      },
+      "expected": {
+        "schema_version": 2,
+        "target_formats": [
+          "txt"
+        ],
+        "ocr": {
+          "enabled": false,
+          "languages": [
+            "por",
+            "eng"
+          ],
+          "dpi": null,
+          "strategy": "auto"
+        },
+        "text": {
+          "newline": "lf",
+          "page_separator": "form_feed",
+          "include_table_text": true
+        },
+        "csv": {
+          "profile": "interoperable",
+          "delimiter": null,
+          "formula_policy": "safe",
+          "table_ids": null,
+          "value_mode": "original"
+        }
+      }
+    },
+    {
+      "id": "v3_pdf_without_spreadsheet_is_v2",
+      "kind": "pdf",
+      "input": {
+        "target_formats": [
+          "txt"
+        ],
+        "ocr": {
+          "enabled": false
+        }
+      },
+      "expected": {
+        "schema_version": 2,
+        "target_formats": [
+          "txt"
+        ],
+        "ocr": {
+          "enabled": false,
+          "languages": [
+            "por",
+            "eng"
+          ],
+          "dpi": null,
+          "strategy": "auto"
+        },
+        "text": {
+          "newline": "lf",
+          "page_separator": "form_feed",
+          "include_table_text": true
+        },
+        "csv": {
+          "profile": "interoperable",
+          "delimiter": null,
+          "formula_policy": "safe",
+          "table_ids": null,
+          "value_mode": "original"
+        }
+      }
+    },
+    {
+      "id": "v3_xlsx_defaults",
+      "kind": "spreadsheet",
+      "input": {
+        "schema_version": 3,
+        "ocr": {
+          "enabled": false
+        }
+      },
+      "expected": {
+        "schema_version": 3,
+        "target_formats": [
+          "xlsx",
+          "txt",
+          "csv"
+        ],
+        "ocr": {
+          "enabled": false,
+          "languages": [
+            "por",
+            "eng"
+          ],
+          "dpi": null,
+          "strategy": "auto"
+        },
+        "text": {
+          "newline": "lf",
+          "page_separator": "form_feed",
+          "include_table_text": true
+        },
+        "csv": {
+          "profile": "interoperable",
+          "delimiter": null,
+          "formula_policy": "safe",
+          "table_ids": null,
+          "value_mode": "original"
+        },
+        "spreadsheet": {
+          "sheet_names": null,
+          "header_row": null,
+          "csv_encoding": null,
+          "csv_delimiter": null,
+          "formula_mode": "cached_or_text",
+          "reader_version": "spreadsheet-reader-v1"
+        }
+      }
+    },
+    {
+      "id": "v3_csv_explicit_dialect",
+      "kind": "spreadsheet",
+      "input": {
+        "schema_version": 3,
+        "target_formats": [
+          "xlsx",
+          "csv"
+        ],
+        "spreadsheet": {
+          "csv_encoding": "cp1252",
+          "csv_delimiter": ";",
+          "header_row": true
+        },
+        "ocr": {
+          "enabled": false
+        }
+      },
+      "expected": {
+        "schema_version": 3,
+        "target_formats": [
+          "xlsx",
+          "csv"
+        ],
+        "ocr": {
+          "enabled": false,
+          "languages": [
+            "por",
+            "eng"
+          ],
+          "dpi": null,
+          "strategy": "auto"
+        },
+        "text": {
+          "newline": "lf",
+          "page_separator": "form_feed",
+          "include_table_text": true
+        },
+        "csv": {
+          "profile": "interoperable",
+          "delimiter": null,
+          "formula_policy": "safe",
+          "table_ids": null,
+          "value_mode": "original"
+        },
+        "spreadsheet": {
+          "sheet_names": null,
+          "header_row": true,
+          "csv_encoding": "cp1252",
+          "csv_delimiter": ";",
+          "formula_mode": "cached_or_text",
+          "reader_version": "spreadsheet-reader-v1"
+        }
+      }
+    },
+    {
+      "id": "v3_sheet_selection",
+      "kind": "spreadsheet",
+      "input": {
+        "schema_version": 3,
+        "spreadsheet": {
+          "sheet_names": [
+            "Faturas",
+            "Resumo"
+          ]
+        },
+        "ocr": {
+          "enabled": false
+        }
+      },
+      "expected": {
+        "schema_version": 3,
+        "target_formats": [
+          "xlsx",
+          "txt",
+          "csv"
+        ],
+        "ocr": {
+          "enabled": false,
+          "languages": [
+            "por",
+            "eng"
+          ],
+          "dpi": null,
+          "strategy": "auto"
+        },
+        "text": {
+          "newline": "lf",
+          "page_separator": "form_feed",
+          "include_table_text": true
+        },
+        "csv": {
+          "profile": "interoperable",
+          "delimiter": null,
+          "formula_policy": "safe",
+          "table_ids": null,
+          "value_mode": "original"
+        },
+        "spreadsheet": {
+          "sheet_names": [
+            "Faturas",
+            "Resumo"
+          ],
+          "header_row": null,
+          "csv_encoding": null,
+          "csv_delimiter": null,
+          "formula_mode": "cached_or_text",
+          "reader_version": "spreadsheet-reader-v1"
+        }
+      }
+    },
+    {
+      "id": "image_xlsx_rejected",
+      "kind": "image",
+      "input": {
+        "target_formats": [
+          "xlsx"
+        ]
+      },
+      "expected_error": {
+        "ts": "INCOMPATIBLE_OUTPUT_FORMAT",
+        "py": "UNSUPPORTED_TARGET"
+      }
+    },
+    {
+      "id": "spreadsheet_unknown_key_rejected",
+      "kind": "spreadsheet",
+      "input": {
+        "schema_version": 3,
+        "spreadsheet": {
+          "bogus_option": true
+        }
+      },
+      "expected_error": {
+        "ts": "INVALID_OPTION",
+        "py": "INVALID_OPTION"
+      }
+    },
+    {
+      "id": "spreadsheet_bad_formula_mode_rejected",
+      "kind": "spreadsheet",
+      "input": {
+        "schema_version": 3,
+        "spreadsheet": {
+          "formula_mode": "recalculate"
+        }
+      },
+      "expected_error": {
+        "ts": "INVALID_OPTION",
+        "py": "INVALID_OPTION"
+      }
+    },
+    {
+      "id": "v2_stays_v2_when_spreadsheet_requested",
+      "kind": "pdf",
+      "input": {
+        "schema_version": 3,
+        "target_formats": [
+          "xlsx"
+        ],
+        "ocr": {
+          "enabled": false
+        }
+      },
+      "expected": {
+        "schema_version": 2,
+        "target_formats": [
+          "xlsx"
+        ],
+        "ocr": {
+          "enabled": false,
+          "languages": [
+            "por",
+            "eng"
+          ],
+          "dpi": null,
+          "strategy": "auto"
+        },
+        "text": {
+          "newline": "lf",
+          "page_separator": "form_feed",
+          "include_table_text": true
+        },
+        "csv": {
+          "profile": "interoperable",
+          "delimiter": null,
+          "formula_policy": "safe",
+          "table_ids": null,
+          "value_mode": "original"
+        }
+      },
+      "comment": "schema_version 3 alone does not upgrade a PDF: without a spreadsheet input the document keeps the legacy v2 shape and behavior."
+    },
+    {
+      "id": "page_ceiling_still_rejected",
+      "kind": "pdf",
+      "input": {
+        "max_pages": 500
+      },
+      "expected_error": {
+        "ts": "INVALID_OPTION",
+        "py": "INVALID_OPTION"
+      }
+    }
+  ]
+}
