@@ -835,6 +835,27 @@ class PublicBatchEventRow(Base):
 
 
 # --------------------------------------------------------------------------- #
+# Upgrade domains: sources + automation (register before create_all)
+# --------------------------------------------------------------------------- #
+
+# Imported here (not at the top) so the tables join Base.metadata while keeping
+# module initialization acyclic: these modules only import `Base`/`utcnow`.
+from automation.models import (  # noqa: E402
+    AutomationEventRow,
+    AutomationRunRow,
+    AutomationScheduleRow,
+)
+from sources.models import (  # noqa: E402
+    FileSourceRow,
+    SourceFileVersionRow,
+    SourceImportItemRow,
+    SourceImportRow,
+    SourceKnowledgeHeadRow,
+    SourceRootRow,
+)
+
+
+# --------------------------------------------------------------------------- #
 # Engine / session factory
 # --------------------------------------------------------------------------- #
 
@@ -954,6 +975,15 @@ __all__ = [
     "PublicUploadSessionRow",
     "PublicUploadPartRow",
     "PublicBatchEventRow",
+    "SourceRootRow",
+    "FileSourceRow",
+    "SourceImportRow",
+    "SourceImportItemRow",
+    "SourceFileVersionRow",
+    "SourceKnowledgeHeadRow",
+    "AutomationScheduleRow",
+    "AutomationRunRow",
+    "AutomationEventRow",
     "get_engine",
     "get_session_factory",
     "init_db",
