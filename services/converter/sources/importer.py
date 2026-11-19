@@ -656,9 +656,12 @@ class ImportService:
         try:
             record = self.repository.get_import(session, import_id=import_id, owner_id=owner_id)
             if record is not None and record.status not in {"completed", "partial", "cancelled"}:
-                record.status = "failed"
-                record.error_code = code
-                record.error_message = message
+                # A cooperative cancel is a distinct terminal state, never a
+                # failure: the user asked for it and history stays coherent.
+                record.status = "cancelled" if code == "CANCELLED" else "failed"
+                if code != "CANCELLED":
+                    record.error_code = code
+                    record.error_message = message
                 record.lease_until = None
                 session.commit()
         finally:

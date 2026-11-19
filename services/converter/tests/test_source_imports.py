@@ -222,3 +222,20 @@ def test_recovery_after_submission_does_not_duplicate(api_client, tmp_path: Path
     items = service.items(import_id, owner["id"])
     conversion_ids = [item["conversion_id"] for item in items if item["conversion_id"]]
     assert len(conversion_ids) == 1
+
+
+def test_cancel_before_scan_ends_as_cancelled_not_failed(api_client, tmp_path: Path):
+    """A cooperative cancel is a distinct terminal state (not a failure)."""
+    owner, source_id, root = _make_source(api_client, tmp_path)
+    (root / "docs" / "plan.xlsx").write_bytes(_xlsx_bytes())
+    service = ImportService()
+    record = service.start(
+        owner_id=owner["id"],
+        source_id=source_id,
+        request={"options": {"schema_version": 3}},
+        idempotency_key=uuid.uuid4().hex,
+    )
+    service.cancel(record["id"], owner["id"])
+    result = service.run(record["id"], owner["id"])
+    assert result["status"] == "cancelled"
+    assert result["error"] is None
