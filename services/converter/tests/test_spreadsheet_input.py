@@ -180,3 +180,37 @@ def test_negative_number_and_formula_prefix_stay_text(tmp_path: Path):
     row = doc.sheets[0].rows[1]
     assert row[0].value == "=cmd()"
     assert row[1].value == "-5"
+
+
+def test_far_away_declared_cell_is_budget_rejected_not_oom(tmp_path: Path):
+    """A tiny file declaring XFD1048576 must be rejected, never allocate it."""
+    path = tmp_path / "declarada.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Extrema"
+    ws["A1"] = "ok"
+    ws["XFD1048576"] = "fim"
+    wb.save(path)
+
+    probe = probe_spreadsheet(path, "xlsx", None)
+    assert probe.supported is True
+
+    with pytest.raises(IngestionError) as excinfo:
+        read_spreadsheet(path, SpreadsheetOptions())
+    assert excinfo.value.code == "SPREADSHEET_BUDGET_EXCEEDED"
+    assert excinfo.value.details["limit_area"] == 50_000_000
+
+
+def test_wide_but_legit_sheet_reads_with_ragged_rows(tmp_path: Path):
+    """A normal file with a wide column keeps working (rows are ragged)."""
+    path = tmp_path / "larga.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "cabecalho"
+    ws["Z2"] = "valor distante"
+    wb.save(path)
+    doc = read_spreadsheet(path, SpreadsheetOptions())
+    sheet = doc.sheets[0]
+    assert len(sheet.rows) == 2
+    assert len(sheet.rows[0]) == 1  # not padded to column Z
+    assert sheet.rows[1][25].value == "valor distante"

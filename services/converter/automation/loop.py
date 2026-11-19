@@ -42,6 +42,7 @@ class AutomationLoop:
         self.repository = AutomationRepository()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_cleanup = None
 
     # ------------------------------------------------------------------ life
     def start(self) -> None:
@@ -73,8 +74,9 @@ class AutomationLoop:
             self._stop.wait(self.poll_seconds)
 
     def tick(self, *, now: datetime | None = None) -> dict[str, Any]:
-        """One deterministic iteration: create due occurrences, claim, advance."""
+        """One iteration: retention, due occurrences, claim, advance."""
         now = now or datetime.now(UTC)
+        self._maybe_cleanup(now)
         created = 0
         session = get_session_factory()()
         try:
@@ -94,8 +96,24 @@ class AutomationLoop:
             if lease is None:
                 break
             claimed += 1
-            self.executor.advance(lease.run_id)
+            # The fence travels with the claim: a reclaimed attempt bumps it
+            # and the old worker can no longer finalize the run.
+            self.executor.advance(lease.run_id, fence=lease.fence)
         return {"created": created, "claimed": claimed}
+
+    def _maybe_cleanup(self, now: datetime) -> None:
+        """Retention runs at most once a day; never touches artifacts."""
+        from automation.cleanup import run_cleanup
+
+        current = now.date()
+        if getattr(self, "_last_cleanup", None) == current:
+            return
+        try:
+            result = run_cleanup(now=now)
+            logger.info("automation cleanup: %s", result)
+            self._last_cleanup = current
+        except Exception:  # noqa: BLE001 - cleanup must not stop the calendar
+            logger.exception("automation cleanup failed")
 
     # --------------------------------------------------------------- recovery
     def recover(self) -> dict[str, int]:
@@ -113,7 +131,10 @@ class AutomationLoop:
                 )
             ]
             for run in rows:
-                run.state = "queued"
+                # A cancellation requested before the crash is honoured: the
+                # executor sees `cancelling` and finishes as `cancelled`.
+                if run.state != "cancelling":
+                    run.state = "queued"
                 run.lease_owner = None
                 run.lease_until = None
                 run.fence = (run.fence or 0) + 1

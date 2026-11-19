@@ -484,6 +484,12 @@ def internal_model_diagnostics(body: dict[str, Any]) -> dict[str, Any]:
 @router.get("/models/digest", dependencies=[Depends(internal_guard)])
 def internal_model_digest(model: str, host: str = "127.0.0.1", port: int = 11434) -> dict[str, Any]:
     """Digest of the tag in use, for checkpoint fingerprints (T13)."""
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ApiError(
+            400,
+            "ENDPOINT_NOT_LOOPBACK",
+            "O diagnóstico de modelos aceita apenas endpoints de loopback.",
+        )
     base = f"http://{host}:{int(port)}".rstrip("/")
     try:
         import httpx
@@ -516,18 +522,23 @@ def internal_automation_status() -> dict[str, Any]:
 
 
 @router.post("/automation/pause", dependencies=[Depends(internal_guard)])
-def internal_automation_pause() -> dict[str, Any]:
-    """Tray action: pause new dispatches without deleting definitions."""
+def internal_automation_pause(
+    x_owner_id: str | None = Header(default=None, alias="x-owner-id"),
+) -> dict[str, Any]:
+    """Tray action: pause this owner's dispatches without deleting anything.
+
+    Scoped by owner: an engine shared by several tenants must never pause
+    everybody because one desktop asked.
+    """
     from models.db import AutomationScheduleRow, get_session_factory
     from sqlalchemy import update as _update
 
     session = get_session_factory()()
     try:
-        result = session.execute(
-            _update(AutomationScheduleRow)
-            .where(AutomationScheduleRow.enabled.is_(True))
-            .values(enabled=False)
-        )
+        query = _update(AutomationScheduleRow).where(AutomationScheduleRow.enabled.is_(True))
+        if x_owner_id:
+            query = query.where(AutomationScheduleRow.owner_id == x_owner_id)
+        result = session.execute(query.values(enabled=False))
         session.commit()
         return {"paused": int(result.rowcount or 0)}
     finally:

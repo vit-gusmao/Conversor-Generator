@@ -40,15 +40,18 @@ export const IMPORT_ITEM_STATUSES = [
 ] as const;
 export type ImportItemStatus = (typeof IMPORT_ITEM_STATUSES)[number];
 
-/** Root concession visible to its owner. Absolute paths are not listed here. */
+/**
+ * Root concession visible to its owner. `display_path` is shown only to that
+ * owner (the engine filters by owner on every read); other owners never see
+ * another person's absolute path.
+ */
 export interface SourceRootInfo {
   id: string;
   label: string | null;
   runtime_id: string;
   runtime_available: boolean;
-  granted_by: string;
+  display_path: string;
   created_at: string;
-  revoked_at: string | null;
 }
 
 export interface SourceCreateRequest {

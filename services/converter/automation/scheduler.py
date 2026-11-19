@@ -269,6 +269,9 @@ class AutomationScheduler:
             select(AutomationRunRow)
             .where(
                 (AutomationRunRow.state == "queued")
+                # A queued cancellation is reclaimed so it can finish as
+                # `cancelled` instead of staying "cancelling" forever.
+                | (AutomationRunRow.state == "cancelling")
                 | (
                     AutomationRunRow.state.in_(ACTIVE_STATES)
                     & AutomationRunRow.lease_until.is_not(None)

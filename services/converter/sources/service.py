@@ -212,6 +212,40 @@ class SourceService:
     def update_source(
         self, session: Session, *, source_id: str, owner_id: str, version: int, changes: dict[str, Any]
     ) -> dict[str, Any] | None:
+        # The same policy as creation: a typo or traversal must not be stored.
+        if "relative_path" in changes or "kind" in changes:
+            from api.deps import ApiError
+            from sources.types import validate_source_create
+
+            current = self.repository.get_source(session, source_id=source_id, owner_id=owner_id)
+            if current is None:
+                return None
+            root = self.repository.get_root(session, root_id=current.root_id, owner_id=owner_id)
+            if root is None:
+                raise ApiError(404, "ROOT_NOT_FOUND", "Raiz concedida inexistente para este dono.")
+            candidate = {
+                "root_id": current.root_id,
+                "relative_path": changes.get("relative_path", current.relative_path),
+                "kind": changes.get("kind", current.kind),
+                "name": changes.get("name", current.name),
+                "recursive": changes.get("recursive", bool(current.recursive)),
+                "include_patterns": changes.get("include_patterns", current.include_patterns),
+                "exclude_patterns": changes.get("exclude_patterns", current.exclude_patterns),
+            }
+            parsed = validate_source_create(candidate)
+            try:
+                resolved = resolve_source_path(
+                    root.canonical_path, parsed.relative_path, allow_empty=True
+                )
+            except PathPolicyError as exc:
+                raise self._api_error(exc) from exc
+            if not resolved.exists():
+                raise ApiError(
+                    400,
+                    "SOURCE_UNAVAILABLE",
+                    "O caminho da fonte não existe na raiz concedida.",
+                    details={"relative_path": parsed.relative_path},
+                )
         updated = self.repository.update_source(
             session,
             source_id=source_id,

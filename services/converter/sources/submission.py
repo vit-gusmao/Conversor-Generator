@@ -18,6 +18,29 @@ from models.db import get_session_factory
 from storage import get_storage
 
 
+def _content_info(filename: str) -> tuple[str, str]:
+    """Extension and MIME from the real name (never from an opaque id)."""
+    lower = (filename or "").lower()
+    if lower.endswith(".csv"):
+        return ".csv", "text/csv"
+    if lower.endswith(".pdf"):
+        return ".pdf", "application/pdf"
+    for suffix, mime in (
+        (".png", "image/png"),
+        (".jpg", "image/jpeg"),
+        (".jpeg", "image/jpeg"),
+        (".tif", "image/tiff"),
+        (".tiff", "image/tiff"),
+        (".bmp", "image/bmp"),
+        (".gif", "image/gif"),
+        (".webp", "image/webp"),
+        (".jp2", "image/jp2"),
+    ):
+        if lower.endswith(suffix):
+            return suffix, mime
+    return ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
 class SubmissionResult:
     def __init__(self, *, item_id: str, upload_id: str, conversion_id: str) -> None:
         self.item_id = item_id
@@ -56,7 +79,7 @@ class StandaloneSubmissionPort:
 
         service = BatchService()
         client_item_id = f"srcimp:{import_id}:{import_item_id}"
-        extension = ".csv" if relative_path.lower().endswith(".csv") else ".xlsx"
+        extension, mime_type = _content_info(relative_path)
         registered = service.register_item(
             owner_id=owner_id,
             batch_id=batch_id,
@@ -79,15 +102,8 @@ class StandaloneSubmissionPort:
 
         storage = get_storage()
         storage_key = f"documents/{owner_id}/{sha256}{extension}"
-        if snapshot_bytes is not None:
-            if not storage.exists(storage_key):
-                storage.put_bytes(
-                    storage_key,
-                    snapshot_bytes,
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    if extension == ".xlsx"
-                    else "text/csv",
-                )
+        if snapshot_bytes is not None and not storage.exists(storage_key):
+            storage.put_bytes(storage_key, snapshot_bytes, mime_type)
 
         conversion = ConversionService().create_from_stored(
             owner_id=owner_id,
@@ -95,11 +111,7 @@ class StandaloneSubmissionPort:
             sha256=sha256,
             size_bytes=size_bytes,
             filename=relative_path.rsplit("/", 1)[-1],
-            mime_type=(
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                if extension == ".xlsx"
-                else "text/csv"
-            ),
+            mime_type=mime_type,
             normalized=normalized_options,
             page_count=None,
             # One stable key per import item: at-least-once submission can

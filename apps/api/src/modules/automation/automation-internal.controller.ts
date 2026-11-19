@@ -4,6 +4,9 @@ import { Body, Controller, HttpCode, HttpStatus, Inject, Param, Post, Put, Req }
 import type { Request } from 'express';
 
 import { InternalTokenGuard } from '../realtime/internal-token.guard';
+import { ApiError } from '../../common/errors/api-error';
+import { ERROR_CODES } from '../../common/errors/error-codes';
+import type { NormalizedConversionOptions } from '@pdf2x/contracts';
 import { UseGuards } from '@nestjs/common';
 import type { AuthenticatedUser } from '../../common/request-context';
 import { BatchesService } from '../batches/batches.service';
@@ -68,9 +71,9 @@ export class AutomationInternalController {
   }
 
   /**
-   * Snapshot content from the engine. Identity travels in headers set by the
-   * trusted port; the conversion id is recovered idempotently by the stable
-   * `source-import:{import}:{item}` key.
+   * Snapshot content from the engine (raw octet-stream). The file extension and
+   * MIME come from the trusted headers the port sets, never from the opaque
+   * client item id; a checksum mismatch is a 400, not a 201.
    */
   @Put('batches/:batchId/items/:clientItemId/content')
   @HttpCode(HttpStatus.CREATED)
@@ -82,24 +85,39 @@ export class AutomationInternalController {
     const owner = this.ownerFrom(headerValue(request, 'x-owner-id'));
     const importId = headerValue(request, 'x-import-id') ?? 'unknown';
     const declaredSha = headerValue(request, 'x-content-sha256') ?? '';
-    const content = Buffer.from((request.body as Buffer) ?? Buffer.alloc(0));
+    const filename = headerValue(request, 'x-filename') ?? 'documento.xlsx';
+    const content = Buffer.isBuffer(request.body)
+      ? (request.body as Buffer)
+      : Buffer.from((request.body as ArrayBuffer) ?? Buffer.alloc(0));
+
+    if (content.length === 0) {
+      throw ApiError.badRequest(ERROR_CODES.INVALID_FILE, { reason: 'empty_body' });
+    }
     const sha256 = createHash('sha256').update(content).digest('hex');
     if (declaredSha && declaredSha !== sha256) {
-      return { error: { code: 'UPLOAD_CHECKSUM_MISMATCH', message: 'Hash divergente.' } };
+      throw ApiError.validation({
+        code: ERROR_CODES.UPLOAD_CHECKSUM_MISMATCH,
+        expected: declaredSha,
+        received: sha256,
+      });
     }
-    const extension = clientItemId.toLowerCase().endsWith('.csv') ? '.csv' : '.xlsx';
-    const storageKey = `documents/${owner.id}/${sha256}${extension}`;
+
+    const info = storageInfo(filename);
+    const storageKey = `documents/${owner.id}/${sha256}${info.extension}`;
     if (!(await this.storage.exists(storageKey))) {
-      await this.storage.put(storageKey, content, mimeFor(extension));
+      await this.storage.put(storageKey, content, info.mimeType);
     }
+
+    // The registered item carries the normalized options (v3 included).
+    const registered = await this.findRegisteredOptions(batchId, clientItemId, owner.id);
     const conversion = await this.conversions.createStoredConversion(
       owner,
       {
         storageKey,
         sha256,
         sizeBytes: content.length,
-        filename: fileNameFrom(clientItemId),
-        mimeType: mimeFor(extension),
+        filename,
+        mimeType: info.mimeType,
         pageCount: null,
         validation: {
           ok: true,
@@ -117,7 +135,7 @@ export class AutomationInternalController {
           errors: [],
         },
       },
-      optionsFor(extension) as unknown as Parameters<typeof this.conversions.createStoredConversion>[2],
+      registered.options,
       { idempotencyKey: `source-import:${importId}:${clientItemId}` },
     );
     return {
@@ -156,6 +174,21 @@ export class AutomationInternalController {
     return { cancelled: true };
   }
 
+  /** Reads the normalized options persisted at registration time. */
+  private async findRegisteredOptions(
+    batchId: string,
+    clientItemId: string,
+    ownerId: string,
+  ): Promise<{ options: NormalizedConversionOptions }> {
+    const owner = this.ownerFrom(ownerId);
+    const items = (await this.batches.listItems(owner, batchId, { limit: 200 })) as unknown as {
+      items?: Array<{ client_item_id?: string; options?: NormalizedConversionOptions }>;
+    };
+    const match = (items.items ?? []).find((item) => item.client_item_id === clientItemId);
+    const options = match?.options ?? ({ schema_version: 3 } as NormalizedConversionOptions);
+    return { options };
+  }
+
   private ownerFrom(ownerId?: string): AuthenticatedUser {
     // The engine is trusted (internal token); it always sends the persisted
     // import owner — never a client-supplied identity.
@@ -174,6 +207,24 @@ export class AutomationInternalController {
 function headerValue(request: Request, name: string): string | undefined {
   const value = request.headers[name];
   return Array.isArray(value) ? value[0] : value;
+}
+
+/** Content-derived extension/MIME for the stored snapshot. */
+function storageInfo(filename: string): { extension: string; mimeType: string } {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.csv')) return { extension: '.csv', mimeType: 'text/csv' };
+  if (lower.endsWith('.pdf')) return { extension: '.pdf', mimeType: 'application/pdf' };
+  if (/\.(png|jpe?g|tiff?|bmp|gif|webp|ico|jp2|pnm|avif|heic|heif)$/.test(lower)) {
+    const extension = lower.slice(lower.lastIndexOf('.'));
+    return {
+      extension,
+      mimeType: `image/${extension.slice(1).replace('jpg', 'jpeg').replace('tif', 'tiff')}`,
+    };
+  }
+  return {
+    extension: '.xlsx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  };
 }
 
 function fileNameFrom(clientItemId: string): string {

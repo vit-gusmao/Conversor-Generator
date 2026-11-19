@@ -154,6 +154,9 @@ class GatewaySubmissionPort:
                 "x-content-sha256": sha256,
                 "x-import-id": import_id,
                 "x-item-id": str(response.get("item_id") or client_item_id),
+                # The real name carries the extension/MIME the gateway must use
+                # (the opaque client id cannot tell CSV from XLSX).
+                "x-filename": filename,
                 "Content-Type": "application/octet-stream",
             },
         )

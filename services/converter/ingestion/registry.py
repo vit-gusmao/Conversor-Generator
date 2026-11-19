@@ -33,12 +33,18 @@ class InputProbe:
 ZIP_MAGIC = b"PK\x03\x04"
 
 
+def spreadsheet_enabled() -> bool:
+    from config import settings
+
+    return bool(getattr(settings, "spreadsheet_input_enabled", True))
+
+
 def probe_input(data: bytes) -> InputProbe:
     if sniff_is_pdf(data):
         return InputProbe(kind="pdf", format="PDF", mime_type="application/pdf", supported=True)
     signature = detect_signature(data)
     if signature is None:
-        if data[:4] == ZIP_MAGIC:
+        if data[:4] == ZIP_MAGIC and spreadsheet_enabled():
             return _probe_xlsx_bytes(data)
         return InputProbe(
             kind="unknown",
@@ -153,7 +159,7 @@ def probe_input_path(path, filename: str | None = None) -> InputProbe:
             supported=available,
             reason=None if available else "CODEC_UNAVAILABLE",
         )
-    if head[:4] == ZIP_MAGIC:
+    if head[:4] == ZIP_MAGIC and spreadsheet_enabled():
         from ingestion.spreadsheet_input import probe_spreadsheet
 
         try:
@@ -174,7 +180,7 @@ def probe_input_path(path, filename: str | None = None) -> InputProbe:
             reason=probe.reason,
         )
     declared_suffix = declared_name.rsplit(".", 1)[-1].lower() if "." in declared_name else ""
-    if declared_suffix == "csv":
+    if declared_suffix == "csv" and spreadsheet_enabled():
         from ingestion.spreadsheet_input import IngestionError, probe_spreadsheet
 
         try:

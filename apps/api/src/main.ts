@@ -2,7 +2,15 @@ import 'reflect-metadata';
 
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { json, urlencoded, type Express, type NextFunction, type Request, type Response } from 'express';
+import {
+  json,
+  raw,
+  urlencoded,
+  type Express,
+  type NextFunction,
+  type Request,
+  type Response,
+} from 'express';
 
 import { AppModule } from './app.module';
 import { ERROR_CODES } from './common/errors/error-codes';
@@ -23,6 +31,11 @@ async function bootstrap(): Promise<void> {
   // for multipart uploads (multer's own limit is configured in UploadModule).
   app.use(json({ limit: config.uploadMaxBytes }));
   app.use(urlencoded({ extended: true, limit: config.uploadMaxBytes }));
+  // Engine → gateway snapshot uploads travel as raw octet-stream bodies.
+  app.use(
+    '/api/v1/internal/automation',
+    raw({ type: 'application/octet-stream', limit: config.uploadMaxBytes }),
+  );
   app.use((request: Request, _response: Response, next: NextFunction) => {
     const raw = request.headers['content-length'];
     if (typeof raw === 'string') {

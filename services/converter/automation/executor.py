@@ -31,8 +31,15 @@ class AutomationExecutor:
         self._submission = submission
 
     # ------------------------------------------------------------------ entry
-    def advance(self, run_id: str, owner_id: str | None = None) -> RunProgress:
-        """Advance one occurrence as far as it can go right now."""
+    def advance(
+        self, run_id: str, owner_id: str | None = None, *, fence: int | None = None
+    ) -> RunProgress:
+        """Advance one occurrence as far as it can go right now.
+
+        ``fence`` is the token received with the claim: a stale worker (whose
+        lease expired and was reclaimed) cannot finalize the new attempt.
+        """
+        self._fence = fence
         run, owner = self._load(run_id, owner_id)
         if run is None:
             return RunProgress(run_id=run_id, state="failed", phase="finalize", done=True,
@@ -43,9 +50,11 @@ class AutomationExecutor:
         if run.state == "skipped":
             return RunProgress(run_id=run_id, state="skipped", phase="finalize", done=True)
 
-        if run.state == "cancelling" or self._cancel_requested(run_id):
+        if self._cancel_requested(run_id):
             self._finish(run_id, "cancelled", {})
-            return RunProgress(run_id=run_id, state="cancelled", phase=run.phase or "scan", done=True)
+            return RunProgress(
+                run_id=run_id, state="cancelled", phase=run.phase or "scan", done=True
+            )
 
         snapshot = run.snapshot_json or {}
         try:
@@ -69,6 +78,17 @@ class AutomationExecutor:
                 index_detail = self._index_if_requested(run_id, owner, snapshot, result)
                 if index_detail:
                     detail["index"] = index_detail
+                    if index_detail.get("status") == "queued":
+                        # Indexing runs as a durable job; the occurrence waits
+                        # for it instead of declaring itself complete early.
+                        self._set_run_fields(run_id, state="waiting_children")
+                        return RunProgress(
+                            run_id=run_id,
+                            state="waiting_children",
+                            phase="index",
+                            done=False,
+                            detail=detail,
+                        )
                     if index_detail.get("status") not in {"indexed", "skipped", None}:
                         state = "partial"
             self._finish(run_id, state, detail)
@@ -114,9 +134,32 @@ class AutomationExecutor:
         session = get_session_factory()()
         try:
             run = session.get(AutomationRunRow, run_id)
-            return bool(run is not None and run.state == "cancelling")
+            return bool(
+                run is not None
+                and (run.cancel_requested_at is not None or run.state == "cancelling")
+            )
         finally:
             session.close()
+
+    @property
+    def fence(self) -> int | None:
+        return getattr(self, "_fence", None)
+
+    def _fence_valid(self, session, run: AutomationRunRow) -> bool:
+        """A stale worker (reclaimed lease) must not write results."""
+        expected = self.fence
+        if expected is None:
+            return True
+        if run.fence != expected:
+            return False
+        if run.lease_until is not None:
+            lease = run.lease_until
+            now = datetime.now(UTC)
+            if lease.tzinfo is None:
+                lease = lease.replace(tzinfo=UTC)
+            if lease < now:
+                return False
+        return True
 
     def _ensure_import(self, run: AutomationRunRow, owner_id: str, snapshot: dict[str, Any]):
         """Idempotent import creation from the frozen snapshot."""
@@ -247,6 +290,11 @@ class AutomationExecutor:
             run = session.get(AutomationRunRow, run_id)
             if run is None:
                 return
+            if not self._fence_valid(session, run):
+                # Another worker owns this attempt now: leave its state alone.
+                return
+            if run.cancel_requested_at is not None and state != "cancelled":
+                state = "cancelled"
             if run.state == "cancelled" and state != "cancelled":
                 state = "cancelled"
             run.state = state

@@ -29,7 +29,7 @@ import {
 } from '@/hooks/use-sources';
 import { explainError } from '@/lib/errors';
 import { formatBytes, formatDateTime, formatNumber } from '@/lib/format';
-import { isDesktopRuntime, pickSourcePath } from '@/lib/platform';
+import { isDesktopRuntime, pickSource } from '@/lib/platform';
 import { toast } from '@/stores/ui';
 
 const IMPORT_STATE_LABELS: Record<string, string> = {
@@ -72,7 +72,7 @@ export function SourcesPage() {
   const importItems = useImportItems(activeImportId);
 
   const availableRoots: SourceRootInfo[] = (roots.data ?? []).filter(
-    (root) => root.runtime_available && !root.revoked_at,
+    (root) => root.runtime_available,
   );
   const hasRoots = availableRoots.length > 0;
 
@@ -202,8 +202,21 @@ export function SourcesPage() {
                   type="button"
                   variant="outline"
                   onClick={async () => {
-                    const picked = await pickSourcePath(kind);
-                    if (picked) setRelativePath(picked);
+                    try {
+                      const picked = await pickSource(kind);
+                      if (!picked) return; // cancelled: nothing changes
+                      // The picker granted the folder; create the source
+                      // relative to that root ('.' = the root itself).
+                      setRootId(picked.root_id);
+                      setRelativePath(picked.display_path);
+                      setKind(picked.kind);
+                    } catch (error) {
+                      toast({
+                        title: 'Seleção não autorizada',
+                        description: explainError(error),
+                        variant: 'error',
+                      });
+                    }
                   }}
                 >
                   Procurar…

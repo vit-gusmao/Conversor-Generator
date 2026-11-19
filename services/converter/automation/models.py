@@ -75,6 +75,9 @@ class AutomationRunRow(Base):
     lease_owner = Column(String(128), nullable=True)
     lease_until = Column(DateTime(timezone=True), nullable=True)
     fence = Column(Integer, nullable=False, default=0)
+    #: Durable cancellation request. The executor cooperates at phase
+    #: boundaries; a published result stays in the history.
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
     error_code = Column(String(64), nullable=True)
     error_message = Column(Text, nullable=True)
     started_at = Column(DateTime(timezone=True), nullable=True)

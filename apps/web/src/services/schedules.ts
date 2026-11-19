@@ -79,9 +79,11 @@ export async function getRun(runId: string): Promise<AutomationRunRecord> {
 }
 
 export async function getRunEvents(runId: string, after = 0): Promise<AutomationEvent[]> {
+  // Same route serves SSE for `Accept: text/event-stream`; the SPA asks for
+  // the JSON page (fetch defaults to */*, so it gets JSON).
   const payload = await apiFetch<{ items: AutomationEvent[] }>(
     `/schedule-runs/${encodeURIComponent(runId)}/events`,
-    { query: { after } },
+    { query: { after }, headers: { Accept: 'application/json' } },
   );
   return payload.items ?? [];
 }

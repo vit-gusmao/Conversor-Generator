@@ -78,7 +78,12 @@ try {
     -Body (@{ owner_id = $me.id; canonical_path = $rootGranted } | ConvertTo-Json)
   $source = Invoke-RestMethod "$base/api/v1/sources" -Method Post -Headers $auth -ContentType 'application/json' `
     -Body (@{ root_id = $grant.id; relative_path = 'planilhas'; kind = 'directory'; name = 'Smoke'; include_patterns = @('*.xlsx') } | ConvertTo-Json)
-  $validation = Invoke-RestMethod "$base/api/v1/sources/$($source.id)/validate" -Method Post -Headers $auth
+  try {
+    $validation = Invoke-RestMethod "$base/api/v1/sources/$($source.id)/validate" -Method Post -Headers $auth
+  } catch {
+    $body = $_.ErrorDetails.Message
+    throw "validacao falhou: $body"
+  }
   if ($validation.estimated_files -ne 1) { throw "validacao nao encontrou o arquivo" }
 
   $importKey = [guid]::NewGuid().ToString('N')

@@ -97,11 +97,24 @@ def main(argv: list[str] | None = None) -> int:
         publish_readiness(0, metadata["boot_id"], metadata["version"], None)
         return 0
 
-    port = args.port or _free_loopback_port(args.host)
+    # Bind the listening socket FIRST and hand it to uvicorn: readiness must
+    # announce the port that is actually accepting connections (no probe-then-
+    # assume race, and the window can load immediately).
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((args.host, args.port))
+    listener.listen(2048)
+    port = int(listener.getsockname()[1])
 
-    # The bootstrap secret authenticates privileged requests from the host.
-    if not os.environ.get("DESKTOP_BOOTSTRAP_SECRET"):
-        os.environ["DESKTOP_BOOTSTRAP_SECRET"] = secrets.token_urlsafe(32)
+    # The internal token authenticates privileged requests from the host; the
+    # supervisor passes one, and we never fall back to the documented default.
+    token = os.environ.get("CONVERTER_INTERNAL_TOKEN") or os.environ.get(
+        "DESKTOP_BOOTSTRAP_SECRET"
+    )
+    if not token or token == "dev-internal-token-change-me":
+        token = secrets.token_urlsafe(32)
+    os.environ["CONVERTER_INTERNAL_TOKEN"] = token
+    os.environ["DESKTOP_BOOTSTRAP_SECRET"] = token
 
     publish_readiness(
         port,
@@ -114,7 +127,17 @@ def main(argv: list[str] | None = None) -> int:
 
     from api.main import app
 
-    uvicorn.run(app, host=args.host, port=port, log_level=os.environ.get("LOG_LEVEL", "info").lower())
+    config = uvicorn.Config(
+        app, log_level=os.environ.get("LOG_LEVEL", "info").lower(), lifespan="on"
+    )
+    server = uvicorn.Server(config)
+    try:
+        server.run(sockets=[listener])
+    finally:
+        try:
+            listener.close()
+        except OSError:
+            pass
     return 0
 
 

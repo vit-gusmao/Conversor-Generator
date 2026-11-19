@@ -117,3 +117,36 @@ describe('BackendSupervisor', () => {
     expect(endpoint.bootId).toBe('boot-b');
   });
 });
+
+describe('BackendSupervisor — internal token (review fix)', () => {
+  it('never spawns the backend with the documented default token', async () => {
+    const child = new FakeChild();
+    // The constructor refuses before any spawn.
+    let error: unknown = null;
+    try {
+      makeSupervisor(child, { internalToken: 'dev-internal-token-change-me' });
+    } catch (thrown) {
+      error = thrown;
+    }
+    expect(error).toMatchObject({ code: 'INSECURE_INTERNAL_TOKEN' });
+  });
+
+  it('shares the per-boot token with the backend environment', async () => {
+    const child = new FakeChild();
+    const { supervisor, spawnImpl } = makeSupervisor(child, { internalToken: 'token-abc-123' });
+    const pending = supervisor.start();
+    child.emitReady({ port: 40000, boot_id: 'b', version: '1' });
+    await pending;
+    const options = (spawnImpl as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][2] as {
+      env: Record<string, string>;
+    };
+    expect(options.env.CONVERTER_INTERNAL_TOKEN).toBe('token-abc-123');
+    expect(options.env.DESKTOP_BOOTSTRAP_SECRET).toBe('token-abc-123');
+  });
+
+  it('generates a strong token when none is provided', () => {
+    const { supervisor } = makeSupervisor(new FakeChild());
+    expect(supervisor.internalToken.length).toBeGreaterThan(32);
+    expect(supervisor.internalToken).not.toBe('dev-internal-token-change-me');
+  });
+});

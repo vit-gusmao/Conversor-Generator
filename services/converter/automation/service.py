@@ -78,12 +78,6 @@ class ScheduleService:
             options=create.options or {},
             index_collection_id=create.index_collection_id,
         )
-        self.repository.append_event(
-            session,
-            run_id=None,  # schedule-level events attach to the first occurrence
-            type="SCHEDULE_CREATED",
-            payload={},
-        ) if False else None
         return self.schedule_payload(schedule)
 
     def get(self, session: Session, *, schedule_id: str, owner_id: str) -> dict[str, Any] | None:
@@ -185,21 +179,13 @@ class ScheduleService:
         resumed = self.repository.resume_schedule(
             session, schedule_id=schedule_id, owner_id=owner_id, next_run_at=next_run
         )
-        assert resumed is not None
+        if resumed is None:
+            raise ApiError(404, "SCHEDULE_NOT_FOUND", "Agenda inexistente ou de outro dono.")
         return self.schedule_payload(resumed)
 
     def archive(self, session: Session, *, schedule_id: str, owner_id: str) -> bool:
-        schedule = self.repository.get_schedule(session, schedule_id=schedule_id, owner_id=owner_id)
-        if schedule is None:
-            return False
-        active_source_schedules = [
-            other
-            for other in self.repository.list_schedules(session, owner_id=owner_id)
-            if other.id != schedule_id and other.source_id == schedule.source_id and other.enabled
-        ]
-        # Archiving a schedule is allowed even when other schedules use the
-        # source; only the source archive blocks on active schedules.
-        del active_source_schedules
+        # Archiving a schedule is always allowed: other schedules sharing the
+        # same source keep working, and history is preserved.
         return self.repository.archive_schedule(session, schedule_id=schedule_id, owner_id=owner_id)
 
     # --------------------------------------------------------------- preview

@@ -9,6 +9,8 @@
 export interface DesktopSelection {
   display_path: string;
   kind: 'file' | 'directory';
+  /** Root granted at pick time; create the source relative to it. */
+  root_id: string;
 }
 
 export interface DesktopModelSelection {
@@ -50,12 +52,11 @@ export function isDesktopRuntime(): boolean {
   return true;
 }
 
-/** Native picker or `null` (browser, or the user cancelled). */
-export async function pickSourcePath(kind: 'file' | 'directory'): Promise<string | null> {
+/** Native picker (grants the root) or `null` when cancelled/unavailable. */
+export async function pickSource(kind: 'file' | 'directory'): Promise<DesktopSelection | null> {
   const bridge = desktopBridge();
   if (!bridge) return null;
-  const selection = await bridge.pickSource({ kind });
-  return selection?.display_path ?? null;
+  return bridge.pickSource({ kind });
 }
 
 export async function pickModelResource(

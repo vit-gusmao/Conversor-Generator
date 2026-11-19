@@ -16,6 +16,8 @@ export interface DesktopBridge {
   pickSource(input: { kind: 'file' | 'directory' }): Promise<{
     display_path: string;
     kind: 'file' | 'directory';
+    /** Root granted by the host; the page creates the source relative to it. */
+    root_id: string;
   } | null>;
   pickModelResource(input: { kind: ModelSelection['kind'] }): Promise<ModelSelection | null>;
   readRuntimeProfile(): Promise<Record<string, unknown>>;

@@ -74,9 +74,19 @@ class ImportService:
     ) -> dict[str, Any]:
         session = get_session_factory()()
         try:
+            from config import settings as runtime_settings
+
+            if not getattr(runtime_settings, "source_imports_enabled", True):
+                raise ApiError(
+                    409,
+                    "FEATURE_DISABLED",
+                    "Importações por caminho estão desabilitadas neste runtime.",
+                )
             source = self.repository.get_source(session, source_id=source_id, owner_id=owner_id)
             if source is None:
                 raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
+            if not source.enabled:
+                raise ApiError(409, "SOURCE_DISABLED", "A fonte está desativada.")
             root = self.repository.get_root(session, root_id=source.root_id, owner_id=owner_id)
             if root is None or root.revoked_at is not None:
                 raise ApiError(409, "ROOT_REVOKED", "A concessão da raiz foi revogada.")
@@ -101,7 +111,9 @@ class ImportService:
                 )
 
             options = request.get("options") or {}
-            normalized = self._normalize(options, "spreadsheet")
+            # Options are normalized with the kind the source actually holds:
+            # a PDF from a source must not adopt v3 spreadsheet semantics.
+            normalized = self._normalize_for_source(options, definition)
             payload = {
                 "options": normalized,
                 "force": bool(request.get("force")),
@@ -197,7 +209,15 @@ class ImportService:
                 if record is None:
                     raise ApiError(404, "IMPORT_NOT_FOUND", "Importação inexistente.")
                 if record.status in {"completed", "partial", "failed", "cancelled"}:
-                    return self.import_payload(record)
+                    # A `partial` caused by children still converting stays
+                    # resumable: re-running reconciles those items instead of
+                    # leaving the import stuck forever.
+                    resumable = (
+                        record.status == "partial"
+                        and record.error_code == "IMPORT_INCOMPLETE"
+                    )
+                    if not resumable:
+                        return self.import_payload(record)
                 record.status = "scanning"
                 record.lease_owner = f"standalone:{os.getpid()}"
                 record.lease_until = datetime.now(UTC) + timedelta(seconds=SOURCE_LEASE_SECONDS)
@@ -351,9 +371,27 @@ class ImportService:
 
         session = get_session_factory()()
         try:
-            known = None
+            from config import settings as runtime_settings
+
+            max_bytes = runtime_settings.max_bytes()
             for candidate in batch:
                 self._assert_not_cancelled(import_id, owner_id)
+                if max_bytes and candidate.size_bytes > max_bytes:
+                    # Never copy a file the admission path would reject anyway.
+                    item = self.repository.add_import_item(
+                        session,
+                        import_id=import_id,
+                        relative_path=candidate.relative_path,
+                        client_item_id=f"big:{candidate.relative_path}:{candidate.size_bytes}",
+                        size_bytes=candidate.size_bytes,
+                        mtime_ns=candidate.mtime_ns,
+                    )
+                    item.status = "failed"
+                    item.error_code = "FILE_TOO_LARGE"
+                    item.error_message = (
+                        f"O arquivo excede o limite de {max_bytes // (1024 * 1024)} MiB."
+                    )
+                    continue
                 known_sha, known_hash = self.repository.latest_processed_sha256(
                     session,
                     owner_id=owner_id,
@@ -503,6 +541,11 @@ class ImportService:
                 )
                 continue
             self._mark_item_submitted(import_id, owner_id, item.id, result)
+            # The upload is confirmed: the private copy is no longer needed.
+            try:
+                snapshot_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         self.submission.seal_batch(owner_id, batch_id)
         self._mark_status(import_id, owner_id, "converting")
@@ -532,7 +575,7 @@ class ImportService:
                 select(SourceImportItemRow).where(SourceImportItemRow.import_id == import_id)
             ).scalars().all()
             for item in items:
-                if item.status != "submitted":
+                if item.status not in {"submitted", "queued"}:
                     continue
                 conversion = session.get(PublicConversionRow, item.conversion_id) if item.conversion_id else None
                 status = conversion.status if conversion is not None else "queued"
@@ -569,7 +612,7 @@ class ImportService:
             ).scalars().all()
             pending = 0
             for item in items:
-                if item.status != "submitted":
+                if item.status not in {"submitted", "queued"}:
                     continue
                 conversion = session.get(PublicConversionRow, item.conversion_id) if item.conversion_id else None
                 if conversion is None or conversion.status not in {
@@ -692,6 +735,21 @@ class ImportService:
         from api.service import _normalize_options
 
         return _normalize_options(options or {}, kind)
+
+    def _normalize_for_source(
+        self, options: dict[str, Any], definition: SourceDefinitionSnapshot
+    ) -> dict[str, Any]:
+        """Pick the kind from the source's declared formats.
+
+        A source restricted to spreadsheets normalizes as v3; a mixed/PDF
+        source keeps the legacy behaviour so per-file probing decides.
+        """
+        include = [str(pattern).lower() for pattern in (definition.include_patterns or [])]
+        only_spreadsheets = bool(include) and all(
+            any(token in pattern for token in (".xlsx", ".csv", "xlsx", "csv")) for pattern in include
+        )
+        kind = "spreadsheet" if only_spreadsheets else "pdf"
+        return self._normalize(options, kind)
 
     def _options_hash(self, options: dict[str, Any]) -> str:
         payload = dict(options)

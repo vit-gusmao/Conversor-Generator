@@ -29,6 +29,17 @@ SPREADSHEET_READER_VERSION = "spreadsheet-reader-v1"
 
 #: Safety budgets (operational values, enforced, never silent truncation).
 XLSX_MAX_ENTRIES = 2048
+#: Cells actually present in the sheet XML (empty cells are not counted).
+XLSX_MAX_CELLS = 2_000_000
+#: Used extents; the declared <dimension> is never trusted.
+XLSX_MAX_ROWS = 1_048_576
+XLSX_MAX_COLUMNS = 16_384
+#: One merged range larger than this is recorded by anchor only.
+XLSX_MAX_MERGED_CELLS = 10_000
+#: Bounding box of the grid we are willing to materialize. A file whose
+#: declared extent is vastly larger than its content (padding attack) is
+#: rejected instead of allocating an enormous ragged grid.
+XLSX_MAX_GRID_AREA = 50_000_000
 XLSX_MAX_EXPANSION_BYTES = 512 * 1024 * 1024  # sum of inflated entry sizes
 XLSX_MAX_EXPANSION_RATIO = 500  # legit OOXML compresses ~10-50x; bombs exceed 1000x
 XLSX_MAX_READ_SECONDS = 30
@@ -398,20 +409,71 @@ def _read_xlsx(path: Path, options: SpreadsheetOptions) -> SpreadsheetDocument:
                     }
                 )
 
-            rows: list[list[SpreadsheetCell | None]] = []
-            merged_lookup, merged_anchors = _merged_anchor_map(worksheet)
-            max_row = worksheet.max_row or 0
-            max_column = worksheet.max_column or 1
+            merged_lookup, merged_anchors = _merged_anchor_map(worksheet, name, warnings)
+            # Only cells that actually exist in the sheet XML are parsed: a
+            # declared dimension reaching XFD1048576 (common in exporter
+            # output) must never allocate a 17-billion-cell grid.
+            present = _present_cells(worksheet)
+            if len(present) > XLSX_MAX_CELLS:
+                raise IngestionError(
+                    "SPREADSHEET_BUDGET_EXCEEDED",
+                    f"A aba '{name}' tem {len(present)} celulas (limite {XLSX_MAX_CELLS}).",
+                    details={"sheet": name, "cells": len(present), "limit": XLSX_MAX_CELLS},
+                )
+            if time.perf_counter() - started > XLSX_MAX_READ_SECONDS:
+                raise IngestionError(
+                    "SPREADSHEET_BUDGET_EXCEEDED",
+                    "A leitura do XLSX excedeu o tempo operacional.",
+                    details={
+                        "sheet": name,
+                        "elapsed_seconds": round(time.perf_counter() - started, 2),
+                    },
+                )
+            sparse: dict[int, dict[int, SpreadsheetCell | None]] = {}
+            max_row = 0
+            max_column = 1
             sheet_formulas = 0
+            for (row_index, column_index), cell in present:
+                parsed = _parse_cell(cell, row_index, column_index, merged_lookup, merged_anchors)
+                if parsed is not None and parsed.value_type == "formula":
+                    sheet_formulas += 1
+                sparse.setdefault(row_index, {})[column_index] = parsed
+                if row_index > max_row:
+                    max_row = row_index
+                if column_index > max_column:
+                    max_column = column_index
+            if max_row > XLSX_MAX_ROWS or max_column > XLSX_MAX_COLUMNS:
+                raise IngestionError(
+                    "SPREADSHEET_BUDGET_EXCEEDED",
+                    f"A aba '{name}' usa {max_row} linha(s) x {max_column} coluna(s), acima do limite.",
+                    details={
+                        "sheet": name,
+                        "rows": max_row,
+                        "columns": max_column,
+                        "limit_rows": XLSX_MAX_ROWS,
+                        "limit_columns": XLSX_MAX_COLUMNS,
+                    },
+                )
+            if max_row * max_column > XLSX_MAX_GRID_AREA:
+                raise IngestionError(
+                    "SPREADSHEET_BUDGET_EXCEEDED",
+                    (
+                        f"A aba '{name}' declara uma área de {max_row}x{max_column} "
+                        f"(limite {XLSX_MAX_GRID_AREA} celulas de grade)."
+                    ),
+                    details={
+                        "sheet": name,
+                        "rows": max_row,
+                        "columns": max_column,
+                        "limit_area": XLSX_MAX_GRID_AREA,
+                    },
+                )
+            # Ragged rows: a wide cell in one row does not pad every other row.
+            rows: list[list[SpreadsheetCell | None]] = []
             for row_index in range(1, max_row + 1):
-                row_cells: list[SpreadsheetCell | None] = []
-                for column_index in range(1, max_column + 1):
-                    cell = worksheet.cell(row=row_index, column=column_index)
-                    parsed = _parse_cell(cell, row_index, column_index, merged_lookup, merged_anchors)
-                    if parsed is not None and parsed.value_type == "formula":
-                        sheet_formulas += 1
-                    row_cells.append(parsed)
-                rows.append(row_cells)
+                row_map = sparse.get(row_index, {})
+                width = max(row_map) if row_map else 0
+                rows.append([row_map.get(column_index) for column_index in range(1, width + 1)])
             if sheet_formulas:
                 warnings.append(
                     {
@@ -450,8 +512,35 @@ def _read_xlsx(path: Path, options: SpreadsheetOptions) -> SpreadsheetDocument:
     )
 
 
-def _merged_anchor_map(worksheet) -> tuple[dict[tuple[int, int], str], set[tuple[int, int]]]:
-    """Maps non-anchor coordinates of merged ranges to their anchor address."""
+def _present_cells(worksheet) -> list[tuple[tuple[int, int], Any]]:
+    """Cells that exist in the XML, never the declared grid rectangle."""
+    raw = getattr(worksheet, "_cells", None)
+    if isinstance(raw, dict):
+        return [((int(row), int(col)), cell) for (row, col), cell in raw.items()]
+    # Fallback (future openpyxl): bounded iteration with a hard cell counter.
+    collected: list[tuple[tuple[int, int], Any]] = []
+    for row_cells in worksheet.iter_rows():
+        for cell in row_cells:
+            if cell is None or cell.value is None:
+                continue
+            collected.append(((int(cell.row), int(cell.column)), cell))
+            if len(collected) > XLSX_MAX_CELLS:
+                raise IngestionError(
+                    "SPREADSHEET_BUDGET_EXCEEDED",
+                    "A aba excede o orcamento de celulas.",
+                    details={"limit": XLSX_MAX_CELLS},
+                )
+    return collected
+
+
+def _merged_anchor_map(
+    worksheet, sheet_name: str = "", warnings: list[dict[str, Any]] | None = None
+) -> tuple[dict[tuple[int, int], str], set[tuple[int, int]]]:
+    """Maps non-anchor coordinates of merged ranges to their anchor address.
+
+    A range larger than ``XLSX_MAX_MERGED_CELLS`` is recorded by its anchor
+    only (with a warning) so a crafted file cannot force a huge expansion.
+    """
     lookup: dict[tuple[int, int], str] = {}
     anchors: set[tuple[int, int]] = set()
     try:
@@ -462,6 +551,21 @@ def _merged_anchor_map(worksheet) -> tuple[dict[tuple[int, int], str], set[tuple
         min_col, min_row, max_col, max_row = span.min_col, span.min_row, span.max_col, span.max_row
         anchor = _address(min_row, min_col)
         anchors.add((min_row, min_col))
+        area = (max_row - min_row + 1) * (max_col - min_col + 1)
+        if area > XLSX_MAX_MERGED_CELLS:
+            if warnings is not None:
+                warnings.append(
+                    {
+                        "code": "MERGED_RANGE_TOO_LARGE",
+                        "message": (
+                            f"Mescla {anchor}:{_address(max_row, max_col)} com {area} celulas "
+                            "foi registrada apenas pela ancora."
+                        ),
+                        "sheet": sheet_name,
+                        "area": area,
+                    }
+                )
+            continue
         for row_index in range(min_row, max_row + 1):
             for column_index in range(min_col, max_col + 1):
                 if (row_index, column_index) != (min_row, min_col):

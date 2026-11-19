@@ -117,8 +117,26 @@ class KnowledgeJobRunner:
                 row.error_code = error.get("code")
                 row.error_message = error.get("message")
             session.commit()
+            if status in TERMINAL:
+                self._finalize_parent_run(session, row, status)
         finally:
             session.close()
+
+    def _finalize_parent_run(self, session, job_row: KnowledgeIndexJobRow, status: str) -> None:
+        """Close the occurrence waiting on this job (idempotent)."""
+        from automation.models import AutomationRunRow
+
+        run = session.execute(
+            select(AutomationRunRow).where(AutomationRunRow.index_job_id == job_row.id)
+        ).scalars().first()
+        if run is None or run.state not in {"waiting_children", "running"}:
+            return
+        run.state = "succeeded" if status == "completed" else "partial"
+        run.phase = "finalize"
+        run.finished_at = datetime.now(UTC)
+        run.lease_until = None
+        run.lease_owner = None
+        session.commit()
 
     # ------------------------------------------------------------------ reads
     def get(self, job_id: str, owner_id: str) -> dict[str, Any]:

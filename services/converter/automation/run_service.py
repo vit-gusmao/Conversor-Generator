@@ -64,11 +64,20 @@ class AutomationRunService:
             if run.state in TERMINAL:
                 # Idempotent: cancelling a finished run keeps the real result.
                 return {"cancel_requested": False, "state": run.state}
-            if run.state != "cancelling":
-                run.state = "cancelling"
+            if run.cancel_requested_at is None:
+                # Durable request: survives restarts and is checked by the
+                # executor at every phase boundary.
+                run.cancel_requested_at = datetime.now(UTC)
+                run.state = "cancelling" if run.state != "queued" else "cancelling"
                 self.repository.append_event(
                     session, run_id=run.id, type="RUN_CANCEL_REQUESTED", payload={}
                 )
+                if run.import_id:
+                    from models.db import SourceImportRow
+
+                    record = session.get(SourceImportRow, run.import_id)
+                    if record is not None:
+                        record.cancel_requested_at = datetime.now(UTC)
                 session.commit()
             return {"cancel_requested": True, "state": run.state}
         finally:

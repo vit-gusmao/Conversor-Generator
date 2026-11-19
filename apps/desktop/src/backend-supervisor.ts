@@ -2,12 +2,14 @@
  * Supervises the packaged Python backend (T12, doc 03 §4).
  *
  * - spawn without a shell, with an explicit environment (absolute dirs);
+ * - hand the backend the per-boot internal token it must enforce;
  * - ask the backend to bind a free loopback port (no "test port then assume");
  * - read the authenticated readiness line and verify boot id/version;
  * - restart only the process tree this app created, never a foreign one.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -35,6 +37,8 @@ export interface SupervisorOptions {
   /** Test seam: replaces spawn. */
   spawnImpl?: typeof spawn;
   spawnArgs?: string[];
+  /** Token shared with the backend (generated per boot when omitted). */
+  internalToken?: string;
 }
 
 export class SupervisorError extends Error {
@@ -48,16 +52,31 @@ export class SupervisorError extends Error {
 }
 
 const READY_PREFIX = 'CONVERTER_READY ';
+/** Documented development default: never acceptable in a shipped app. */
+const INSECURE_DEFAULT_TOKEN = 'dev-internal-token-change-me';
 
 export class BackendSupervisor extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
   private endpoint: RuntimeEndpoint | null = null;
   private stdoutBuffer = '';
+  /** Per-boot internal token used by privileged routes (host ↔ backend). */
+  readonly internalToken: string;
   private readonly options: Required<Pick<SupervisorOptions, 'startupTimeoutMs'>> & SupervisorOptions;
 
   constructor(options: SupervisorOptions) {
     super();
     this.options = { startupTimeoutMs: 90_000, ...options };
+    this.internalToken = options.internalToken ?? BackendSupervisor.newToken();
+    if (!this.internalToken || this.internalToken === INSECURE_DEFAULT_TOKEN) {
+      throw new SupervisorError(
+        'INSECURE_INTERNAL_TOKEN',
+        'O backend não pode iniciar com o token interno de desenvolvimento.',
+      );
+    }
+  }
+
+  static newToken(): string {
+    return randomBytes(32).toString('base64url');
   }
 
   get running(): boolean {
@@ -82,9 +101,6 @@ export class BackendSupervisor extends EventEmitter {
   }
 
   buildEnvironment(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-    const bootstrap = Buffer.from(
-      `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-    ).toString('base64url');
     return {
       ...process.env,
       APP_DATA_DIR: this.options.appDataDir,
@@ -94,7 +110,10 @@ export class BackendSupervisor extends EventEmitter {
       WEB_DIST_DIR: this.options.webDistDir,
       CONVERTER_HOST: '127.0.0.1',
       CONVERTER_PORT: '0',
-      DESKTOP_BOOTSTRAP_SECRET: bootstrap,
+      // The backend enforces this on every internal route; the same value is
+      // what Electron main uses for host-privileged calls. Never the default.
+      CONVERTER_INTERNAL_TOKEN: this.internalToken,
+      DESKTOP_BOOTSTRAP_SECRET: this.internalToken,
       CONVERTER_QUEUE: 'inline',
       ...(this.options.env ?? {}),
       ...extra,

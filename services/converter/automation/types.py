@@ -153,6 +153,24 @@ def _validate_rule_values(rule: DailyRule | IntervalRule) -> None:
             "every_seconds deve ser um número inteiro de segundos.",
             details={"every_seconds": seconds},
         )
+    if rule.anchor_at is not None:
+        from datetime import datetime as _datetime
+
+        raw = str(rule.anchor_at)
+        try:
+            parsed = _datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ApiError(
+                400,
+                "INVALID_SCHEDULE_RULE",
+                "anchor_at deve ser uma data/hora ISO-8601.",
+                details={"anchor_at": raw},
+            ) from exc
+        if parsed.tzinfo is None:
+            # A naive anchor means UTC by contract, never server local time.
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        rule.anchor_at = parsed.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
     if seconds < INTERVAL_MIN_SECONDS or seconds > INTERVAL_MAX_SECONDS:
         raise ApiError(
             400,

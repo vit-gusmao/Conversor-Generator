@@ -177,17 +177,26 @@ def run_events(
     run_id: str,
     user: dict[str, Any] = Depends(current_user),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    accept: str | None = Header(default=None),
+    after: int = 0,
     session=Depends(get_db),
 ):
-    """SSE with replay: `Last-Event-ID` is the last sequence already seen."""
+    """Events with content negotiation.
+
+    ``Accept: text/event-stream`` gets the SSE stream (replay via
+    ``Last-Event-ID``); anything else gets a JSON page, which is what the SPA
+    polls. Same data, same sequence numbers.
+    """
     from automation.run_service import AutomationRunService
 
     service = AutomationRunService()
     if service.get_run(session, owner_id=user["id"], run_id=run_id) is None:
         raise ApiError(404, "RUN_NOT_FOUND", "Ocorrência inexistente ou de outro dono.")
-    after = 0
-    if last_event_id and last_event_id.isdigit():
-        after = int(last_event_id)
+    cursor = int(last_event_id) if (last_event_id and last_event_id.isdigit()) else int(after)
+
+    if not accept or "text/event-stream" not in accept:
+        return {"items": service.events(session, run_id=run_id, after=cursor)}
+    after = cursor
 
     def stream():
         import time as _time

@@ -1,9 +1,12 @@
 /**
- * Electron main process (T12, doc 03 §4/§5/§8).
+ * Electron main process (T12/T13, doc 03 §4/§5/§8).
  *
  * Single instance → profile → backend supervisor → window on the backend's
- * own loopback origin (same origin, relative /api/v1) → tray. The renderer is
- * sandboxed, context-isolated and cannot navigate away from the app.
+ * own loopback origin (same origin, relative /api/v1) → tray.
+ *
+ * Privileged local operations (root grants, model diagnostics, apply) use the
+ * per-boot internal token the supervisor shares with the backend; the
+ * renderer never receives that token.
  */
 
 import { app, BrowserWindow, dialog, ipcMain, Menu, Tray, nativeImage } from 'electron';
@@ -21,7 +24,7 @@ import {
   type IpcEventLike,
 } from './ipc-handlers';
 import { LocalGrants } from './local-grants';
-import { ProfileStore, validateDraft } from './runtime-profile';
+import { ProfileStore, validateDraft, type RuntimeProfile } from './runtime-profile';
 
 const APP_NAME = 'Conversor Generator';
 
@@ -55,29 +58,40 @@ function webDistDir(): string {
     : join(resourcesDir(), 'apps', 'web', 'dist');
 }
 
-async function createSupervisor(): Promise<BackendSupervisor> {
-  const dataDir = appDataDir();
-  const created = new BackendSupervisor({
-    backendDir: backendDir(),
-    appDataDir: dataDir,
-    workDir: join(dataDir, 'work'),
-    logDir: join(dataDir, 'logs'),
-    webDistDir: webDistDir(),
-    env: { AUTOMATION_EXECUTOR_ENABLED: 'true', DESKTOP_HOST_ENABLED: 'true' },
-  });
-  created.on('log', (line: string) => {
-    // Logs stay in the main process; the renderer never sees the raw stream.
-    process.stdout.write(`[backend] ${line}`);
-  });
-  return created;
+/** Profile-derived environment for the backend (models, OCR, assistant). */
+function profileEnvironment(profile: RuntimeProfile): Record<string, string> {
+  return {
+    AUTOMATION_EXECUTOR_ENABLED: 'true',
+    DESKTOP_HOST_ENABLED: 'true',
+    OLLAMA_MODE: profile.mode,
+    GLMOCR_ENABLED: String(profile.ocr.enabled),
+    GLMOCR_HOST: profile.ocr.endpoint_host,
+    GLMOCR_PORT: String(profile.ocr.endpoint_port),
+    GLMOCR_MODEL: profile.ocr.model ?? '',
+    ASSISTANT_ENABLED: String(profile.assistant.enabled),
+    ASSISTANT_HOST: profile.assistant.endpoint_host,
+    ASSISTANT_PORT: String(profile.assistant.endpoint_port),
+    ASSISTANT_MODEL: profile.assistant.model ?? '',
+    ASSISTANT_CONTEXT_TOKENS: String(profile.assistant.context_tokens),
+    ASSISTANT_MAX_OUTPUT_TOKENS: String(profile.assistant.max_output_tokens),
+  };
 }
 
-async function startBackend(): Promise<RuntimeEndpoint> {
-  supervisor = await createSupervisor();
+async function startBackend(profile?: RuntimeProfile): Promise<RuntimeEndpoint> {
+  const active = profile ?? profileStore?.read() ?? null;
+  supervisor = new BackendSupervisor({
+    backendDir: backendDir(),
+    appDataDir: appDataDir(),
+    workDir: join(appDataDir(), 'work'),
+    logDir: join(appDataDir(), 'logs'),
+    webDistDir: webDistDir(),
+    env: active ? profileEnvironment(active) : undefined,
+  });
+  supervisor.on('log', (line: string) => process.stdout.write(`[backend] ${line}`));
   endpoint = await supervisor.start();
   grants = new LocalGrants({
     baseUrl: endpoint.baseUrl,
-    bootstrapSecret: process.env.DESKTOP_BOOTSTRAP_SECRET ?? '',
+    bootstrapSecret: supervisor.internalToken,
   });
   return endpoint;
 }
@@ -158,17 +172,61 @@ function ensureTray(): void {
   tray.on('double-click', () => mainWindow?.show());
 }
 
+function internalHeaders(): Record<string, string> {
+  const token = supervisor?.internalToken;
+  if (!token) {
+    throw new IpcError('BACKEND_UNAVAILABLE', 'Backend indisponível.');
+  }
+  return { 'x-internal-token': token, 'content-type': 'application/json' };
+}
+
 async function pauseAutomation(): Promise<void> {
   const target = endpoint;
   if (!target) return;
   try {
     await fetch(`${target.baseUrl}/internal/v1/automation/pause`, {
       method: 'POST',
-      headers: { 'x-internal-token': process.env.DESKTOP_BOOTSTRAP_SECRET ?? '' },
+      headers: internalHeaders(),
     });
   } catch {
     /* the tray action is best-effort; state stays visible in the UI */
   }
+}
+
+/** Owner id of the desktop session (created by the backend on first call). */
+async function desktopOwnerId(): Promise<string> {
+  const target = endpoint;
+  if (!target) throw new IpcError('BACKEND_UNAVAILABLE', 'Backend indisponível.');
+  const identityFile = join(appDataDir(), 'identity', 'device-id');
+  let deviceId: string;
+  try {
+    // Persisted outside localStorage so a backend restart on another port
+    // keeps the same history (doc 03 §4 item 6).
+    const fs = await import('node:fs');
+    if (fs.existsSync(identityFile)) {
+      deviceId = fs.readFileSync(identityFile, 'utf8').trim();
+    } else {
+      deviceId = BackendSupervisor.newToken();
+      fs.mkdirSync(join(appDataDir(), 'identity'), { recursive: true });
+      fs.writeFileSync(identityFile, deviceId, { encoding: 'utf8', mode: 0o600 });
+    }
+  } catch {
+    deviceId = BackendSupervisor.newToken();
+  }
+  const response = await fetch(`${target.baseUrl}/api/v1/auth/anonymous`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-device-id': deviceId },
+    body: '{}',
+  });
+  if (!response.ok) {
+    throw new IpcError('IDENTITY_UNAVAILABLE', 'Não foi possível estabelecer a identidade local.');
+  }
+  const session = (await response.json()) as { user?: { id?: string } };
+  const ownerId = session.user?.id;
+  if (!ownerId) {
+    throw new IpcError('IDENTITY_UNAVAILABLE', 'Sessão local sem identificador.');
+  }
+  return ownerId;
 }
 
 function registerIpc(): void {
@@ -177,6 +235,10 @@ function registerIpc(): void {
     assertTrustedSender(event as IpcEventLike, target?.baseUrl ?? 'http://127.0.0.1:');
   };
 
+  /**
+   * The native picker DOES grant the chosen folder: the root is created with
+   * the host credential and only a relative reference goes back to the page.
+   */
   ipcMain.handle(IPC_CHANNELS.pickSource, async (event, input: { kind?: unknown }) => {
     guard(event);
     const kind = validateSourcePickArgs(input?.kind);
@@ -189,16 +251,29 @@ function registerIpc(): void {
     }
     const selected = result.filePaths[0];
     assertSelectionShape(selected, kind === 'directory' ? 'models_directory' : 'file');
-    // The renderer receives only the display path; the grant stays in main.
-    return { display_path: selected, kind };
+
+    const ownerId = await desktopOwnerId();
+    if (!grants) {
+      throw new IpcError('GRANT_UNAVAILABLE', 'Concessão local indisponível.');
+    }
+    if (kind === 'directory') {
+      const granted = await grants.grant({ ownerId, canonicalPath: selected });
+      // The page works relative to the granted root: '.' means the root itself.
+      return { display_path: '.', kind, root_id: granted.rootId };
+    }
+    // A single file: grant its parent folder, keep the file name relative.
+    const parts = selected.split(/[\\/]/);
+    const filename = parts.pop() ?? '';
+    const parent = parts.join(process.platform === 'win32' ? '\\' : '/');
+    const granted = await grants.grant({ ownerId, canonicalPath: parent });
+    return { display_path: filename, kind, root_id: granted.rootId };
   });
 
   ipcMain.handle(IPC_CHANNELS.pickModelResource, async (event, input: { kind?: unknown }) => {
     guard(event);
     const kind = validateModelPickArgs(input?.kind);
     const result = await dialog.showOpenDialog({
-      properties:
-        kind === 'models_directory' ? ['openDirectory'] : ['openFile'],
+      properties: kind === 'models_directory' ? ['openDirectory'] : ['openFile'],
       filters:
         kind === 'gguf'
           ? [{ name: 'Modelo GGUF', extensions: ['gguf'] }]
@@ -229,10 +304,7 @@ function registerIpc(): void {
     if (!target) throw new IpcError('BACKEND_UNAVAILABLE', 'Backend indisponível.');
     const response = await fetch(`${target.baseUrl}/internal/v1/models/diagnostics`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-internal-token': process.env.DESKTOP_BOOTSTRAP_SECRET ?? '',
-      },
+      headers: internalHeaders(),
       body: JSON.stringify({ draft }),
     });
     return (await response.json()) as Record<string, unknown>;
@@ -243,14 +315,33 @@ function registerIpc(): void {
     async (event, draft: unknown, expectedVersion: unknown) => {
       guard(event);
       const parsed = validateApplyArgs(draft, expectedVersion);
-      const merged = { ...(profileStore?.read() ?? {}), ...parsed.draft } as never;
+      const store = profileStore;
+      if (!store) {
+        throw new IpcError('PROFILE_UNAVAILABLE', 'Perfil local indisponível.');
+      }
+      const merged = { ...store.read(), ...parsed.draft } as RuntimeProfile;
       validateDraft(merged);
-      const applied = profileStore?.write(merged, parsed.expectedVersion);
-      // Restart only the process this app owns; the previous profile is kept
-      // in backups/ by the backend migration step if it fails.
-      supervisor = await createSupervisor();
-      endpoint = await supervisor.start();
-      return { status: 'applied', applied_version: applied?.version ?? null, blockers: [] };
+      const applied = store.write(merged, parsed.expectedVersion);
+      if (!applied) {
+        throw new IpcError('PROFILE_UNAVAILABLE', 'Perfil local indisponível.');
+      }
+      // Restart the SAME supervisor (stops the previous child) with the new
+      // profile, so no duplicate backend runs against the same database.
+      const previous = store.read();
+      try {
+        const restarted = supervisor ? await supervisor.restart(profileEnvironment(applied)) : await startBackend(applied);
+        endpoint = restarted;
+        return { status: 'applied', applied_version: applied.version, blockers: [] };
+      } catch (error) {
+        // Roll back to the previous version so a failed apply is not sticky.
+        store.write(previous, applied.version);
+        throw new IpcError(
+          'PROFILE_APPLY_FAILED',
+          `A aplicação falhou e a versão anterior foi restaurada: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     },
   );
 
@@ -304,7 +395,6 @@ if (!lock) {
   });
 
   app.on('window-all-closed', () => {
-    // Keep running in the tray when configured; otherwise quit.
     const preferences = profileStore?.read().preferences;
     if (!preferences?.close_to_tray) {
       quitting = true;
