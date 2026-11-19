@@ -71,6 +71,7 @@ include = [
   "assistant*",
   "sources*",
   "automation*",
+  "runtime*",
 ]
 
 [tool.setuptools]

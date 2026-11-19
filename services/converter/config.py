@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -246,6 +247,10 @@ class Settings(BaseSettings):
 
     @property
     def data_dir(self) -> Path:
+        # Packaged desktop passes an absolute APP_DATA_DIR before import.
+        explicit = os.environ.get("APP_DATA_DIR")
+        if explicit:
+            return Path(explicit)
         if self.is_sqlite:
             raw = self.converter_database_url.replace("sqlite:///", "")
             p = Path(raw)
@@ -256,6 +261,9 @@ class Settings(BaseSettings):
 
     @property
     def storage_dir(self) -> Path:
+        explicit = os.environ.get("APP_DATA_DIR")
+        if explicit and not Path(self.storage_local_root).is_absolute():
+            return Path(explicit) / "storage"
         p = Path(self.storage_local_root)
         if not p.is_absolute():
             p = SERVICE_DIR / p

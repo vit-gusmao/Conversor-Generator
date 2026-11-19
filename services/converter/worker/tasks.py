@@ -8,7 +8,9 @@ Re-execution after a crash therefore converges instead of duplicating data.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from audit.events import EVT_RUN_CANCELLED, AuditRecorder
@@ -64,7 +66,7 @@ def execute_run(
         config=options or {},
     )
     recorder = AuditRecorder(run_id, sink=repo.progress_sink(run_id))
-    work_dir = settings.data_dir / "work"
+    work_dir = Path(os.environ.get("WORK_DIR") or (settings.data_dir / "work"))
     work_dir.mkdir(parents=True, exist_ok=True)
 
     storage = get_storage()

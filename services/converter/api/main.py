@@ -12,7 +12,9 @@ single `uvicorn` process gives a complete, working product.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -33,7 +35,8 @@ from version import ENGINE_VERSION
 
 logger = logging.getLogger(__name__)
 REPO_ROOT = SERVICE_DIR.parents[1]
-WEB_DIST = REPO_ROOT / "apps" / "web" / "dist"
+# Packaged run: the SPA ships as an external resource next to the executable.
+WEB_DIST = Path(os.environ.get("WEB_DIST_DIR") or (REPO_ROOT / "apps" / "web" / "dist"))
 
 
 @asynccontextmanager
