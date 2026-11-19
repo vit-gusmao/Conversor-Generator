@@ -1,11 +1,13 @@
 import { Suspense } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
-import { Bot, FileSpreadsheet, History, Settings, ShieldCheck } from 'lucide-react';
+import { Bot, CalendarClock, FileSpreadsheet, FolderTree, History, Settings, ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ToastViewport } from '@/components/ui/toast';
 
 const navItems = [
   { to: '/', label: 'Converter', icon: FileSpreadsheet, end: true },
+  { to: '/sources', label: 'Fontes', icon: FolderTree, end: false },
+  { to: '/schedules', label: 'Agendamentos', icon: CalendarClock, end: false },
   { to: '/assistant', label: 'Assistente', icon: Bot, end: false },
   { to: '/history', label: 'Histórico', icon: History, end: false },
   { to: '/settings', label: 'Configurações', icon: Settings, end: false },

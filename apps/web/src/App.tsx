@@ -33,6 +33,21 @@ const AssistantPage = lazy(() =>
 const BatchPage = lazy(() =>
   import('@/pages/batch-page').then((module) => ({ default: module.BatchPage })),
 );
+const SourcesPage = lazy(() =>
+  import('@/pages/sources-page').then((module) => ({ default: module.SourcesPage })),
+);
+const SourceDetailPage = lazy(() =>
+  import('@/pages/source-detail-page').then((module) => ({ default: module.SourceDetailPage })),
+);
+const SchedulesPage = lazy(() =>
+  import('@/pages/schedules-page').then((module) => ({ default: module.SchedulesPage })),
+);
+const ScheduleFormPage = lazy(() =>
+  import('@/pages/schedule-form-page').then((module) => ({ default: module.ScheduleFormPage })),
+);
+const ScheduleRunPage = lazy(() =>
+  import('@/pages/schedule-run-page').then((module) => ({ default: module.ScheduleRunPage })),
+);
 
 function RouteErrorPage() {
   const error = useRouteError();
@@ -72,6 +87,12 @@ export const router = createBrowserRouter(
         { path: 'conversions/:id/result', element: <ResultPage /> },
         { path: 'conversions/:id/audit', element: <AuditPage /> },
         { path: 'batches/:id', element: <BatchPage /> },
+        { path: 'sources', element: <SourcesPage /> },
+        { path: 'sources/:id', element: <SourceDetailPage /> },
+        { path: 'schedules', element: <SchedulesPage /> },
+        { path: 'schedules/new', element: <ScheduleFormPage /> },
+        { path: 'schedules/:id', element: <ScheduleFormPage /> },
+        { path: 'schedule-runs/:id', element: <ScheduleRunPage /> },
         { path: 'history', element: <HistoryPage /> },
         { path: 'assistant', element: <AssistantPage /> },
         { path: 'settings', element: <SettingsPage /> },

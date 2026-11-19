@@ -113,9 +113,13 @@ export interface AutomationRunRecord {
   import_id: string | null;
   index_job_id: string | null;
   attempt: number;
+  /** Fencing token; recovery bumps it so stale workers cannot finalize. */
+  fence?: number;
   error: { code: string; message: string } | null;
   created_at: string;
   updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 export interface AutomationEvent {
