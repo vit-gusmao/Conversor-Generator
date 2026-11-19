@@ -32,7 +32,11 @@ def create_source(
     user: dict[str, Any] = Depends(current_user),
     session=Depends(get_db),
 ) -> dict[str, Any]:
-    return SourceService().create_source(session, owner_id=user["id"], payload=payload)
+    created = SourceService().create_source(session, owner_id=user["id"], payload=payload)
+    # Commit before the 201: a client polling right after the response must
+    # already see the row (the teardown commit races with the next request).
+    session.commit()
+    return created
 
 
 @router.get("/sources")
@@ -78,6 +82,7 @@ def update_source(
             "Versão da fonte divergente: releia e reaplique.",
             details={"source_id": source_id},
         )
+    session.commit()
     return updated
 
 
@@ -90,6 +95,7 @@ def archive_source(
     archived = SourceService().archive_source(session, source_id=source_id, owner_id=user["id"])
     if not archived:
         raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
+    session.commit()
     return {"archived": True}
 
 
@@ -260,9 +266,11 @@ def internal_create_source(
 ) -> dict[str, Any]:
     payload.pop("owner_id", None)
     payload.pop("ownerId", None)
-    return SourceService().create_source(
+    created = SourceService().create_source(
         session, owner_id=_require_owner(x_owner_id), payload=payload
     )
+    session.commit()
+    return created
 
 
 @internal_router.get("/sources/{source_id}")
@@ -308,6 +316,7 @@ def internal_update_source(
             "Versão da fonte divergente: releia e reaplique.",
             details={"source_id": source_id},
         )
+    session.commit()
     return updated
 
 
@@ -323,6 +332,7 @@ def internal_archive_source(
     )
     if not archived:
         raise ApiError(404, "SOURCE_NOT_FOUND", "Fonte inexistente ou de outro dono.")
+    session.commit()
     return {"archived": True}
 
 

@@ -40,7 +40,9 @@ def create_schedule(
 ) -> dict[str, Any]:
     payload.pop("owner_id", None)
     payload.pop("ownerId", None)
-    return _service().create(session, owner_id=user["id"], payload=payload)
+    created = _service().create(session, owner_id=user["id"], payload=payload)
+    session.commit()
+    return created
 
 
 @router.post("/schedules/preview")
@@ -86,6 +88,7 @@ def update_schedule(
     )
     if updated is None:
         raise ApiError(404, "SCHEDULE_NOT_FOUND", "Agenda inexistente ou de outro dono.")
+    session.commit()
     return updated
 
 
@@ -98,6 +101,7 @@ def archive_schedule(
     archived = _service().archive(session, schedule_id=schedule_id, owner_id=user["id"])
     if not archived:
         raise ApiError(404, "SCHEDULE_NOT_FOUND", "Agenda inexistente ou de outro dono.")
+    session.commit()
     return {"archived": True}
 
 
@@ -107,7 +111,9 @@ def pause_schedule(
     user: dict[str, Any] = Depends(current_user),
     session=Depends(get_db),
 ) -> dict[str, Any]:
-    return _service().pause(session, schedule_id=schedule_id, owner_id=user["id"])
+    paused = _service().pause(session, schedule_id=schedule_id, owner_id=user["id"])
+    session.commit()
+    return paused
 
 
 @router.post("/schedules/{schedule_id}/resume")
@@ -116,7 +122,9 @@ def resume_schedule(
     user: dict[str, Any] = Depends(current_user),
     session=Depends(get_db),
 ) -> dict[str, Any]:
-    return _service().resume(session, schedule_id=schedule_id, owner_id=user["id"])
+    resumed = _service().resume(session, schedule_id=schedule_id, owner_id=user["id"])
+    session.commit()
+    return resumed
 
 
 @router.post("/schedules/{schedule_id}/run-now", status_code=202)
@@ -259,7 +267,9 @@ def internal_create_schedule(
     _guard: None = Depends(internal_guard),
 ) -> dict[str, Any]:
     payload.pop("owner_id", None)
-    return _service().create(session, owner_id=_owner(x_owner_id), payload=payload)
+    created = _service().create(session, owner_id=_owner(x_owner_id), payload=payload)
+    session.commit()
+    return created
 
 
 @internal_router.get("/schedules/{schedule_id}")
@@ -296,6 +306,7 @@ def internal_update_schedule(
     )
     if updated is None:
         raise ApiError(404, "SCHEDULE_NOT_FOUND", "Agenda inexistente ou de outro dono.")
+    session.commit()
     return updated
 
 
@@ -309,6 +320,7 @@ def internal_archive_schedule(
     archived = _service().archive(session, schedule_id=schedule_id, owner_id=_owner(x_owner_id))
     if not archived:
         raise ApiError(404, "SCHEDULE_NOT_FOUND", "Agenda inexistente ou de outro dono.")
+    session.commit()
     return {"archived": True}
 
 
@@ -323,9 +335,13 @@ def internal_schedule_action(
 ) -> dict[str, Any]:
     owner_id = _owner(x_owner_id)
     if action == "pause":
-        return _service().pause(session, schedule_id=schedule_id, owner_id=owner_id)
+        paused = _service().pause(session, schedule_id=schedule_id, owner_id=owner_id)
+        session.commit()
+        return paused
     if action == "resume":
-        return _service().resume(session, schedule_id=schedule_id, owner_id=owner_id)
+        resumed = _service().resume(session, schedule_id=schedule_id, owner_id=owner_id)
+        session.commit()
+        return resumed
     if action == "run-now":
         from automation.run_service import AutomationRunService
 

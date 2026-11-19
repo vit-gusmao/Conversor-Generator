@@ -246,14 +246,16 @@ def test_index_request_keeps_run_in_waiting_children_then_succeeds(api_client, t
         session.close()
     assert job_id
 
-    # The durable job completes and finalizes the waiting occurrence.
-    runner = KnowledgeJobRunner()
-    for _ in range(100):
-        payload = runner.get(job_id, owner["id"])
-        if payload["status"] in {"completed", "failed"}:
+    # The durable job completes and finalizes the waiting occurrence. The
+    # job runs in its own thread, so poll until the occurrence is terminal
+    # instead of assuming one specific intermediate state.
+    for _ in range(200):
+        detail = api_client.get(
+            f"/api/v1/schedule-runs/{run_id}", headers=owner["headers"]
+        ).json()
+        if detail["state"] in {
+            "succeeded", "partial", "no_changes", "failed", "cancelled"
+        }:
             break
-        time.sleep(0.1)
-    assert payload["status"] == "completed"
-
-    detail = api_client.get(f"/api/v1/schedule-runs/{run_id}", headers=owner["headers"]).json()
+        time.sleep(0.05)
     assert detail["state"] == "succeeded", detail
