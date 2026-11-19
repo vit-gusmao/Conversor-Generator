@@ -29,6 +29,7 @@ import {
 } from '@/hooks/use-sources';
 import { explainError } from '@/lib/errors';
 import { formatBytes, formatDateTime, formatNumber } from '@/lib/format';
+import { isDesktopRuntime, pickSourcePath } from '@/lib/platform';
 import { toast } from '@/stores/ui';
 
 const IMPORT_STATE_LABELS: Record<string, string> = {
@@ -66,6 +67,7 @@ export function SourcesPage() {
   const [exclude, setExclude] = useState('~$*,*.tmp');
   const [pendingArchive, setPendingArchive] = useState<SourceRecord | null>(null);
   const [activeImportId, setActiveImportId] = useState<string | null>(null);
+  const desktop = isDesktopRuntime();
   const importState = useImport(activeImportId);
   const importItems = useImportItems(activeImportId);
 
@@ -185,13 +187,34 @@ export function SourcesPage() {
             </Select>
           </div>
           <div className="space-y-1">
-            <span className="text-sm font-medium">Caminho relativo à raiz</span>
-            <Input
-              id="source-path"
-              value={relativePath}
-              onChange={(event) => setRelativePath(event.target.value)}
-              placeholder="financeiro/planilhas"
-            />
+            <span className="text-sm font-medium">
+              {desktop ? 'Caminho (seletor nativo ou relativo à raiz)' : 'Caminho relativo à raiz'}
+            </span>
+            <div className="flex gap-2">
+              <Input
+                id="source-path"
+                value={relativePath}
+                onChange={(event) => setRelativePath(event.target.value)}
+                placeholder="financeiro/planilhas"
+              />
+              {desktop ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={async () => {
+                    const picked = await pickSourcePath(kind);
+                    if (picked) setRelativePath(picked);
+                  }}
+                >
+                  Procurar…
+                </Button>
+              ) : null}
+            </div>
+            <p className="text-xs text-muted">
+              {desktop
+                ? 'No desktop o seletor concede a pasta ao aplicativo; o backend ainda valida a raiz.'
+                : 'No navegador, o caminho é sempre relativo a uma raiz já concedida pelo operador local.'}
+            </p>
           </div>
           <div className="space-y-1">
             <span className="text-sm font-medium">Tipo</span>

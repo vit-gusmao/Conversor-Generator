@@ -1,0 +1,34 @@
+# Empacotamento do aplicativo Windows (T12/T14).
+# Nome exato do executável: conversor-generator.exe
+appId: com.conversor.generator
+productName: Conversor Generator
+copyright: Conversor Generator
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**/*
+  - package.json
+# O backend congelado (PyInstaller) e o SPA são recursos EXTERNOS ao ASAR:
+# nunca executar um binário de dentro do arquivo empacotado.
+extraResources:
+  - from: ../converter/dist/converter
+    to: backend
+    filter: ["**/*"]
+  - from: ../web/dist
+    to: web
+    filter: ["**/*"]
+asar: true
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  executableName: conversor-generator
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Conversor Generator
+  artifactName: conversor-generator-setup-${version}.${ext}

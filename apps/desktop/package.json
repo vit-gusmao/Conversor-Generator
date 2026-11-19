@@ -1,0 +1,23 @@
+{
+  "name": "@pdf2x/desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Conversor Generator — aplicativo Windows (Electron) que supervisiona o backend empacotado",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "npm run build && electron .",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^33.2.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "electron-builder": "^25.1.8"
+  }
+}
