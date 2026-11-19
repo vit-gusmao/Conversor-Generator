@@ -48,6 +48,9 @@ const ScheduleFormPage = lazy(() =>
 const ScheduleRunPage = lazy(() =>
   import('@/pages/schedule-run-page').then((module) => ({ default: module.ScheduleRunPage })),
 );
+const LocalModelsPage = lazy(() =>
+  import('@/pages/local-models-page').then((module) => ({ default: module.LocalModelsPage })),
+);
 
 function RouteErrorPage() {
   const error = useRouteError();
@@ -96,6 +99,7 @@ export const router = createBrowserRouter(
         { path: 'history', element: <HistoryPage /> },
         { path: 'assistant', element: <AssistantPage /> },
         { path: 'settings', element: <SettingsPage /> },
+        { path: 'settings/local-models', element: <LocalModelsPage /> },
         { path: '*', element: <NotFoundPage /> },
       ],
     },

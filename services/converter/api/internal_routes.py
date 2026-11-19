@@ -466,6 +466,74 @@ def internal_model_status() -> dict[str, Any]:
     return assistant_service.status()
 
 
+@router.post("/models/diagnostics", dependencies=[Depends(internal_guard)])
+def internal_model_diagnostics(body: dict[str, Any]) -> dict[str, Any]:
+    """Desktop configuration screen: probe OCR and LLM independently.
+
+    Nothing is downloaded and the running profile is never switched by a
+    probe — applying a profile is a separate, guarded operation.
+    """
+    from assistant.diagnostics import test_model_profile
+
+    draft = body.get("draft") if isinstance(body, dict) else None
+    if not isinstance(draft, dict):
+        raise ApiError(400, "INVALID_PAYLOAD", "draft é obrigatório.")
+    return test_model_profile(draft)
+
+
+@router.get("/models/digest", dependencies=[Depends(internal_guard)])
+def internal_model_digest(model: str, host: str = "127.0.0.1", port: int = 11434) -> dict[str, Any]:
+    """Digest of the tag in use, for checkpoint fingerprints (T13)."""
+    base = f"http://{host}:{int(port)}".rstrip("/")
+    try:
+        import httpx
+
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get(f"{base}/api/tags")
+            response.raise_for_status()
+            for item in response.json().get("models") or []:
+                if str(item.get("name")) == model:
+                    return {
+                        "model": model,
+                        "digest": item.get("digest"),
+                        "size": item.get("size"),
+                        "modified_at": item.get("modified_at"),
+                    }
+    except Exception as exc:  # noqa: BLE001
+        return {"model": model, "digest": None, "error": str(exc)}
+    return {"model": model, "digest": None, "error": "tag não encontrada"}
+
+
+@router.get("/automation/status", dependencies=[Depends(internal_guard)])
+def internal_automation_status() -> dict[str, Any]:
+    """Runtime flags for the desktop tray/diagnostics panel."""
+    return {
+        "executor_enabled": bool(getattr(settings, "automation_executor_enabled", False)),
+        "runtime_mode": settings.runtime_mode,
+        "source_imports": bool(getattr(settings, "source_imports_enabled", True)),
+        "spreadsheet_input": bool(getattr(settings, "spreadsheet_input_enabled", True)),
+    }
+
+
+@router.post("/automation/pause", dependencies=[Depends(internal_guard)])
+def internal_automation_pause() -> dict[str, Any]:
+    """Tray action: pause new dispatches without deleting definitions."""
+    from models.db import AutomationScheduleRow, get_session_factory
+    from sqlalchemy import update as _update
+
+    session = get_session_factory()()
+    try:
+        result = session.execute(
+            _update(AutomationScheduleRow)
+            .where(AutomationScheduleRow.enabled.is_(True))
+            .values(enabled=False)
+        )
+        session.commit()
+        return {"paused": int(result.rowcount or 0)}
+    finally:
+        session.close()
+
+
 @router.get("/chat/conversations", dependencies=[Depends(internal_guard)])
 def internal_conversations(owner: str = Header(alias="x-owner-id")) -> dict[str, Any]:
     items = assistant_service.list_conversations(owner)

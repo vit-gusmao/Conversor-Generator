@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { Link } from 'react-router-dom';
 import { Check, Database, HardDrive, KeyRound, ScanText, Server, ShieldCheck, SlidersHorizontal, X } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -20,6 +21,15 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
 }
 
 export function SettingsPage() {
+  const localModelsLink = (
+    <p className="text-sm text-muted">
+      Modelos locais de OCR e do assistente:{' '}
+      <Link to="/settings/local-models" className="text-accent hover:underline">
+        abrir configuração de IA local
+      </Link>
+      .
+    </p>
+  );
   useEnsureSession();
   const settings = useSettings();
 
@@ -35,7 +45,8 @@ export function SettingsPage() {
   if (settings.isError || !settings.data) {
     return (
       <div className="space-y-4">
-        <PageHeader eyebrow="Configurações" title="Plataforma" />
+        {localModelsLink}
+      <PageHeader eyebrow="Configurações" title="Plataforma" />
         <ErrorBlock
           title="Não foi possível ler as configurações"
           message={explainError(settings.error)}
